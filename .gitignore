@@ -1,6 +1,8 @@
-.cache/
-dist/
-upstream/
+/.restore-test/
+.DS_Store
 __pycache__/
 *.pyc
-.DS_Store
+/rstudio-2026.11.0-203/
+/rstudio/build*/
+/rstudio/.git/
+/rstudio-mac-server-patch/.git/

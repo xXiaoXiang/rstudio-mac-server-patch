@@ -1,0 +1,6 @@
+.cache/
+dist/
+upstream/
+__pycache__/
+*.pyc
+.DS_Store

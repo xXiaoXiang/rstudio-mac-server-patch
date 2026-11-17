@@ -1,0 +1,29 @@
+[Unit]
+Description=Flask App with Gunicorn
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/flask_apps/condaR 
+ExecStart=/usr/bin/gunicorn \
+  --worker-class gevent \
+  --worker-connections 5000 \
+  -w 8 \
+  --threads 8 \
+  -b 127.0.0.1:5001 \
+  --timeout 43200 \
+  --max-requests 5000 \
+  --max-requests-jitter 500 \
+  app:app
+
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Restart=always
+RestartSec=5
+
+# 资源限制优化
+LimitNOFILE=65535
+LimitNPROC=65535
+
+[Install]
+WantedBy=multi-user.target

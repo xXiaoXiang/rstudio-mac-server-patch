@@ -1,0 +1,237 @@
+name: "Cache Seed: Sentinel (re-seed evicted E2E build caches)"
+
+# Past the repo's GitHub Actions cache quota (40 GB as of November 2026),
+# GitHub evicts entries least-recently-used first -- including the build
+# caches the seed workflows maintain on main. PR runs can only restore caches
+# from their own merge ref or from main, so once main's copy is evicted every
+# PR build goes cold (full dependency download + GWT recompile) until the
+# next nightly seed. This sentinel closes that gap: it periodically checks that each
+# expected cache-key prefix still resolves on refs/heads/main and dispatches
+# the owning seed workflow when one has gone missing.
+#
+# Ubuntu 26 AMD64 and macOS 14 ARM64 have no seed workflow and are not part of
+# the PR orchestrator, so they are deliberately absent from the checks below.
+# macOS 14's routine runs install the daily .dmg and skip its build job, so the
+# build caches a seed would maintain are never read on that path.
+on:
+  schedule:
+    # Every 2 hours, offset from the nightly seeds (07:00 / 07:30 UTC).
+    - cron: '45 */2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: cache-seed-sentinel
+  cancel-in-progress: true
+
+permissions:
+  # Needed both to list caches / workflow runs and to dispatch the seed
+  # workflows via `gh workflow run`.
+  actions: write
+  # Needed to open an alert issue when a seed workflow's latest run failed.
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Only for dependencies/tools/rstudio-tools.sh, which carries the R pin
+      # the os-e2e-deps cache prefixes below are derived from. Sparse so this
+      # stays a seconds-long job -- it otherwise touches no working tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: dependencies/tools/rstudio-tools.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Re-seed platforms whose main caches were evicted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh is run against the repo rather than the sparse working tree.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # One line per seed workflow: <workflow-file>=<cache-key prefixes>.
+          # The prefixes must track the cache keys in the matching build
+          # workflows (see the "Restore rstudio-tools deps" etc. steps). The
+          # rstudio-tools / rlibs linux keys are shared by the Desktop and
+          # Server Ubuntu 24 builds, so they are listed once, under the
+          # Desktop seed; each seed re-warms every cache its build job
+          # touches, missing or not.
+          #
+          # The os-cache-seed-e2e-deps.yml prefixes are the os-e2e-deps cache
+          # keys the PR orchestrator's e2e jobs read: <CACHE_OS>-{r,pak}-<R
+          # major.minor>- plus the R-version-independent <CACHE_OS>-pw-
+          # browser keys. The major.minor is derived from the same
+          # RSTUDIO_R_VERSION the seed and the PR jobs install, so bumping R is
+          # still one line in rstudio-tools.sh and this audit follows it.
+          R_MM=$(sed -n 's/^export RSTUDIO_R_VERSION="\([0-9]*\.[0-9]*\).*"$/\1/p' \
+            dependencies/tools/rstudio-tools.sh | tail -1)
+          if [ -z "$R_MM" ]; then
+            echo "::error::Could not read RSTUDIO_R_VERSION from dependencies/tools/rstudio-tools.sh."
+            exit 1
+          fi
+          echo "Auditing os-e2e-deps caches for R $R_MM"
+
+          # Double-quoted so $R_MM expands; nothing else in here uses $.
+          CHECKS="
+          os-cache-seed-e2e-rstudio-desktop-os-ubuntu-24.yml=rstudio-tools-linux-x86_64- rstudio-build-rlibs-linux-x86_64- rstudio-gwt-linux-desktop-x86_64-
+          os-cache-seed-e2e-rstudio-server-os-ubuntu-24.yml=rstudio-gwt-linux-x86_64-
+          os-cache-seed-e2e-macos-26-arm64.yml=rstudio-tools-arm64- rstudio-build-rlibs-arm64- rstudio-gwt-arm64-
+          os-cache-seed-e2e-macos-15-x86_64.yml=rstudio-tools-x86_64- rstudio-build-rlibs-x86_64- rstudio-gwt-x86_64-
+          os-cache-seed-e2e-rstudio-desktop-os-windows-server-2025.yml=rstudio-tools-win64- rstudio-gwt-win64-
+          os-cache-seed-e2e-deps.yml=Windows-r-$R_MM- Windows-pak-$R_MM- Windows-pw- macOS-macos26-arm64-r-$R_MM- macOS-macos26-arm64-pak-$R_MM- macOS-macos26-arm64-pw- Linux-noble-amd64-r-$R_MM- Linux-noble-amd64-pak-$R_MM- Linux-noble-amd64-pw-
+          "
+
+          FAILED=0
+          while IFS= read -r LINE; do
+            # Trim leading whitespace; skip blank lines.
+            LINE="${LINE#"${LINE%%[![:space:]]*}"}"
+            if [ -z "$LINE" ]; then
+              continue
+            fi
+
+            SEED="${LINE%%=*}"
+            PREFIXES="${LINE#*=}"
+
+            MISSING=""
+            for PREFIX in $PREFIXES; do
+              # The caches API `key` parameter matches by prefix, so this asks
+              # "does any cache under this prefix still exist in main's scope?"
+              COUNT=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?ref=refs/heads/main&key=$PREFIX&per_page=1" --jq .total_count)
+              if [ "$COUNT" -eq 0 ]; then
+                MISSING="$MISSING $PREFIX"
+              fi
+            done
+
+            if [ -z "$MISSING" ]; then
+              echo "OK: $SEED -- all prefixes present on main"
+              continue
+            fi
+            echo "Evicted from main:$MISSING"
+
+            # Don't dispatch on top of an active run: the seeds' concurrency
+            # groups cancel in-flight runs, so piling on dispatches could keep
+            # a seed from ever finishing.
+            ACTIVE=0
+            for STATUS in queued in_progress; do
+              N=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$SEED/runs?status=$STATUS&per_page=1" --jq .total_count)
+              ACTIVE=$((ACTIVE + N))
+            done
+            if [ "$ACTIVE" -gt 0 ]; then
+              echo "Seed $SEED is already queued or running; not dispatching."
+              continue
+            fi
+
+            echo "Dispatching $SEED"
+            gh workflow run "$SEED" --ref main || FAILED=1
+          done <<EOF
+          $CHECKS
+          EOF
+
+          # The cache checks above only notice a failing seed once its caches
+          # have actually been evicted, and some failure modes are invisible
+          # to the seed workflow itself (startup_failure never runs any job
+          # that could report it -- the Windows seed startup-failed silently
+          # on two consecutive weekends). Check each seed's latest completed
+          # run directly and open an alert issue when it did not succeed.
+          for SEED in $(printf '%s\n' "$CHECKS" | sed -n 's/^[[:space:]]*\([^=]*\)=.*/\1/p'); do
+            RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$SEED/runs?status=completed&per_page=1" \
+              --jq '.workflow_runs[0] | "\(.conclusion) \(.html_url)"')
+            CONCLUSION="${RUN%% *}"
+            RUN_URL="${RUN#* }"
+
+            TITLE="cache seed workflow failing: $SEED"
+            ISSUE=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
+
+            # No completed runs yet (new seed) counts as healthy.
+            if [ -z "$CONCLUSION" ] || [ "$CONCLUSION" = "null" ]; then
+              continue
+            fi
+
+            # Recovered: retire the alert from the earlier failure, so a
+            # transient flake doesn't leave an issue for someone to close by
+            # hand (and doesn't suppress alerting on the next real breakage).
+            if [ "$CONCLUSION" = "success" ]; then
+              if [ -n "$ISSUE" ]; then
+                echo "Seed $SEED recovered; closing #$ISSUE"
+                COMMENT=$(printf '%s\n\n%s' \
+                  "The latest completed run of \`$SEED\` succeeded: $RUN_URL" \
+                  "(Closed automatically by the cache-seed sentinel.)")
+                gh issue close "$ISSUE" --reason completed --comment "$COMMENT" || FAILED=1
+              fi
+              continue
+            fi
+            echo "Seed $SEED latest completed run: $CONCLUSION"
+
+            # One open issue per seed; skip if the previous alert is still open.
+            if [ -n "$ISSUE" ]; then
+              echo "Alert issue already open for $SEED (#$ISSUE)"
+              continue
+            fi
+
+            # A failing conclusion is stale the moment a newer run is queued or
+            # running -- including one this job dispatched above, since that
+            # dispatch happens before this check. Let the retry settle before
+            # calling the seed broken; transient infrastructure faults (DNS,
+            # runner loss) clear on their own and would otherwise file an issue
+            # that is already obsolete when it is opened.
+            PENDING=0
+            for STATUS in queued in_progress; do
+              N=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$SEED/runs?status=$STATUS&per_page=1" --jq .total_count)
+              PENDING=$((PENDING + N))
+            done
+            if [ "$PENDING" -gt 0 ]; then
+              echo "Seed $SEED has a newer run in flight; deferring alert."
+              continue
+            fi
+
+            # Every seed but one maintains build caches. os-cache-seed-e2e-deps
+            # runs no build at all -- it warms the os-e2e-deps test-dependency
+            # caches -- so a generic "build caches" alert sends readers looking
+            # in the wrong place.
+            case "$SEED" in
+              os-cache-seed-e2e-deps.yml)
+                IMPACT="Until this seed succeeds again, its R library, pak download, and Playwright browser caches on main can go stale or be evicted, and PR e2e jobs reinstall those dependencies from scratch."
+                ;;
+              *)
+                IMPACT="Until this seed succeeds again, its build caches on main can go stale or be evicted, and PR builds for that platform run cold."
+                ;;
+            esac
+
+            BODY=$(printf '%s\n\n%s\n\n%s' \
+              "The latest completed run of \`$SEED\` finished with conclusion \`$CONCLUSION\`: $RUN_URL" \
+              "$IMPACT" \
+              "(Opened automatically by the cache-seed sentinel; it skips re-alerting while this issue stays open, and closes it once the seed succeeds again.)")
+            gh issue create --title "$TITLE" --body "$BODY" || FAILED=1
+          done
+
+          exit $FAILED
+
+      # GWT output is keyed on a hash of the GWT sources, so every merge that
+      # touches them saves a new 30-80 MB entry per platform key, and an older
+      # entry is only ever read on an exact key match (a restore-keys match
+      # recompiles from scratch). Keep the two newest per key family -- the
+      # second covers runs keyed against the previous main -- and delete the
+      # rest, rather than leaving superseded builds in the quota for 7 days.
+      - name: Prune superseded GWT output caches on main
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KEEP=2
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/caches?ref=refs/heads/main&key=rstudio-gwt-&sort=created_at&direction=desc&per_page=100" \
+            --jq '.actions_caches[] | "\(.id) \(.key)"' > "$RUNNER_TEMP/gwt-caches.txt"
+
+          # Newest first; a key's family is the key minus its trailing hash.
+          awk -v keep="$KEEP" '{ fam = $2; sub(/-[0-9a-f]+$/, "", fam); if (++seen[fam] > keep) print $1, $2 }' \
+            "$RUNNER_TEMP/gwt-caches.txt" > "$RUNNER_TEMP/gwt-stale.txt"
+
+          FAILED=0
+          while read -r ID KEY; do
+            echo "Deleting superseded GWT cache $KEY (id $ID)"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$ID" --silent || FAILED=1
+          done < "$RUNNER_TEMP/gwt-stale.txt"
+          echo "Pruned $(wc -l < "$RUNNER_TEMP/gwt-stale.txt") of $(wc -l < "$RUNNER_TEMP/gwt-caches.txt") GWT caches"
+
+          exit $FAILED

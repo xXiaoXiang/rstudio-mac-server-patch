@@ -1,0 +1,407 @@
+name: "Test: E2E Playwright RStudio (PR-triggered)"
+
+on:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "src/**"
+      - "dependencies/**"
+      - "cmake/**"
+      - "package/**"
+      - "e2e/rstudio/**"
+      - ".github/actions/os-e2e-blobs/**"
+      - ".github/actions/os-e2e-credentials/**"
+      - ".github/actions/os-e2e-deps/**"
+      - ".github/actions/os-e2e-report/**"
+      - ".github/actions/os-publish-e2e-report/**"
+      - ".github/actions/os-resolve-daily-manifest/**"
+      - ".github/actions/os-resolve-daily-urls/**"
+      # version/RELEASE picks which branch's daily every platform resolves, so
+      # a change to it changes the binary under test. A flower with no daily
+      # yet resolves to a source build via decide(), which is the answer we
+      # want to see proven on the PR that renames it rather than in the next
+      # cron rotation.
+      - "version/RELEASE"
+      - ".github/workflows/os-test-e2e-rstudio-pr.yml"
+      - ".github/workflows/os-test-e2e-rstudio-desktop-os-windows-server-2025.yml"
+      - ".github/workflows/os-test-e2e-rstudio-desktop-os-macos-26-arm64.yml"
+      - ".github/workflows/os-test-e2e-rstudio-desktop-linux.yml"
+      - ".github/workflows/os-test-e2e-rstudio-server-os-ubuntu-24.yml"
+      - ".github/e2e-linux/**"
+      # The shard counts and the plumbing that reads them: a count change
+      # should be proven on the PR that makes it.
+      - ".github/e2e/shards.json"
+      - ".github/actions/os-e2e-shards/**"
+      - ".github/workflows/os-test-e2e-rstudio-shards.yml"
+
+concurrency:
+  group: pw-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Lets the e2e-merge jobs mint an OIDC token to assume the S3 report-upload
+  # role (see .github/actions/os-publish-e2e-report).
+  id-token: write
+  actions: write  # the engines' e2e-merge job deletes the shard blob artifacts once merged
+
+jobs:
+  # Single change-detection job shared by all e2e platforms (Windows Desktop,
+  # macOS Desktop, Linux Desktop, Linux Server). Decides, per platform, whether
+  # to build from source or test against the latest daily. A daily is used only
+  # when ALL hold:
+  #   1. No compiled-binary source changed in this PR.
+  #   2. The daily manifest resolves a usable installer for that platform
+  #      (link + filename + sha256 + commit all present).
+  #   3. The daily's commit already contains this branch's merge-base, else it
+  #      predates the behavior the (possibly main-merged) test-only branch assumes.
+  # Any miss falls back to a source build. All four platforms are decided
+  # independently via decide(): macOS/Windows/Linux Desktop look up the electron
+  # product, Linux Server the server product. Each manifest entry carries its own
+  # commit, so every platform is checked against its own daily build.
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      macos_build_from_source: ${{ steps.check.outputs.macos_build_from_source }}
+      windows_build_from_source: ${{ steps.check.outputs.windows_build_from_source }}
+      linux_desktop_build_from_source: ${{ steps.check.outputs.linux_desktop_build_from_source }}
+      linux_server_build_from_source: ${{ steps.check.outputs.linux_server_build_from_source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full commit history, for the merge-base below, but almost no file
+          # contents: a sparse checkout makes this a blobless partial clone,
+          # roughly a tenth the size of a full one. The diff below runs
+          # without rename detection, so it only compares trees. Only the
+          # local action and the version/RELEASE file it reads have to be
+          # on disk.
+          fetch-depth: 0
+          sparse-checkout: |
+            .github
+            version
+
+      - name: Resolve daily manifest URL
+        id: manifest
+        uses: ./.github/actions/os-resolve-daily-manifest
+
+      - name: Decide build-from-source vs daily (per platform)
+        id: check
+        env:
+          MANIFEST_URL: ${{ steps.manifest.outputs.manifest-url }}
+        run: |
+          BASE=$(git merge-base HEAD origin/${{ github.base_ref }})
+          # --no-renames: a rename is otherwise listed under its new path only,
+          # so a file moved out of src/ would not count as a source change.
+          CHANGED=$(git diff --no-renames --name-only "$BASE" HEAD)
+          echo "Changed files vs merge base with ${{ github.base_ref }}:"
+          echo "$CHANGED"
+
+          # Build from source when C++, GWT, CMake, build scripts, or
+          # dependencies changed -- anything that ends up in the compiled
+          # binary. Matches all of package/ (CMakeLists.txt at the root, and
+          # every per-platform subdir) plus the repo-root CMakeLists.txt so a
+          # packaging or top-level cmake change can't silently fall through to
+          # running tests against a daily.
+          SOURCE_CHANGED=false
+          if echo "$CHANGED" | grep -qE '^(CMakeLists\.txt$|src/|package/|dependencies/|cmake/)'; then
+            SOURCE_CHANGED=true
+          fi
+
+          # Fetch the daily manifest once, up front, so both a broken/missing
+          # manifest and a stale daily resolve to the same safe fallback:
+          # build from source. A non-200 response or a body that doesn't parse
+          # as JSON is normalized to empty so decide() treats it as unreachable
+          # rather than letting a later jq error abort this step.
+          MANIFEST=$(curl -fsSL --retry 3 --retry-delay 5 "$MANIFEST_URL" || echo '')
+          if [ -n "$MANIFEST" ] && ! echo "$MANIFEST" | jq empty 2>/dev/null; then
+            echo "Daily manifest did not parse as JSON -- treating as unreachable"
+            MANIFEST=""
+          fi
+
+          # Echoes "true" (build from source) or "false" (use the daily) for the
+          # manifest product ($1, e.g. "electron" or "server") and platform key
+          # ($2). product/key appears in every log line because some keys
+          # (e.g. "noble-amd64") exist under more than one product.
+          decide() {
+            local product="$1" key="$2"
+
+            if [ "$SOURCE_CHANGED" = true ]; then
+              echo "$product/$key: source files changed -- building from source" >&2
+              echo true
+              return
+            fi
+
+            if [ -z "$MANIFEST" ]; then
+              echo "$product/$key: daily manifest unreachable -- building from source" >&2
+              echo true
+              return
+            fi
+
+            local entry link filename sha commit
+            entry=$(echo "$MANIFEST" | jq -c --arg p "$product" --arg k "$key" '.products[$p].platforms[$k] // empty')
+            link=$(echo "$entry" | jq -r '.link // empty')
+            filename=$(echo "$entry" | jq -r '.filename // empty')
+            sha=$(echo "$entry" | jq -r '.sha256 // empty')
+            commit=$(echo "$entry" | jq -r '.commit // empty')
+            if [ -z "$link" ] || [ -z "$filename" ] || [ -z "$sha" ] || [ -z "$commit" ]; then
+              echo "$product/$key: daily manifest missing fields (link='$link' filename='$filename' sha256='$sha' commit='$commit') -- building from source" >&2
+              echo true
+              return
+            fi
+
+            # The daily's commit must already contain this branch's merge-base,
+            # or it predates the behavior the test-only branch assumes. Fetch
+            # the commit best-effort in case full history isn't local; any
+            # error from --is-ancestor (including an unknown commit) is treated
+            # as "not contained" and falls back to a source build.
+            if ! git cat-file -e "${commit}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --quiet origin "$commit" 2>/dev/null || true
+            fi
+            if git merge-base --is-ancestor "$BASE" "$commit" 2>/dev/null; then
+              echo "$product/$key: daily $commit contains merge-base $BASE -- using daily" >&2
+              echo false
+            else
+              echo "$product/$key: daily $commit does not contain merge-base $BASE -- building from source" >&2
+              echo true
+            fi
+          }
+
+          # macOS/Windows/Linux Desktop are electron-product builds; Linux Server
+          # is the server-product .deb. Both products carry the same per-platform
+          # fields (link/filename/sha256/commit), so all four ride decide() and
+          # get the same staleness check against the daily's commit.
+          MACOS=$(decide electron macos)
+          WINDOWS=$(decide electron windows)
+          LINUXDESKTOP=$(decide electron noble-amd64)
+          LINUXSERVER=$(decide server noble-amd64)
+          echo "Decision: macos build_from_source=$MACOS, windows build_from_source=$WINDOWS, linux-desktop build_from_source=$LINUXDESKTOP, linux-server build_from_source=$LINUXSERVER"
+          echo "macos_build_from_source=$MACOS" >> "$GITHUB_OUTPUT"
+          echo "windows_build_from_source=$WINDOWS" >> "$GITHUB_OUTPUT"
+          echo "linux_desktop_build_from_source=$LINUXDESKTOP" >> "$GITHUB_OUTPUT"
+          echo "linux_server_build_from_source=$LINUXSERVER" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: detect-changes
+    uses: ./.github/workflows/os-test-e2e-rstudio-desktop-os-windows-server-2025.yml
+    secrets:
+      CONNECT_API_KEY: ${{ secrets.CONNECT_API_KEY }}
+      AWS_E2E_REPORTS_ROLE_ARN: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    with:
+      build_from_source: ${{ fromJSON(needs.detect-changes.outputs.windows_build_from_source) }}
+      project: desktop
+      # Suppress each platform's own merge/publish/comment; the e2e-merge-all
+      # job below combines every platform's blobs into a single report + comment.
+      defer_merge: true
+
+  macos:
+    needs: detect-changes
+    uses: ./.github/workflows/os-test-e2e-rstudio-desktop-os-macos-26-arm64.yml
+    secrets:
+      CONNECT_API_KEY: ${{ secrets.CONNECT_API_KEY }}
+      AWS_E2E_REPORTS_ROLE_ARN: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    with:
+      build_from_source: ${{ fromJSON(needs.detect-changes.outputs.macos_build_from_source) }}
+      project: desktop
+      # Suppress each platform's own merge/publish/comment; the e2e-merge-all
+      # job below combines every platform's blobs into a single report + comment.
+      defer_merge: true
+
+  linux-desktop:
+    needs: detect-changes
+    uses: ./.github/workflows/os-test-e2e-rstudio-desktop-linux.yml
+    secrets:
+      CONNECT_API_KEY: ${{ secrets.CONNECT_API_KEY }}
+      AWS_E2E_REPORTS_ROLE_ARN: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    with:
+      os: ubuntu-24-x86_64
+      arch: x86_64
+      build_from_source: ${{ fromJSON(needs.detect-changes.outputs.linux_desktop_build_from_source) }}
+      project: desktop
+      # Suppress each platform's own merge/publish/comment; the e2e-merge-all
+      # job below combines every platform's blobs into a single report + comment.
+      defer_merge: true
+
+  linux-server:
+    needs: detect-changes
+    uses: ./.github/workflows/os-test-e2e-rstudio-server-os-ubuntu-24.yml
+    secrets:
+      CONNECT_API_KEY: ${{ secrets.CONNECT_API_KEY }}
+      AWS_E2E_REPORTS_ROLE_ARN: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    with:
+      build_from_source: ${{ fromJSON(needs.detect-changes.outputs.linux_server_build_from_source) }}
+      project: server
+      # Suppress each platform's own merge/publish/comment; the e2e-merge-all
+      # job below combines every platform's blobs into a single report + comment.
+      defer_merge: true
+
+  # Combine every platform's per-shard blob reports into ONE HTML report, publish
+  # it to S3, and post a single PR comment with a per-platform breakdown.
+  # Artifacts are shared across the whole run, so this job can read the blobs
+  # uploaded by the reusable platform workflows above. Runs even when some
+  # platforms failed, so a partial report is still produced -- but not when the
+  # run was cancelled or every platform was skipped (e.g. detect-changes
+  # failed), where there is provably nothing to merge and a red "No blob
+  # reports found" would only obscure the real upstream failure.
+  e2e-merge-all:
+    needs: [windows, macos, linux-desktop, linux-server]
+    if: >-
+      !cancelled() &&
+      (contains(needs.*.result, 'success') || contains(needs.*.result, 'failure'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      # OIDC token for the S3 report upload (os-publish-e2e-report).
+      id-token: write
+      # Deleting the shard blob artifacts once merged.
+      actions: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: e2e/rstudio/package-lock.json
+
+      - name: Install Playwright
+        working-directory: e2e/rstudio
+        run: npm ci --ignore-scripts
+
+      # Every platform's shards uploaded blobs named
+      # playwright-blob-report-<platform>-<shard>; pull them all into one dir.
+      # Blob file names are platform+shard unique (see the blob reporter's
+      # fileName in playwright.config.ts), so flattening with merge-multiple
+      # cannot clobber one platform with another.
+      - name: Download all platform blob reports
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: playwright-blob-report-*
+          path: e2e/rstudio/all-blob-reports
+          merge-multiple: true
+
+      # On a re-run, blobs a previous attempt retired come back from the bucket.
+      - name: Restore archived blob reports
+        id: restore
+        uses: ./.github/actions/os-e2e-blobs
+        with:
+          mode: restore
+          role-arn: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+          label: all-platforms
+
+      - name: Merge all reports
+        id: merge
+        working-directory: e2e/rstudio
+        run: |
+          if [ -z "$(ls -A all-blob-reports 2>/dev/null)" ]; then
+            echo "::error::No blob reports found -- every platform failed to produce artifacts"
+            exit 1
+          fi
+          npx playwright merge-reports --config merge.config.ts ./all-blob-reports
+
+      - name: Summarize results
+        id: summary
+        if: always()
+        working-directory: e2e/rstudio
+        run: node scripts/summarize-merged-report.mjs
+
+      # The report's only copy, browsable from the Posit tailnet (see
+      # .github/e2e-reports); nothing goes to GitHub artifacts, which anyone
+      # signed in to GitHub can download. Best-effort: a no-op on fork PRs (no
+      # secret) and never fails the job. The bucket's 14-day lifecycle rule
+      # reaps it.
+      - name: Publish report to S3
+        id: publish-report
+        if: always() && github.event.pull_request.head.repo.fork == false
+        uses: ./.github/actions/os-publish-e2e-report
+        with:
+          role-arn: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+          label: all-platforms
+
+      # Post when there are results to report OR the merge itself did not
+      # succeed (failed, or skipped because an earlier step failed) -- otherwise
+      # a broken merge would zero out every count and silently suppress the only
+      # e2e feedback this PR run produces (the per-platform comments are
+      # suppressed via defer_merge). The all-zero-with-successful-merge case
+      # (every platform skipped) still posts nothing.
+      - name: Post E2E results to PR
+        if: |
+          always() &&
+          github.event.pull_request.head.repo.fork == false &&
+          (steps.merge.outcome != 'success' || steps.summary.outputs.passed != '0' || steps.summary.outputs.failed != '0' || steps.summary.outputs.skipped != '0' || steps.summary.outputs.flaky != '0')
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          header: e2e-results
+          message: |
+            ## RStudio E2E - all platforms
+
+            ${{ steps.merge.outcome != 'success' && ':warning: **The merged report could not be produced** -- results below are incomplete or missing; see the run log.' || steps.summary.outputs.failed == '0' && '### All tests passed!' || format('### {0} test(s) failed', steps.summary.outputs.failed) }}
+
+            `${{ steps.summary.outputs.bar }}` **${{ steps.summary.outputs.rate }}%** pass rate
+
+            | Passed | Failed | Skipped | Flaky |
+            | :---: | :---: | :---: | :---: |
+            | **${{ steps.summary.outputs.passed }}** | **${{ steps.summary.outputs.failed }}** | **${{ steps.summary.outputs.skipped }}** | **${{ steps.summary.outputs.flaky }}** |
+
+            ${{ steps.summary.outputs.platform_table }}
+
+            ${{ steps.publish-report.outputs.url != '' && format('**[View report online]({0})**', steps.publish-report.outputs.url) || '_No report was published; see the run log._' }}
+
+            ${{ steps.restore.outputs.restored != '' && steps.restore.outputs.restored != '0' && format(':warning: {0} shard report(s) are from a previous attempt of this run: shards that did not re-run, or that re-ran without producing one (the merge job warns about each).', steps.restore.outputs.restored) || '' }}
+
+            ---
+            <sub>All platforms - commit <code>${{ github.event.pull_request.head.sha }}</code> - <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Run #${{ github.run_number }}</a></sub>
+
+      # The shard blobs hold every trace and screenshot the report does, and a
+      # GitHub artifact can be downloaded by anyone signed in to GitHub. Once
+      # the merged report is safely published they are archived to the bucket
+      # and deleted from the run (os-e2e-blobs); their one-day retention is the
+      # fallback when this job never gets this far. Not when the merge or the
+      # publish failed: the report would then exist nowhere. This is the only
+      # job deleting from this run's artifact list (the engines defer their
+      # merges), so no shard count is needed.
+      - name: Retire shard blob artifacts
+        if: always() && steps.merge.outcome == 'success' && steps.publish-report.outputs.url != ''
+        uses: ./.github/actions/os-e2e-blobs
+        with:
+          mode: retire
+          role-arn: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+          label: all-platforms
+          artifact-prefix: playwright-blob-report-
+          github-token: ${{ github.token }}
+
+      # Does nothing: the name is the point. A step name can read step outputs
+      # (jobs.<id>.steps.name allows the `steps` context), so this puts the build
+      # under test in the job's step list, readable without expanding anything.
+      # The run page itself has no surface for a runtime value -- a run's title is
+      # fixed before it starts, and annotation placement is GitHub's to decide --
+      # so the summarizer also emits these as annotations, and this is the same
+      # facts one click in. Last, and if: always(), so the gate above can't
+      # suppress it. Skipped on an empty output, which is how the summarizer
+      # reports "no engine in that slot".
+      # Four slots because this job merges all four engines the PR run calls;
+      # add a slot here (and raise MAX_STEP_NAMES in the summarizer) if that
+      # list grows, or the extra engine appears only in the annotations.
+      - name: ${{ steps.summary.outputs.run_under_test_1 }}
+        if: always() && steps.summary.outputs.run_under_test_1 != ''
+        run: 'true'
+
+      - name: ${{ steps.summary.outputs.run_under_test_2 }}
+        if: always() && steps.summary.outputs.run_under_test_2 != ''
+        run: 'true'
+
+      - name: ${{ steps.summary.outputs.run_under_test_3 }}
+        if: always() && steps.summary.outputs.run_under_test_3 != ''
+        run: 'true'
+
+      - name: ${{ steps.summary.outputs.run_under_test_4 }}
+        if: always() && steps.summary.outputs.run_under_test_4 != ''
+        run: 'true'

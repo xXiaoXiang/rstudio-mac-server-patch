@@ -1,0 +1,16 @@
+[Unit]
+Description=gunicorn-condaR socket
+
+[Socket]
+ListenStream=/run/gunicorn-condaR.sock
+# Our service won't need permissions for the socket, since it
+# inherits the file descriptor by socket activation.
+# Only the nginx daemon will need access to the socket:
+SocketUser=root
+SocketGroup=root
+# Once the user/group is correct, restrict the permissions:
+SocketMode=0660
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

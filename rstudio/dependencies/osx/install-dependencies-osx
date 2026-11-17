@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+#
+# install-dependencies-osx
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+
+set -e
+source "$(dirname "${BASH_SOURCE[0]}")/../tools/rstudio-tools.sh"
+
+help () {
+   cat <<USAGE
+usage: install-dependencies-osx [--arch=<architectures>]
+
+Install the dependencies needed to build RStudio on macOS.
+
+Options
+  --arch=<architectures>
+        Comma-separated list of architectures to install dependencies for
+        (x86_64, arm64). Defaults to the machine's own architecture.
+        Universal Desktop dependencies require an explicit --arch option.
+        Installing x86_64 dependencies on
+        Apple Silicon requires Rosetta 2 and an x86_64 Homebrew at /usr/local.
+USAGE
+}
+
+NATIVE_ARCH="$(uname -m)"
+
+# Server builds on Apple Silicon need only arm64 dependencies. Do not
+# implicitly install osx-64 tools, even on CI. For a universal Desktop
+# build, opt in explicitly with --arch=x86_64,arm64.
+# ARCHS="x86_64,arm64"
+ARCHS="${NATIVE_ARCH}"
+
+for ARG in "$@"; do
+   case "${ARG}" in
+   --arch=*) ARCHS="${ARG#*=}" ;;
+   --help)   help; exit 0 ;;
+   *)        help; error "unknown option '${ARG}'" ;;
+   esac
+done
+
+# the Homebrew prefix for each architecture, as chosen by the Homebrew installer
+brew-prefix () {
+   case "$1" in
+   x86_64) echo "/usr/local" ;;
+   arm64)  echo "/opt/homebrew" ;;
+   esac
+}
+
+check-arch-prerequisites () {
+   local ARCH="$1"
+
+   require-runnable-arch "${ARCH}"
+
+   local BREW
+   BREW="$(brew-prefix "${ARCH}")/bin/brew"
+   if ! [ -x "${BREW}" ]; then
+      error "no ${ARCH} Homebrew found at ${BREW}; see dependencies/osx/README.md for how to install it"
+   fi
+}
+
+# install one architecture's dependencies into its own RSTUDIO_TOOLS_ROOT
+# sibling (e.g. /opt/rstudio-tools/x86_64), with that architecture's
+# Homebrew first on the PATH so its formulae are the ones found
+install-for-arch () {
+   local ARCH="$1"
+   local TOOLS_ROOT="${RSTUDIO_TOOLS_ROOT}/../${ARCH}"
+
+   mkdir-sudo-if-necessary "${TOOLS_ROOT}"
+   TOOLS_ROOT="$(cd "${TOOLS_ROOT}"; pwd -P)"
+
+   section "Installing ${ARCH} Dependencies"
+   PATH="$(brew-prefix "${ARCH}")/bin:${PATH}"  \
+   RSTUDIO_TOOLS_ROOT="${TOOLS_ROOT}"           \
+      arch "-${ARCH}" ./install-dependencies-osx-arch
+}
+
+info "RSTUDIO_TOOLS_ROOT: ${RSTUDIO_TOOLS_ROOT}"
+info "Installing dependencies for: ${ARCHS}"
+
+IFS=',' read -r -a ARCH_LIST <<< "${ARCHS}"
+if [ "${#ARCH_LIST[@]}" -eq 0 ]; then
+   error "no architectures given; expected --arch=x86_64, --arch=arm64 or --arch=x86_64,arm64"
+fi
+
+for ARCH in "${ARCH_LIST[@]}"; do
+   check-arch-prerequisites "${ARCH}"
+done
+
+# install Jenkins pre-requisites
+if is-jenkins; then
+   for ARCH in "${ARCH_LIST[@]}"; do
+      ./install-dependencies-osx-jenkins "${ARCH}"
+   done
+fi
+
+for ARCH in "${ARCH_LIST[@]}"; do
+   install-for-arch "${ARCH}"
+done
+
+# put some necessary utilities on the PATH
+if is-jenkins; then
+   mkdir -p "${HOME}/opt/bin"
+   for PROGRAM in aws gtimeout jq ninja R; do
+      ln -nfs "/opt/homebrew/arm64/bin/${PROGRAM}" "${HOME}/opt/bin/${PROGRAM}"
+   done
+fi
+
+# enable PAM
+if ! is-jenkins; then
+   if ! [ -f "/etc/pam.d/rstudio" ]; then
+      section "Installing RStudio PAM Profile"
+      sudo install -o root -g wheel -m 644 \
+         ../../src/cpp/server/extras/pam/mac/rstudio /etc/pam.d/rstudio
+   fi
+fi
+
+# ensure python requirements are installed
+if ! is-jenkins; then
+   if has-program python3; then
+     section "Installing python packages for i18n"
+     pushd ../../src/gwt/tools/i18n-helpers
+     python3 -m venv VENV
+     ./VENV/bin/pip install --disable-pip-version-check -r commands.cmd.xml/requirements.txt
+     popd
+   fi
+fi

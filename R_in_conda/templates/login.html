@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Sign in RStudio Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}">
+</head>
+<body>
+  <header id="banner" role="banner">
+    <div id="logo">
+        <picture style="margin-right: 10px; margin-left: 6px;">
+          <source srcset="{{ url_for('static', filename='images/svgviewer-output.png') }}"
+                  media="(prefers-color-scheme: dark)">
+          <img src="{{ url_for('static', filename='images/svgviewer-output.png') }}" height="27">
+        </picture>
+    </div>
+  </header>
+
+  <main role="main">
+    {% if error %}
+    <div id="errorpanel">
+      <p id="errortext">Error: {{ error }}</p>
+    </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('login') }}">
+      <div id="border" role="presentation">
+        <div role="group" aria-labelledby="caption_header">
+          <div id="controls">
+            <h1 id="caption_header" class="caption">RStudio Manager</h1>
+
+            <p>
+              <label for="username">Username:</label><br />
+              <input type="text" name="username" id="username" required
+                     autocomplete="off" autocorrect="off"
+                     autocapitalize="off" spellcheck="false" size="45">
+            </p>
+
+            <p>
+              <label for="password">Password:</label><br />
+              <input type="password" name="password" id="password" required
+                     autocomplete="off" autocorrect="off"
+                     autocapitalize="off" spellcheck="false" size="45">
+            </p>
+
+            <div style="display: block">
+              <input type="checkbox" name="staySignedIn" id="staySignedIn" value="1">
+              <label id="staySignedInLabel" for="staySignedIn">
+                Stay signed in when browser closes
+              </label>
+              <p style="display: block">
+                <span style="font-size: 10px">
+                  You will automatically be signed out after 60 minutes of inactivity.
+                </span>
+              </p>
+            </div>
+
+            <div class="buttonpanel">
+              <button id="signinbutton" class="fancy" type="submit">Sign in</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </form>
+
+    <div class="signin-spinner-holder">
+      <div aria-live="polite" class="visuallyhidden" id="progress-message"></div>
+      <div role="progressbar" aria-labelledby="progress-message"
+           id="spinner" class="signin-hidden signin-spinner">
+        {% for _ in range(12) %}
+        <div></div>
+        {% endfor %}
+      </div>
+    </div>
+  </main>
+<script src="{{ url_for('static', filename='js/login.js') }}"></script>
+</body>
+</html>

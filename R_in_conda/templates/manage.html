@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RStudio Management</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/manage.css') }}">
+</head>
+<body>
+<header id="banner" role="banner">
+  <div id="logo" style="display: flex; align-items: center;">
+    <picture>
+      <source srcset="{{ url_for('static', filename='images/svgviewer-output.png') }}" media="(prefers-color-scheme: dark)">
+      <img src="{{ url_for('static', filename='images/svgviewer-output.png') }}" height="27" alt="RStudio">
+    </picture>
+  </div>
+  <div style="margin-left:auto; display:flex; align-items:center;">
+    <span style="margin-right: 12px; vertical-align: middle;"><i>{{ username }}</i></span>
+    <a href="{{ url_for('logout') }}" title="Logout" style="vertical-align: middle;">
+      <img src="{{ url_for('static', filename='images/logout.png') }}" style="vertical-align: middle;" alt="Logout" height="24">
+    </a>
+  </div>
+</header>
+
+<div class="main">
+    <div class="left-panel">
+        <div class="user-panel">
+            <h3 class="section-title">User Info</h3>
+            <div class="user-card">
+                <p><b>Total Users:</b> <span id="totalUsers">0</span></p>
+                <p><b>Total Active Sessions:</b> <span id="totalSessions">0</span></p>
+            </div>
+        </div>
+
+        <div class="envs-panel">
+            <h3 class="section-title">Conda Environments Management</h3>
+            <div id="envList" class="envs-list-scroll">
+                <div class="spinner"></div> Loading envs...
+            </div>
+            <h3 class="section-title"> </h3>
+            <div class="env-actions" style="margin-top: 16px;">
+                <div class="env-row">
+                    <input type="text" id="new-env-name" placeholder="Env name">
+                    <input type="text" id="new-env-channel" placeholder="Channel (conda-forge)">
+                </div>
+                <div class="env-row">
+                    <input type="text" id="new-env-packages" placeholder="Packages (e.g. python r-base=4.3.3)">
+                    <button id="create-env-btn">Create</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="right-panel">
+        <div>
+            <h3 class="section-title">All User Sessions</h3>
+            <label style="margin-left: auto; user-select: none; font-weight: normal; align-items: center;">
+                <input type="checkbox" id="autoRefreshSessions" checked style="align-items: center;"> AutoRefresh
+            </label>
+        </div>
+        <div id="sessionList" class="list-grid">
+            <div class="spinner"></div> Loading sessions...
+        </div>
+    </div>
+</div>
+
+<script>
+    const CURRENT_USER = "{{ username }}";
+</script>
+<script src="{{ url_for('static', filename='js/manage.js') }}"></script>
+</body>
+</html>

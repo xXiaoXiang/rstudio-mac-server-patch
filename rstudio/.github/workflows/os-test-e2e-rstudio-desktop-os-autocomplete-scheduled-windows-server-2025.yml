@@ -1,0 +1,247 @@
+name: "Test: E2E Playwright RStudio Autocomplete Scheduled (Desktop, Windows Server 2025 x64, Open Source)"
+
+on:
+  schedule:
+    - cron: '0 8,20 * * *'
+  workflow_dispatch:
+    inputs:
+      rstudio_installer_url:
+        description: "URL to a Desktop installer (.deb on Ubuntu, .rpm on RHEL/Fedora, .exe on Windows, .dmg on macOS). Leave empty to auto-resolve the latest daily for this workflow's platform. To pin a specific build, paste its full URL from dailies.rstudio.com."
+        type: string
+        default: ""
+      r_version:
+        description: >-
+          Exact R version to install, as X.Y.Z. Empty (the default) uses
+          RSTUDIO_R_VERSION from dependencies/tools/rstudio-tools.sh, which is
+          the single place the version CI tests against is pinned. Any version
+          named here must already be mirrored into rstudio-buildtools; see
+          dependencies/tools/upload-r.sh.
+        type: string
+        default: ""
+      project:
+        description: "Playwright project to run: 'desktop' or 'server'. OS and edition are auto-filtered from the host platform and PW_RSTUDIO_EDITION."
+        type: string
+        default: "desktop"
+      grep:
+        description: "Optional Playwright --grep pattern to run only tests whose title matches."
+        type: string
+        default: ""
+      test_selector:
+        description: "Optional test paths/files/directories to run (space-separated). Matched as substrings against test file paths. Examples: 'autocomplete.test.ts', 'tests/panes/misc/', 'autocomplete tests/panes/posit-assistant-chat/'. Leave empty to run all tests (default runs autocomplete tests)."
+        type: string
+        default: "autocomplete.test.ts"
+      test_ignore:
+        description: "Optional test paths/files/directories to exclude (space-separated globs). Examples: '**/code_suggestions.test.ts', '**/posit-assistant-chat/**'. Leave empty to exclude nothing."
+        type: string
+        default: ""
+      grep_invert:
+        description: "Optional Playwright --grep-invert pattern to skip tests by title."
+        type: string
+        default: ""
+      rstudio_extra_args:
+        description: "Optional extra args passed to RStudio Desktop on launch (space-separated). Maps to PW_RSTUDIO_EXTRA_ARGS."
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      rstudio_installer_url:
+        type: string
+        default: ""
+      r_version:
+        type: string
+        default: ""
+      project:
+        type: string
+        default: "desktop"
+      grep:
+        type: string
+        default: ""
+      test_selector:
+        type: string
+        default: "autocomplete.test.ts"
+      test_ignore:
+        type: string
+        default: ""
+      grep_invert:
+        type: string
+        default: ""
+      rstudio_extra_args:
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write  # OIDC for the S3 report upload (os-publish-e2e-report)
+
+jobs:
+  e2e-desktop-windows:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # os-e2e-deps installs the harness's required packages here and exports
+      # PW_RSTUDIO_R_LIBS_USER so globalSetup finds them at test time.
+      R_LIBS_USER: ${{ github.workspace }}\R-libs
+      # Point globalSetup's R-libs provisioner at the same library the
+      # e2e-deps action installs and caches (see the main windows-server-2025
+      # workflow). Without this the harness default is
+      # %LOCALAPPDATA%\rstudio-playwright\r-libs\... -- a different path, so
+      # packages re-download from CRAN on every run of this ephemeral runner.
+      PW_RSTUDIO_R_LIBS_USER: ${{ github.workspace }}\R-libs
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: e2e/rstudio/package-lock.json
+
+      - name: Install R
+        uses: ./.github/actions/os-install-r-windows
+        with:
+          r-version: ${{ inputs.r_version }}
+
+      - name: Resolve daily manifest URL
+        id: manifest
+        uses: ./.github/actions/os-resolve-daily-manifest
+
+      - name: Resolve RStudio .exe URL
+        id: resolve
+        env:
+          INSTALLER_URL: ${{ inputs.rstudio_installer_url }}
+          MANIFEST_URL: ${{ steps.manifest.outputs.manifest-url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = $env:INSTALLER_URL
+          $manifestUrl = $env:MANIFEST_URL
+          $sha = ''
+          $filename = ''
+          if ([string]::IsNullOrEmpty($url)) {
+            $manifest = Invoke-RestMethod -Uri $manifestUrl
+            $win = $manifest.products.electron.platforms.windows
+            $url = $win.link
+            $sha = $win.sha256
+            $filename = $win.filename
+            if ([string]::IsNullOrEmpty($url) -or [string]::IsNullOrEmpty($filename) -or [string]::IsNullOrEmpty($sha)) {
+              Write-Error "No usable windows entry in $manifestUrl (url='$url', filename='$filename', sha256='$sha'). Either this release branch has no Windows daily yet, or the manifest schema changed."
+              exit 1
+            }
+            Write-Host "Auto-resolved windows daily:"
+            Write-Host "  URL:      $url"
+            Write-Host "  SHA-256:  $sha"
+            Write-Host "  Filename: $filename"
+          } else {
+            $filename = Split-Path -Leaf $url
+            Write-Host "Using override URL: $url (SHA-256 verification skipped)"
+          }
+          "url=$url"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$sha"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "filename=$filename" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Downloaded fresh every run rather than cached: dailies.rstudio.com is
+      # already S3/CDN-backed, and GH Actions cache scoping means concurrent
+      # runs can't share a cache entry with each other anyway, so caching here
+      # would just duplicate the same bytes into the shared cache quota
+      # without saving meaningful time.
+      - name: Download RStudio .exe
+        env:
+          DOWNLOAD_URL: ${{ steps.resolve.outputs.url }}
+          DOWNLOAD_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest `
+            -Uri $env:DOWNLOAD_URL `
+            -OutFile $env:DOWNLOAD_FILENAME `
+            -MaximumRetryCount 3 -RetryIntervalSec 5
+
+      - name: Verify SHA-256
+        if: steps.resolve.outputs.sha256 != ''
+        env:
+          EXPECTED_SHA256: ${{ steps.resolve.outputs.sha256 }}
+          DOWNLOAD_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_SHA256.ToLower()
+          $actual = (Get-FileHash -Algorithm SHA256 $env:DOWNLOAD_FILENAME).Hash.ToLower()
+          if ($expected -ne $actual) {
+            Write-Error "SHA-256 mismatch. Expected: $expected. Actual: $actual."
+            exit 1
+          }
+          Write-Host "SHA-256 OK: $actual"
+
+      - name: Install RStudio
+        env:
+          INSTALLER_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process -FilePath ".\$env:INSTALLER_FILENAME" -ArgumentList '/allusers', '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "RStudio installer exited $($p.ExitCode)"; exit 1 }
+          $exe = 'C:\Program Files\RStudio\rstudio.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Error "RStudio binary not found at $exe after install."
+            exit 1
+          }
+          Get-Item $exe | Format-List FullName, Length, LastWriteTime
+
+      # install-required-packages: see the main windows-server-2025 workflow --
+      # pre-installs the harness's REQUIRED_PACKAGES set into the cached
+      # library so nothing installs from CRAN at test time.
+      - name: Install e2e test dependencies
+        uses: ./.github/actions/os-e2e-deps
+        with:
+          r-libs-user: ${{ env.R_LIBS_USER }}
+          install-required-packages: "true"
+
+      - name: Run Playwright tests
+        working-directory: e2e/rstudio
+        env:
+          PW_RSTUDIO_MODE: desktop
+          PW_RSTUDIO_EDITION: os
+          PW_PROJECT_NAME: ${{ inputs.project || 'desktop' }}
+          PW_GREP: ${{ inputs.grep }}
+          PW_GREP_INVERT: ${{ inputs.grep_invert }}
+          PW_TEST_SELECTOR: ${{ inputs.test_selector || 'autocomplete.test.ts' }}
+          PW_TEST_IGNORE: ${{ inputs.test_ignore }}
+          PW_RSTUDIO_EXTRA_ARGS: ${{ inputs.rstudio_extra_args }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pwArgs = @('--project', $env:PW_PROJECT_NAME)
+          if (-not [string]::IsNullOrEmpty($env:PW_GREP)) {
+            $pwArgs += '--grep'
+            $pwArgs += $env:PW_GREP
+          }
+          if (-not [string]::IsNullOrEmpty($env:PW_GREP_INVERT)) {
+            $pwArgs += '--grep-invert'
+            $pwArgs += $env:PW_GREP_INVERT
+          }
+          if (-not [string]::IsNullOrEmpty($env:PW_TEST_SELECTOR)) {
+            $pwArgs += '--'
+            $pwArgs += ($env:PW_TEST_SELECTOR -split '\s+' | Where-Object { $_ -ne '' })
+          }
+          npx playwright test @pwArgs
+
+      # The report's only copy, browsable from the Posit tailnet (see
+      # .github/e2e-reports) and linked from the run's Summary page; a GitHub
+      # artifact could be downloaded by anyone signed in to GitHub.
+      - name: Publish report to S3
+        if: always()
+        uses: ./.github/actions/os-publish-e2e-report
+        with:
+          role-arn: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+          label: autocomplete-windows
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results
+          path: e2e/rstudio/test-results/
+          if-no-files-found: ignore

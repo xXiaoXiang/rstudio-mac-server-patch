@@ -1,0 +1,20 @@
+dependency(QUARTO
+   DEPNAME      "Quarto"
+   REPOSITORY   "https://github.com/quarto-dev/quarto-cli"
+)
+
+dependency(PANDOC
+   DEPNAME      "pandoc"
+   REPOSITORY   "https://github.com/jgm/pandoc"
+   REVISION     "main"
+   LICENSE      "GPL-2.0-or-later"
+   LICENSE_PATH "COPYRIGHT"
+)
+
+dependency(RIG
+   DEPNAME      "rig"
+   REPOSITORY   "https://github.com/r-lib/rig"
+   REVISION     "v0.11.0"
+   LICENSE      "MIT"
+   LICENSE_PATH "LICENSE"
+)

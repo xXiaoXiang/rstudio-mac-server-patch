@@ -1,0 +1,550 @@
+# RStudio
+
+These instructions apply to the RStudio open-source IDE repository.
+
+
+## Code Structure
+
+Broadly speaking, RStudio is split into three different components -- the front-end / user interface, the desktop integration, and the backend / server components.
+
+- The user interface uses a mixture of Google GWT and JavaScript, in `src/gwt`.
+- The desktop integration lives in `src/node/desktop`, as an Electron application.
+- The backend and server components live in `src/cpp`, and are primarily authored in C++ and R.
+
+
+### Backend Layout (`src/cpp`)
+
+    src/cpp/
+    ├── core/              # Foundation libraries (http, json, system, text, etc.)
+    ├── shared_core/       # Shared between server and session
+    ├── server_core/       # Server-specific core utilities
+    ├── r/                 # R integration layer
+    │   └── R/             # Core R functions (Api.R, Tools.R, etc.)
+    ├── session/           # Session management (main IDE backend)
+    │   ├── modules/       # Feature modules (one per feature)
+    │   ├── include/       # Public headers
+    │   └── resources/     # Schemas, templates, static resources
+    ├── server/            # RStudio Server (auth, db, launcher)
+    └── tests/             # C++ and automation tests
+
+
+### Frontend Layout (`src/gwt`)
+
+    src/gwt/src/org/rstudio/
+    ├── core/client/               # Core GWT utilities (widgets, dom, events, js interop)
+    └── studio/client/
+        ├── application/           # Application lifecycle
+        ├── common/                # Shared components
+        ├── server/                # Server communication interfaces
+        └── workbench/
+            ├── commands/          # Command infrastructure (Commands.cmd.xml)
+            ├── events/            # Event definitions
+            ├── model/             # Data models
+            ├── ui/                # UI components
+            └── views/             # Feature views (one per pane)
+                ├── source/        # Source editor (largest subsystem)
+                ├── console/       # R console
+                ├── environment/   # Environment pane
+                ├── files/         # Files pane
+                ├── plots/         # Plots pane
+                ├── packages/      # Packages pane
+                ├── help/          # Help pane
+                ├── terminal/      # Terminal pane
+                ├── chat/          # AI chat pane
+                ├── vcs/           # Git/SVN integration
+                ├── connections/   # Database connections
+                ├── jobs/          # Background jobs
+                └── ...            # buildtools, viewer, tutorial, presentation, etc.
+
+
+### R Code Locations
+
+R code lives in several places and serves different purposes:
+
+- `src/cpp/r/R/` -- core R functions shipped with RStudio (Api.R, Tools.R, etc.)
+- `src/cpp/session/modules/*.R` -- R-side logic for session modules (e.g. SessionChat.R)
+- `scripts/` -- build and code generation scripts
+
+
+## Session Module System
+
+Each backend feature is implemented as a session module. Modules follow a consistent pattern:
+
+
+### File naming convention
+
+    src/cpp/session/modules/SessionXxx.cpp   # C++ implementation
+    src/cpp/session/modules/SessionXxx.hpp   # C++ header (if needed)
+    src/cpp/session/modules/SessionXxx.R     # R-side logic (if needed)
+
+
+### Module structure
+
+Each module lives in its own namespace and has an `initialize()` function that registers RPC methods and event handlers:
+
+```cpp
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace xxx {
+
+namespace {
+// Private helper functions and RPC handlers
+} // anonymous namespace
+
+Error initialize()
+{
+   using boost::bind;
+   using namespace module_context;
+
+   ExecBlock initBlock;
+   initBlock.addFunctions()
+      (bind(registerRpcMethod, "xxx_do_something", xxxDoSomething))
+      (bind(sourceModuleRFile, "SessionXxx.R"));
+
+   return initBlock.execute();
+}
+
+} // namespace xxx
+} // namespace modules
+} // namespace session
+} // namespace rstudio
+```
+
+
+### Key module infrastructure
+
+- `src/cpp/session/include/session/SessionModuleContext.hpp` -- module registration API (`registerRpcMethod`, `registerAsyncRpcMethod`, `sourceModuleRFile`, `enqueClientEvent`, etc.)
+- `src/cpp/session/include/session/worker_safe/session/SessionClientEvent.hpp` -- client event type constants (declarations)
+
+
+## Client-Server Communication
+
+The frontend and backend communicate via JSON-RPC over HTTP. Understanding this flow is essential for most feature work.
+
+
+### RPC (Frontend → Backend)
+
+1. **Backend** registers an RPC handler in a session module's `initialize()`:
+
+       registerRpcMethod("chat_start_backend", chatStartBackend)
+
+   The handler function receives a `JsonRpcRequest` and populates a `JsonRpcResponse`.
+
+2. **Frontend** defines the method in a `*ServerOperations` interface:
+
+   ```java
+   // e.g. ChatServerOperations.java
+   public interface ChatServerOperations
+   {
+       void chatStartBackend(ServerRequestCallback<JsObject> callback);
+   }
+   ```
+
+   `RemoteServer.java` implements the method and names the RPC explicitly -- there is no automatic
+   snake_case to camelCase mapping:
+
+   ```java
+   sendRequest(RPC_SCOPE, "chat_start_backend", requestCallback);
+   ```
+
+3. **Frontend** calls it from a presenter or view via the injected server operations interface.
+
+
+### Client Events (Backend → Frontend)
+
+1. **Backend** fires an event using `module_context::enqueClientEvent()`:
+
+   ```cpp
+   ClientEvent event(client_events::kExecuteAppCommand, data);
+   module_context::enqueClientEvent(event);
+   ```
+
+   Event type constants are declared in `worker_safe/session/SessionClientEvent.hpp` and given their
+   values and wire names in `src/cpp/session/SessionClientEvent.cpp`.
+
+2. **Frontend** receives the event through the `EventBus` and dispatches it to registered handlers.
+
+
+## GWT Frontend Patterns
+
+
+### Dependency Injection (GIN)
+
+The GWT frontend uses GIN (GWT INjection, based on Guice) for dependency injection.
+
+- `RStudioGinModule.java` -- binds interfaces to implementations
+- `RStudioGinjector.java` -- provides access to injected singletons
+- Use `@Inject` on constructors to wire dependencies
+
+
+### MVP Pattern
+
+Views follow Model-View-Presenter separation:
+
+- **Presenter** (e.g. `ChatPresenter.java`) -- manages logic, handles events, calls server operations
+- **View interface** (e.g. `ChatPresenter.Display`) -- defines the UI contract
+- **View implementation** (e.g. `ChatPane.java`) -- implements the widget and UI
+
+
+### EventBus
+
+Components communicate through a central `EventBus` using typed events. Fire events with `eventBus_.fireEvent()` and handle them by implementing the corresponding `Handler` interface.
+
+
+### Server Operations
+
+Each feature area defines a `*ServerOperations` interface for its RPC calls. These are aggregated into `Server.java`, which is the main server interface.
+
+
+## Accessibility
+
+UI work should aim for [WCAG 2.2 Level AA](https://www.w3.org/TR/WCAG22/) conformance, with
+particular attention to keyboard operability and screen reader support. Much of RStudio's
+existing UI doesn't meet it yet, so treat this as a goal, not a requirement:
+
+- **New UI** should be built to conform from the start.
+- **Changes to existing UI** should not make accessibility worse. Fix nearby problems when the
+  fix is small and self-contained; flag larger gaps instead of growing a small change into an
+  accessibility rewrite.
+
+
+## Adding a New Feature (Checklist)
+
+When implementing a new feature end-to-end:
+
+1. **Backend module**: Create `src/cpp/session/modules/SessionXxx.cpp` with `initialize()`, RPC handlers, and optionally a companion `.R` file.
+2. **Wire the module**: Register the module's `initialize()` in the session startup sequence.
+3. **Client events** (if needed): Declare the constant in `worker_safe/session/SessionClientEvent.hpp`, define its value and wire name in `SessionClientEvent.cpp`, then add the wire name to the frontend's `ClientEvent.java` and dispatch it in `ClientEventDispatcher.java`.
+4. **Server operations**: Create a `*ServerOperations.java` interface in the GWT frontend, add it to the `extends` list of `WorkbenchServerOperations.java` (which `Server.java` extends), and implement its methods in `RemoteServer.java`.
+5. **Frontend view**: Add UI under `src/gwt/.../workbench/views/`.
+6. **Commands** (if needed): Add to `Commands.cmd.xml`, add stubs to `Commands.java`, and update the MD5 checksum.
+7. **DI wiring**: Bind new classes in `RStudioGinModule.java`.
+
+
+## Key Files Reference
+
+Backend:
+- `src/cpp/session/include/session/SessionModuleContext.hpp` -- module registration API
+- `src/cpp/session/include/session/worker_safe/session/SessionClientEvent.hpp` -- client event type constants
+- `src/cpp/session/resources/schema/user-prefs-schema.json` -- user preferences schema
+- `src/cpp/session/resources/schema/user-state-schema.json` -- UI state schema
+- `src/cpp/session/session-options.json` -- session CLI options schema
+- `src/cpp/server/server-options.json` -- server CLI options schema
+
+Frontend:
+- `src/gwt/src/org/rstudio/studio/client/RStudioGinModule.java` -- DI bindings
+- `src/gwt/src/org/rstudio/studio/client/RStudioGinjector.java` -- DI accessor
+- `src/gwt/src/org/rstudio/studio/client/server/Server.java` -- aggregated server operations
+- `src/gwt/src/org/rstudio/studio/client/workbench/commands/Commands.cmd.xml` -- command definitions
+- `src/gwt/src/org/rstudio/studio/client/workbench/commands/Commands.java` -- command stubs
+
+
+## Common Debugging Patterns
+
+- **Find where an RPC is handled**: grep for the RPC name (e.g. `"chat_start_backend"`) in `src/cpp/session/modules/`.
+- **Find a command handler**: grep for `on<CommandName>` with `@Handler` in `src/gwt/`.
+- **Find where a preference is used**: search for its key from `user-prefs-schema.json` in both `src/cpp/` and `src/gwt/`.
+- **Trace a client event**: the wire name (e.g. `execute_app_command`) links the C++ constant in `SessionClientEvent.cpp` (`kExecuteAppCommand`) to the Java constant in `ClientEvent.java` (`ClientEvent.ExecuteAppCommand`). Grep for the C++ constant to find where it's fired, and for the Java constant to find where it's dispatched.
+
+
+## Building RStudio
+
+These sections describe how to build RStudio from the command line.
+
+
+### Frontend
+
+To quickly verify that Java changes compile correctly:
+
+    cd src/gwt && ant javac
+
+This only runs the Java compiler — it does NOT produce runnable JavaScript.
+
+To produce runnable code (GWT transpile to JavaScript, draft/debug mode):
+
+    cd src/gwt && ant draft
+
+Use `ant draft` after making changes you need to test in the browser. Use `ant javac` as a fast check when iterating on Java code.
+
+If you modify JavaScript components (e.g. in `src/gwt/acesupport`), also run:
+
+    cd src/gwt && ant acesupport
+
+RStudio builds against a fork of GWT. To change the fork or update the GWT version, see
+`src/gwt/tools/build-gwt-README.md`.
+
+
+### Backend
+
+To build the backend components, you can use:
+
+    cd build && cmake --build . --target all
+
+If the build directory does not yet exist, you can create and configure the project with:
+
+    mkdir build
+    cd build
+    cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 ..
+
+
+### Desktop Integration
+
+To build the Electron application / desktop components, you can use:
+
+    cd src/node/desktop && npm run package
+
+
+### Development Server
+
+To bring up a development RStudio Server for manual testing -- of this checkout
+or of a git worktree -- use the repo-level tasks:
+
+    npm run rserver-dev                          # this checkout
+    npm run rserver-dev -- <path-to-worktree>    # another checkout
+    npm run rserver-status -- --all              # what is running
+    npm run rserver-stop                         # stop it
+
+`rserver-dev` builds the backend, starts `rserver` and `ant devmode` on
+per-instance ports (so several worktrees can serve at once), and prints the
+localhost URL. The processes outlive the task; logs and state land in
+`<checkout>/.rstudio-dev/`, including the sessions' own RStudio config and
+data homes (pass `--user-config` to use yours), so preferences changed while
+testing stay out of `~/.config/rstudio`. See `tasks/README.md` for the options.
+
+
+### Git Worktrees
+
+A new worktree has no gitignored dependencies. The GWT and CMake builds fall back
+to the primary checkout's `dependencies/`, so install and build there only. Then
+run this once per worktree, from inside it:
+
+    scripts/bootstrap-worktree.sh --with-build-dir
+
+It clones `node_modules` from the primary checkout (or runs `npm ci` when the
+lockfile differs) and configures a fresh `build/`. Never copy or symlink the
+primary checkout's `build/` -- its absolute paths would build and serve the
+primary checkout's code. After that, build and test as usual from the worktree.
+
+
+## Writing Automated Tests
+
+End-to-end tests are written in TypeScript with Playwright, under `e2e/rstudio/`. They drive the IDE through a JS automation bridge at `window.rstudio`, documented in `e2e/rstudio/CLAUDE.md`. See `.claude/skills/rstudio-create-playwright-tests/SKILL.md` for detailed guidance on writing Playwright tests, and `.claude/skills/rstudio-run-playwright-tests/SKILL.md` for how to run them.
+
+
+## Testing
+
+
+### C++ and R Tests
+
+Both are run through `rstudio-tests`, generated into the build directory
+(from `src/cpp/rstudio-tests.in`):
+
+    ./build/src/cpp/rstudio-tests --scope <scope> --filter <pattern>
+
+The `core`, `rserver`, and `rsession` scopes run the C++ Google Test suites.
+The `r` scope runs the R `testthat` suite under `src/cpp/tests/testthat/`
+(e.g. `test-help.R`). `--filter` is a `testthat::test_dir()` filter: a regular
+expression matched against the test file name after its `test-` prefix and
+`.R` extension are stripped, so `test-help.R` is reached with
+`--scope r --filter help` -- NOT with `--scope rsession`, which only runs C++
+tests and ignores the testthat files. Rebuild first so the staged R copies
+under `build/src/cpp/session/modules/R/` are current.
+
+On Windows the runner is `rstudio-tests.bat` (from `src/cpp/rstudio-tests.bat.in`),
+where `--scope` takes more than one scope -- `--scope core,rsession` -- and
+`rserver` is a no-op because those tests aren't built there.
+
+
+### GWT Tests
+
+    cd src/gwt && ant unittest
+
+The standalone HTML test pages in `src/gwt/test/` (autoindent, highlight) are exercised in headless chromium via:
+
+    cd src/gwt && ant testpage
+
+`ant test` runs both `unittest` and `testpage`.
+
+
+### Desktop (Electron) Verification
+
+    cd src/node/desktop && npm test          # Unit tests
+    cd src/node/desktop && npm run lint      # ESLint
+    cd src/node/desktop && npm run typecheck # TypeScript type checking (tsc --noEmit)
+
+Run all three before committing changes to `src/node/desktop/`. Note that `npm run lint` only runs ESLint — it does not catch type errors that the webpack build will reject.
+
+
+## Code Style
+
+
+### Non-ASCII Characters
+
+In R source files (`.R`) under `src/cpp`, use only ASCII characters -- including in comments. Replace non-ASCII characters with ASCII equivalents (e.g. `-` for `·`, `--` for `—`, straight `'`/`"` for smart quotes). This is enforced: the test in `src/cpp/tests/testthat/test-linter.R` fails if any such file contains non-ASCII characters.
+
+
+### R
+
+When documenting R code, use Roxygen style for formatting. For example:
+
+    #' Work
+    #'
+    #' Perform work until the timeout is reached.
+    #'
+    #' @param callback The R callback to execute.
+    #' @param timeout The maximum amount of time to wait, in seconds.
+    work <- function(callback, timeout) { ... }
+
+
+### C++
+
+C++ code is formatted with clang-format. The configuration is in `src/cpp/.clang-format`. Key settings:
+
+- 3-space indentation
+- Allman brace style, except namespaces keep their opening brace on the same line (`namespace x {`)
+- No tabs
+- No column limit: clang-format does not re-wrap long lines, and include/using order and comment prose are left as written. It acts as a brace/indent/spacing normalizer, so running it over existing code stays low-churn.
+
+
+### TypeScript (Desktop)
+
+TypeScript code uses ESLint and Prettier. From `src/node/desktop`:
+
+    npm run lint      # Check for issues
+    npm run format    # Auto-format code
+
+
+## NOTICE
+
+Don't edit the `NOTICE` file by hand. It is generated by a process in the rstudio-pro repository,
+so hand edits here would be overwritten. To change it, update and regenerate it in rstudio-pro,
+then copy the regenerated file here in a separate PR.
+
+
+## Schema-Driven Code Generation
+
+Several parts of the codebase are generated from JSON schema files.
+
+
+### User Preferences and State
+
+User preferences and UI state are declaratively defined in:
+
+    src/cpp/session/resources/schema/user-prefs-schema.json
+    src/cpp/session/resources/schema/user-state-schema.json
+
+After modifying either file, regenerate with:
+
+    Rscript scripts/generate-prefs.R
+
+
+### Server and Session Options
+
+Command-line options for the server and session binaries are defined in:
+
+    src/cpp/server/server-options.json
+    src/cpp/session/session-options.json
+
+After modifying either file, regenerate with:
+
+    Rscript scripts/generate-options.R
+
+
+## Commands
+
+RStudio defines its commands as part of a file at:
+
+    src/gwt/src/org/rstudio/studio/client/workbench/commands/Commands.cmd.xml
+
+When a command is added here, a stub will also need to be added to the file at:
+
+    src/gwt/src/org/rstudio/studio/client/workbench/commands/Commands.java
+
+When Commands.cmd.xml changes, build with `ant` or `ant draft` to regenerate src/gwt/src/org/rstudio/studio/client/workbench/commands/Commands.cmd.xml.MD5 (it is generated; don't edit it by hand), and include it in the commit.
+
+
+### Command Handlers
+
+Handlers for commands can be implemented almost anywhere in the code base. A command handler has the format:
+
+    @Handler
+    void on<Command>() { ... }
+
+where `<Command>` is the name of the command, but with the first letter capitalized.
+
+
+Any class which implements handlers in this form will also need to create a CommandBinder; e.g.
+
+    interface Binder extends CommandBinder<Commands, ThisClass> {}
+
+And then the constructor should have the form:
+
+    @Inject
+    class ThisClass(Commands commands, Binder binder)
+    {
+        binder.bind(commands, this);
+    }
+
+possibly with other injected parameters.
+
+
+## NEWS.md
+
+When fixing a bug or adding a new feature, add an entry to the appropriate section (`### New`, `### Fixed`, etc.) of `NEWS.md`. Follow the existing format:
+
+    - ([#NNNN](https://github.com/rstudio/rstudio/issues/NNNN)): Brief description of the change
+
+Exceptions — do NOT add a NEWS.md entry for:
+- Fixes to unreleased features still under active development
+- Fixes to bugs introduced since the last release (i.e., bugs no official-release user has encountered)
+- Open-source companion PRs for rstudio-pro changes (typically identified by a link to a pro-repo PR/issue or wording like "open-source companion") -- these are tracked in a separate NEWS file in the pro repository
+
+
+## Pull Requests
+
+- Pull requests that resolve a user-facing issue should be associated with a GitHub issue. Developer-only or internal changes (e.g. debugging helpers, build/tooling tweaks) do not require one.
+- Pull requests that fix an existing issue, and also include tests, should include "Fixes #<issue>." in their body.
+- Pull requests that only partially address an issue, or require manual verification, should include "Addresses #<issue>." in their body.
+- When generating a pull request, set the Milestone of the pull request to match contents of @version/RELEASE, if there is a matching milestone already defined. Never create a new milestone.
+
+
+### Open-Source Companion PRs
+
+A change spanning open-source and pro-only code is made in rstudio-pro first: the whole change is
+opened as a PR there, reviewed, and approved, but not merged. An "open-source companion" PR here
+then carries just the open-source portion. It gets a cursory review and is merged, rstudio is
+merged downstream into rstudio-pro, and then the rstudio-pro PR is merged. This only works if the
+companion's changes exactly match the open-source portion of the rstudio-pro PR.
+
+When reviewing a PR that mentions an associated rstudio-pro PR (a link to a pro-repo PR/issue, or
+wording like "open-source companion"), flag it first and ask the author to confirm the rstudio-pro
+PR has already been reviewed and approved, and that this PR matches its open-source portion, before
+any detailed review. If you can read the rstudio-pro PR, compare the diffs yourself and report any
+divergence. Once confirmed, keep the review cursory, and note that any requested change must also
+be made in the rstudio-pro PR, or the two will be out of sync. If it hasn't been reviewed yet,
+recommend that it be reviewed in rstudio-pro first, rather than iterating here.
+
+
+## Git Conventions
+
+For commit messages:
+
+- Use "Addresses #<issue>" instead of "Fixes #<issue>".
+
+For branch naming:
+
+- Use the 'bugfix/' prefix for code changes which fix an existing issue.
+- Use the 'feature/' prefix for code changes that add or extend existing functionality.
+- Use the 'developer/' prefix for code changes that are primarily for developer ergonomics.
+- Use the 'test/' prefix for code changes that are focused on automated tests.
+
+
+## Issues
+
+- When instructed to investigate or fix a GitHub issue, update the Assignee to the current user (`gh api user --jq .login`), and check that the issue has been added to the RStudio IDE project with an "In Progress" status.
+- If the issue describes a bug, add the label `bug`
+- If the issue is for a new feature or enhancements to an existing feature, add the label `enhancement`
+- If the issue reports a product defect or regression and was filed by someone outside Posit, also add the label `support`. Check the reporter with `gh api repos/rstudio/rstudio/issues/<N> --jq .author_association`; `MEMBER` means Posit staff, so skip the label. Staff-filed bugs, accessibility audit items, and CI, build, or tech-debt issues do not get it.
+- These labels apply to issues only, not to pull requests
+

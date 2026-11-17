@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RStudio Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+</head>
+<body>
+<header id="banner" role="banner">
+  <div id="logo" style="display: flex; align-items: center;">
+    <picture>
+      <source srcset="{{ url_for('static', filename='images/svgviewer-output.png') }}" media="(prefers-color-scheme: dark)">
+      <img src="{{ url_for('static', filename='images/svgviewer-output.png') }}" height="27" alt="RStudio">
+    </picture>
+  </div>
+  <div style="margin-left:auto; display:flex; align-items:center;">
+    <span style="margin-right: 12px;"><i>{{ username }}</i></span>
+    <a href="{{ url_for('logout') }}" title="Logout">
+      <img src="{{ url_for('static', filename='images/logout.png') }}" style="vertical-align: middle;" alt="Logout" height="24">
+    </a>
+  </div>
+</header>
+
+<div class="main">
+    <div class="left-panel">
+        <div class="user-panel">
+            <h3 class="section-title">User Info</h3>
+            <div class="user-card">
+                <p><b>Username:</b> {{ username }}</p>
+                <p><b>Total Sessions:</b> <span id="activeCount">0</span></p>
+            </div>
+        </div>
+
+        <div class="envs-panel">
+            <h3 class="section-title">Conda Environments</h3>
+            <div id="envList" class="envs-list-scroll">
+                <div class="spinner"></div> Loading envs...
+            </div>
+        </div>
+    </div>
+
+    <!-- 右边栏 -->
+    <div class="right-panel">
+        <h3 class="section-title">RStudio Session History</h3>
+        <div id="sessionList" class="list-grid">
+            <div class="spinner"></div> Loading sessions...
+        </div>
+    </div>
+</div>
+
+<script>
+    const CURRENT_USER = "{{ username }}";
+</script>
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

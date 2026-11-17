@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+#
+# install-panmirror
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+set -e
+
+source "$(dirname "${BASH_SOURCE[0]}")/../tools/rstudio-tools.sh"
+section "Installing panmirror (visual editor)"
+
+info "RSTUDIO_TOOLS_ROOT: ${RSTUDIO_TOOLS_ROOT}"
+GWT_ROOT_DIR="$(dirname "${BASH_SOURCE}")/../../src/gwt"
+QUARTO_DIR="${GWT_ROOT_DIR}/lib/quarto"
+PANMIRROR_DIR="${QUARTO_DIR}/packages/editor"
+PANMIRROR_WWW_DIR="${GWT_ROOT_DIR}/www/js/panmirror"
+
+info "GWT_ROOT_DIR: ${GWT_ROOT_DIR}"
+info "QUARTO_DIR: ${QUARTO_DIR}"
+
+QUARTO_REPO_URL="https://github.com/quarto-dev/quarto.git"
+
+# panmirror is taken from a branch of the quarto repo named for the RStudio release
+# cycle. Open a cycle by branching quarto's 'main' as release/rstudio-<flower>; to
+# take panmirror changes mid-cycle, create a NEW branch with a numeric suffix
+# (release/rstudio-<flower>-01, -02, ...) and point PANMIRROR_BRANCH at it.
+#
+# IMPORTANT: treat a branch named here as immutable -- never push to it. Editing
+# this script is what invalidates the Docker layer that bakes panmirror into the
+# Jenkins builder images, so nothing detects a branch tip that moves: images cached
+# before the push keep the old panmirror while freshly built ones get the new code,
+# and the divergence is silent.
+PANMIRROR_BRANCH="release/rstudio-parrot-balsam"
+
+info "PANMIRROR_BRANCH: ${PANMIRROR_BRANCH}"
+
+# Check the branch up front; the git errors from the clone and checkout below don't
+# say what to do about a missing branch. Match the full ref path rather than passing
+# --heads with a bare name: --heads matches any tail of a ref at a path boundary, so a
+# name missing the 'release/' prefix would match the real branch and pass the check.
+# Never fall back to another branch -- that would silently ship the wrong panmirror.
+LS_REMOTE_STATUS=0
+git ls-remote --exit-code "${QUARTO_REPO_URL}" "refs/heads/${PANMIRROR_BRANCH}" > /dev/null \
+  || LS_REMOTE_STATUS=$?
+
+# Only --exit-code's 2 means "no such ref". Anything else -- 128 for network, DNS or
+# TLS trouble -- must not be reported as a missing branch, or an outage sends whoever
+# reads the log off to create a branch that is already there.
+if [ "${LS_REMOTE_STATUS}" -eq 2 ]; then
+  error "Branch '${PANMIRROR_BRANCH}' does not exist in ${QUARTO_REPO_URL}." \
+        "Create it from quarto's 'main', or edit PANMIRROR_BRANCH in this script." >&2
+  exit 1
+elif [ "${LS_REMOTE_STATUS}" -ne 0 ]; then
+  error "Could not reach ${QUARTO_REPO_URL} to look for '${PANMIRROR_BRANCH}'" \
+        "(git exited ${LS_REMOTE_STATUS})." >&2
+  exit 1
+fi
+
+# clone quarto monorepo if not already cloned
+if ! test -e "$QUARTO_DIR"; then
+  echo "Cloning quarto repo"
+  git clone --branch "$PANMIRROR_BRANCH" "$QUARTO_REPO_URL" "$QUARTO_DIR"
+  pushd $QUARTO_DIR
+  git rev-parse HEAD
+  popd
+else
+  echo "quarto repo already cloned in '$QUARTO_DIR'"
+
+  pushd $QUARTO_DIR
+  git fetch
+  git reset --hard && git clean -dfx
+  # Force the branch to the fetched tip rather than checkout + pull. A local branch
+  # left ahead of origin -- an interrupted earlier run, or an upstream force-push --
+  # makes pull report "Already up to date" and exit 0 while HEAD sits on a commit that
+  # is not the branch tip, which is the divergence this whole scheme exists to avoid.
+  git checkout -B "$PANMIRROR_BRANCH" "origin/${PANMIRROR_BRANCH}"
+  git rev-parse HEAD
+
+  popd
+fi
+

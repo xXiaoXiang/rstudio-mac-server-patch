@@ -1,0 +1,3 @@
+# Patch context and the verbatim upstream license retain original whitespace.
+patches/*.patch -whitespace
+COPYING -whitespace

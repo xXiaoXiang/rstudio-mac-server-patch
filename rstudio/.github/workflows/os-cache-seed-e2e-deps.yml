@@ -1,0 +1,94 @@
+name: "Cache: Seed E2E test dependency caches"
+
+# Re-warms the os-e2e-deps caches (R library, pak download cache, Playwright
+# browsers) that the PR-triggered e2e jobs restore. PR runs cannot save them,
+# and the build cache seeds use build_only=true, which skips the e2e job where
+# os-e2e-deps runs. Without this workflow, an evicted cache makes every PR
+# shard reinstall its R packages on the critical path, ~1-4 minutes apiece.
+#
+# This seed runs os-e2e-deps on main for exactly the platform / cache-scope /
+# R-version combinations the PR orchestrator's e2e jobs use, so their key set
+# stays warm. No build, no tests -- each job is a few minutes.
+on:
+  push:
+    branches: [main]
+    # The key inputs: DESCRIPTION and required-packages.txt feed the R-library
+    # and pak keys, package-lock.json feeds the Playwright-browsers key, and
+    # the action defines the key format itself.
+    paths:
+      - "e2e/rstudio/DESCRIPTION"
+      - "e2e/rstudio/required-packages.txt"
+      - "e2e/rstudio/package-lock.json"
+      - ".github/actions/os-e2e-deps/**"
+      - ".github/workflows/os-cache-seed-e2e-deps.yml"
+  # Also dispatched by os-cache-seed-sentinel.yml when these caches have been
+  # evicted from main's scope (repo quota, LRU eviction).
+  workflow_dispatch:
+
+# Don't stack seed runs; the latest one wins.
+concurrency:
+  group: cache-seed-e2e-deps
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry per platform the PR orchestrator's e2e jobs run on, with
+        # the same runner image and cache-scope those jobs pass to
+        # os-e2e-deps, so the seeded keys are byte-for-byte the keys they
+        # restore. The Linux Desktop and Linux Server workflows share the
+        # noble-amd64 scope (.github/e2e-linux/ubuntu-24-x86_64.json), so
+        # one entry covers both.
+        include:
+          - platform: windows-desktop
+            runner: windows-2025
+            cache-scope: ""
+          - platform: macos-desktop
+            runner: macos-26
+            cache-scope: "macos26-arm64"
+          - platform: linux
+            runner: ubuntu-24.04
+            cache-scope: "noble-amd64"
+    name: seed (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      R_LIBS_USER: ${{ github.workspace }}/R-libs
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: e2e/rstudio/package-lock.json
+
+      # No r-version: both this seed and the PR jobs whose caches it warms take
+      # RSTUDIO_R_VERSION from dependencies/tools/rstudio-tools.sh, so they
+      # cannot drift apart. That matters here specifically -- the os-e2e-deps
+      # cache keys embed the resolved R major.minor, so a seed built against a
+      # different R warms keys no PR run ever reads.
+      - name: Install R (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/os-install-r-windows
+
+      - name: Install R (Unix)
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/os-install-r-unix
+
+      # The saves inside the action fire because this workflow only runs on
+      # refs/heads/main (push to main, or the sentinel's dispatch --ref main).
+      - name: Install and cache e2e test dependencies
+        uses: ./.github/actions/os-e2e-deps
+        with:
+          r-libs-user: ${{ env.R_LIBS_USER }}
+          cache-scope: ${{ matrix.cache-scope }}
+          install-required-packages: "true"

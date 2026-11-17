@@ -1,0 +1,91 @@
+/* 高亮闪烁效果用于env name已存在时提示 */
+@keyframes flash-animation {
+    0% {
+        background-color: #ffffff;
+    }
+    25% {
+        background-color: var(--lt-grey, #f5f5f5);
+    }
+    50% {
+        background-color: #ffffff;
+    }
+    75% {
+        background-color: var(--lt-grey, #f5f5f5);
+    }
+    100% {
+        background-color: #ffffff;
+    }
+}
+
+.highlight-flash {
+    animation: flash-animation 0.8s ease-in-out 1;
+}
+.manage-container {
+    display: flex;
+    gap: 24px;
+    padding: 24px;
+}
+.panel {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    padding: 24px;
+    flex: 1;
+}
+.env-actions {
+    margin-top: 16px;
+}
+
+.env-row {
+    display: flex;
+    width: 100%;
+    gap: 4px;
+    margin-bottom: 2px;
+}
+
+.env-row:first-child input {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.env-row:first-child input#new-env-name,
+.env-row:first-child input#new-env-channel {
+    width: 0;
+    margin: 2px;
+}
+
+.env-row:last-child input#new-env-packages {
+    flex: 6 2 0;
+    min-width: 0;
+    margin: 2px;
+}
+.env-row:last-child button#create-env-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    margin: 2px;
+}
+
+.env-actions input {
+    padding: 2px 4px;
+    margin-right: 4px;
+}
+.env-actions button {
+    padding: 2px 3px;
+}
+.session-detail {
+    font-size: 13px;
+    color: #666;
+    margin-top: 4px;
+}
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #ccc;
+  border-top: 2px solid #333;
+  border-radius: 60%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

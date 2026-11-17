@@ -1,0 +1,743 @@
+name: "Test: E2E Playwright RStudio (Desktop, macOS 14 ARM64, Open Source)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_from_source:
+        description: "Build RStudio Desktop from this branch's source. When false, downloads the latest daily .dmg installer."
+        type: boolean
+        default: true
+      rstudio_installer_url:
+        description: "Optional .dmg URL to test against (e.g. a specific daily from dailies.rstudio.com). Only used when build_from_source is false. Leave empty to auto-resolve the latest daily."
+        type: string
+        default: ""
+      r_version:
+        description: >-
+          Exact R version to install, as X.Y.Z. Empty (the default) uses
+          RSTUDIO_R_VERSION from dependencies/tools/rstudio-tools.sh, which is
+          the single place the version CI tests against is pinned. Any version
+          named here must already be mirrored into rstudio-buildtools; see
+          dependencies/tools/upload-r.sh.
+        type: string
+        default: ""
+      project:
+        description: "Playwright project to run: 'desktop' or 'server'. OS and edition are auto-filtered from the host platform and PW_RSTUDIO_EDITION."
+        type: string
+        default: "desktop"
+      grep:
+        description: "Optional Playwright --grep pattern to run only tests whose title matches."
+        type: string
+        default: ""
+      test_selector:
+        description: "Optional test paths/files/directories to run (space-separated). Matched as substrings against test file paths. Examples: 'autocomplete.test.ts', 'tests/panes/misc/', 'autocomplete tests/panes/posit-assistant-chat/'. Leave empty to run all tests."
+        type: string
+        default: ""
+      test_ignore:
+        description: "Optional test paths/files/directories to exclude (space-separated globs). Examples: '**/code_suggestions.test.ts', '**/posit-assistant-chat/**'. Leave empty to exclude nothing."
+        type: string
+        default: ""
+      grep_invert:
+        description: "Optional Playwright --grep-invert pattern to skip tests by title. Empty by default (runs all tests)."
+        type: string
+        default: ""
+      rstudio_extra_args:
+        description: "Optional extra args passed to RStudio Desktop on launch (space-separated). Maps to PW_RSTUDIO_EXTRA_ARGS."
+        type: string
+        default: ""
+      posit_assistant_test_manifest:
+        description: "Test the pre-release (test) Posit Assistant manifest instead of the released one. Off by default: only the Posit Assistant release gate turns this on."
+        type: boolean
+        default: false
+      require_tests_passed:
+        description: "Fail the run if it passed zero tests. For release gates, where an empty or all-skipped run must not report green."
+        type: boolean
+        default: false
+      build_only:
+        description: "Run only the build job (to seed the rstudio-tools / R-libs / GWT / sccache caches) and skip the e2e job."
+        type: boolean
+        default: false
+      post_pr_comment:
+        description: "Post test results as a sticky comment on the PR. Pass true only from PR-triggered callers."
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      build_from_source:
+        type: boolean
+        default: true
+      rstudio_installer_url:
+        type: string
+        default: ""
+      r_version:
+        type: string
+        default: ""
+      project:
+        type: string
+        default: "desktop"
+      grep:
+        type: string
+        default: ""
+      test_selector:
+        type: string
+        default: ""
+      test_ignore:
+        type: string
+        default: ""
+      grep_invert:
+        type: string
+        default: ""
+      rstudio_extra_args:
+        type: string
+        default: ""
+      posit_assistant_test_manifest:
+        type: boolean
+        default: false
+      require_tests_passed:
+        type: boolean
+        default: false
+      build_only:
+        type: boolean
+        default: false
+      post_pr_comment:
+        type: boolean
+        default: false
+      defer_merge:
+        description: "Skip this workflow's own merge/publish/comment job; the caller merges every platform's blobs into one report instead."
+        type: boolean
+        default: false
+      skip_e2e_deps_cache_save:
+        description: "Don't save the os-e2e-deps caches (R library, pak downloads, Playwright browsers). Set by broad-matrix callers whose engines run too rarely for those caches to outlive eviction."
+        type: boolean
+        default: false
+    outputs:
+      r_version_actual:
+        description: >-
+          The R version this engine actually ran against, read back from the
+          installed R rather than echoed from the r_version input. Empty when
+          the e2e job did not run (build_only, or a build failure), and also when
+          it ran but failed before reaching the R install.
+        value: ${{ jobs.e2e-desktop-macos14.outputs.r_version_actual }}
+    secrets:
+      CONNECT_API_KEY:
+        description: "Posit Connect API key for the E2E Test Insights reporter"
+        required: false
+      AWS_E2E_REPORTS_ROLE_ARN:
+        description: "IAM role assumed via GitHub OIDC to upload the Playwright report to S3"
+        required: false
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: "OP service account token; resolves the test-account credentials the Playwright auth setup project signs in with"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Lets the e2e-merge job mint an OIDC token to assume the S3 report-upload
+  # role (see .github/actions/os-publish-e2e-report).
+  id-token: write
+
+# actions/cache passes zstd no compression level, so zstd honors ZSTD_CLEVEL;
+# level 9 makes cache entries ~13% smaller than the default level 3 at about
+# the same save time, and restores are unaffected. Set here rather than per
+# step so every save in every job, composite actions included, picks it up.
+env:
+  ZSTD_CLEVEL: 9
+
+jobs:
+  # Builds RStudio Desktop from this branch's source on the same runner image as
+  # the e2e job below, then uploads RStudio.app as an artifact for the e2e job
+  # to consume. Skipped when build_from_source is false OR when an
+  # rstudio_installer_url was supplied (a non-empty URL wins even if
+  # build_from_source is true); in either case the e2e job installs a .dmg
+  # instead -- the supplied rstudio_installer_url, or, when none was given,
+  # the latest daily it resolves itself (keeping its SHA-256 check). That
+  # second path is what every cron rotation run takes, since the rotation's
+  # resolve job emits empty URLs unless a specific version was requested, so
+  # this build job runs only on a from-source dispatch.
+  build:
+    if: inputs.build_from_source == true && inputs.rstudio_installer_url == ''
+    # Bare "macos-14" is the free arm64 standard runner. Do NOT change this to
+    # macos-14-large or macos-14-xlarge: those are larger runners, which GitHub
+    # bills even on public repos, and macos-14-large is Intel besides.
+    #
+    # This image is deprecated. GitHub removes it on 2026-11-02, after which
+    # every run here fails on the unknown label (actions/runner-images#13518).
+    # October 2026 also brings eight brownout windows, 14:00-00:00 UTC, during
+    # which the label already fails; the rotation runs this engine on a Monday
+    # afternoon so four of those windows land on it as early warning. Retire
+    # this engine, and its entry in the scheduled rotation, by that date.
+    runs-on: macos-14
+    # Apple-silicon runners compile fast enough that 90 minutes covers a cold
+    # sccache; only the Intel and Windows engines need the 180 they carry.
+    timeout-minutes: 90
+    env:
+      # The dependency / package scripts default RSTUDIO_TOOLS_ROOT to /opt,
+      # which isn't writable on hosted runners without sudo. Redirect to a
+      # workspace-local path that we can also cache.
+      RSTUDIO_TOOLS_ROOT: ${{ github.workspace }}/opt/rstudio-tools/arm64
+      # Pin R's user library to a workspace-local path so we can cache it.
+      # R expands %p/%v at startup to the platform triple and major.minor
+      # version (e.g. aarch64-apple-darwin20/4.5), which keeps libraries
+      # built for different R versions / platforms in separate subtrees.
+      R_LIBS_USER: ${{ github.workspace }}/R-libs/%p/%v
+      # The backend is set up by the "Configure sccache" step below.
+      SCCACHE_ENABLED: '1'
+      NPM_CONFIG_LOGLEVEL: error
+      NPM_CONFIG_AUDIT: 'false'
+      # Compile GWT with readable (PRETTY) symbol names rather than the default
+      # OBFUSCATED output, so the uncaught client exceptions the e2e automation
+      # agent records (window.rstudio.errors) carry decodable Java stack traces.
+      # Consumed by src/gwt/CMakeLists.txt; folded into the GWT cache key below.
+      GWT_STYLE: PRETTY
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pre-built tool deps (Boost, SOCI, pandoc, quarto, GWT, node, panmirror,
+      # copilot-language-server, etc.) all land under RSTUDIO_TOOLS_ROOT.
+      # Caching this directory turns the install-common step from ~5-10 min
+      # of downloads into a quick cache restore on warm runs. Restore-only; the
+      # matching Save steps after "Install build dependencies" run only from
+      # main-scoped runs.
+      - name: Restore rstudio-tools deps
+        id: tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RSTUDIO_TOOLS_ROOT }}
+          key: rstudio-tools-macos14-arm64-${{ hashFiles('dependencies/common/install-*', 'dependencies/common/rig.cmake', 'dependencies/osx/install-*', 'dependencies/tools/rstudio-tools.sh') }}
+          restore-keys: |
+            rstudio-tools-macos14-arm64-
+
+      # The "Install build dependencies" step below calls install-packages,
+      # which renv::install()s digest/purrr/rmarkdown/testthat/xml2/yaml into
+      # R_LIBS_USER. Cache the whole R-libs tree; R's %p/%v subpaths keep
+      # different versions / platforms isolated automatically.
+      - name: Restore build-time R packages
+        id: rlibs-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/R-libs
+          key: rstudio-build-rlibs-macos14-arm64-${{ hashFiles('dependencies/common/install-packages', 'dependencies/common/lockfiles/**/renv.lock') }}
+          restore-keys: |
+            rstudio-build-rlibs-macos14-arm64-
+
+      # Cache compiled GWT output (package/osx/build-arm64/gwt/{bin,www,extras}).
+      # NB: arm64 builds into "build-arm64", but the macOS 15 x86_64 sibling
+      # uses plain "build" -- make-package only suffixes the arm64 directory
+      # (BUILD_DIR_X86_64/ARM64 in package/osx/make-package). Getting this path
+      # wrong silently disables the cache: the save step does nothing but emit a
+      # path-validation warning, so the key never lands and every run recompiles
+      # GWT. Engines that are registered with the cache-seed sentinel compound
+      # this into an endless re-dispatch loop chasing a prefix that can never
+      # appear; this engine has no seed, so the cost here is just a cold build.
+      # GWT compilation is the single most expensive JS step (~15-30 min). When
+      # GWT Java sources / build scripts haven't changed, cmake skips
+      # recompilation via --build-gwt=0 and uses the cached output directly.
+      # Restore-only here; the matching Save GWT output step after the build
+      # saves only from main-scoped runs after a successful build, and only
+      # on a key miss (see that step's comment).
+      - name: Restore GWT output
+        id: gwt-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: package/osx/build-arm64/gwt
+          key: rstudio-gwt-macos14-arm64-${{ env.GWT_STYLE }}-v2-${{ hashFiles('src/gwt/src/**', 'src/gwt/acesupport/**', 'src/gwt/lib/**', 'src/gwt/build.xml', 'src/gwt/conf/**') }}
+          restore-keys: |
+            rstudio-gwt-macos14-arm64-${{ env.GWT_STYLE }}-v2-
+      # install-dependencies-osx (the entry-point script) adds local-dev
+      # extras (PAM profile, i18n venv) we don't need in CI. Call the per-arch
+      # script directly to install only arm64 brew formulae; that script also
+      # chains into dependencies/common/install-common at the end, so this
+      # single step covers brew formulae + Boost + SOCI + GWT + node +
+      # pandoc/quarto + panmirror + copilot-language-server + sccache +
+      # dictionaries + mathjax.
+      - name: Install build dependencies
+        working-directory: dependencies/osx
+        run: ./install-dependencies-osx-arch
+
+      # Save the tools / R-libs caches only from main-scoped runs, and only on a
+      # key miss. A cache saved from a PR run lands in that PR's merge-ref
+      # scope, which no other branch can restore; each copy is pure pressure on
+      # the repo's Actions cache quota, and that pressure is what evicts
+      # main's copies -- the ones the PR-facing engines depend on.
+      #
+      # This engine has no cache seed, matching the rotation-only Linux configs
+      # (e.g. fedora*, rocky*, debian*): its routine runs install the daily
+      # .dmg, so the build job is skipped and these caches are never read. They populate
+      # only on a from-source run dispatched from main, which is rare enough
+      # that a nightly seed would spend quota and a 90-minute build for nothing.
+      - name: Save rstudio-tools deps
+        if: github.ref == 'refs/heads/main' && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RSTUDIO_TOOLS_ROOT }}
+          key: ${{ steps.tools-cache.outputs.cache-primary-key }}
+
+      - name: Save build-time R packages
+        if: github.ref == 'refs/heads/main' && steps.rlibs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/R-libs
+          key: ${{ steps.rlibs-cache.outputs.cache-primary-key }}
+
+      # sccache keeps one Actions cache entry per object file. Only main
+      # writes them, and every other ref reads main's. An entry written from
+      # a PR would land in that PR's merge-ref scope, which no other branch
+      # can read, and crowd main's entries out of the repo's cache limit
+      # (#18337). This engine has no nightly seed: it compiles only when
+      # dispatched from source, so a dispatch from main is what fills its
+      # entries, and they age out after a week unread. The Actions cache
+      # replaced an S3 bucket whose every hit was billed as egress (#19355).
+      - name: Configure sccache
+        env:
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+        run: |
+          echo "sccache backend: GitHub Actions cache ($SCCACHE_GHA_RW_MODE)"
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "SCCACHE_GHA_RW_MODE=$SCCACHE_GHA_RW_MODE"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        with:
+          # Pinned: resolving "latest" queries api.github.com at runtime,
+          # which fails during GitHub API incidents (503s). A pinned version
+          # downloads directly from the release CDN with no API call.
+          version: "v0.16.0"
+
+      - name: Build RStudio Desktop (arm64)
+        id: build
+        working-directory: package/osx
+        env:
+          RSTUDIO_VERSION_MAJOR: '99'
+          RSTUDIO_VERSION_MINOR: '9'
+          RSTUDIO_VERSION_PATCH: '9'
+          RSTUDIO_VERSION_SUFFIX: "-pr+${{ github.run_number }}"
+        run: |
+          if [ "${{ steps.gwt-cache.outputs.cache-hit }}" = "true" ]; then
+            ./make-package --arch=arm64 --build-dmg=0 --use-creds=0 --build-gwt=0
+          else
+            ./make-package --arch=arm64 --build-dmg=0 --use-creds=0
+          fi
+
+      # Save only from main-scoped runs, and only on a key miss. A cache saved
+      # from a PR run lands in that PR's merge-ref scope, which no other
+      # branch can restore; each copy is pure pressure on the repo's
+      # Actions cache quota, and that pressure is what evicts main's copy (see
+      # the tools / R-libs save steps above for why that matters here).
+      - name: Save GWT output
+        if: github.ref == 'refs/heads/main' && steps.build.conclusion == 'success' && steps.gwt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: package/osx/build-arm64/gwt
+          key: ${{ steps.gwt-cache.outputs.cache-primary-key }}
+
+      # tar (not zip) to preserve symlinks and executable permissions in the
+      # bundle. upload-artifact would otherwise zip the directory tree itself
+      # and break codesigned binaries on the way back out.
+      #
+      # Skipped in build_only runs: no e2e job consumes the artifact there, so
+      # packaging and uploading it would be pure waste.
+      - name: Package RStudio.app
+        if: inputs.build_only != true
+        working-directory: package/osx/install
+        run: tar -czf "${{ github.workspace }}/RStudio.app.tar.gz" RStudio.app
+
+      - name: Upload RStudio.app artifact
+        if: inputs.build_only != true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rstudio-app-macos14-arm64
+          path: RStudio.app.tar.gz
+          retention-days: 7
+
+  # Reads the macOS shard count from .github/e2e/shards.json and republishes
+  # it as job outputs: the e2e job's strategy.matrix cannot read a file or an
+  # env value itself, so the one declaration has to pass through here.
+  shards:
+    uses: ./.github/workflows/os-test-e2e-rstudio-shards.yml
+    with:
+      platform: macos
+
+  e2e-desktop-macos14:
+    needs: [build, shards]
+    # build is skipped when build_from_source is false; allow this job to
+    # run in that case too. needs.build.result is "success" on a normal run
+    # and "skipped" on the daily-download path. build_only seeds the build
+    # caches (rstudio-tools / R-libs / GWT / sccache) without running e2e, so skip.
+    if: |
+      always() &&
+      inputs.build_only != true &&
+      needs.shards.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    # This job is a shard matrix, so this is one output value for the whole matrix
+    # rather than one per shard. Every shard that reaches the deps step installs
+    # the same R, so the value is the same wherever it comes from -- but which
+    # shard supplies it is not something to depend on, and a shard that never
+    # reached that step supplies nothing. The output can therefore be empty for an
+    # engine that did install R and did run the suite. Callers must treat empty as
+    # "unknown", never as "no R was installed". The Linux engine sidesteps this by
+    # uploading per-engine artifacts instead.
+    outputs:
+      r_version_actual: ${{ steps.e2e_deps.outputs.r-version-full }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Declared once in .github/e2e/shards.json (see .github/e2e/README.md
+        # for how the count was chosen); the test step derives --shard=N/M
+        # from strategy.job-total, and e2e-merge prints the same count.
+        shard: ${{ fromJSON(needs.shards.outputs.matrix) }}
+    runs-on: macos-14
+    timeout-minutes: 120
+    # The environment scopes OP_SERVICE_ACCOUNT_TOKEN (a security-team requirement);
+    # deployment: false keeps each shard from recording a deployment on the PR.
+    environment:
+      name: e2e-playwright
+      deployment: false
+    env:
+      # os-e2e-deps installs the harness's required packages here and exports
+      # PW_RSTUDIO_R_LIBS_USER so globalSetup finds them at test time.
+      R_LIBS_USER: ${{ github.workspace }}/R-libs
+      # Pin the sandbox parent so the upload-artifact step below knows where
+      # rsession logs / preserved per-spec config trees end up after a failed
+      # run. globalSetup honors this and auto-creates the directory
+      # (PW_SANDBOX_ROOT_CREATE=1).
+      PW_SANDBOX_ROOT: ${{ github.workspace }}/pw-sandbox
+      PW_SANDBOX_ROOT_CREATE: '1'
+      # Point globalSetup's R-libs provisioner at the same library the
+      # e2e-deps action installs and caches. Without this the harness default
+      # is ~/.cache/rstudio-playwright/r-libs/... -- a different, uncached
+      # path, so packages re-download from CRAN on every run of this
+      # ephemeral runner.
+      PW_RSTUDIO_R_LIBS_USER: ${{ github.workspace }}/R-libs
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: e2e/rstudio/package-lock.json
+
+      - name: Install R
+        uses: ./.github/actions/os-install-r-unix
+        with:
+          r-version: ${{ inputs.r_version }}
+
+      # Build-from-source path: extract the RStudio.app artifact produced by
+      # the build job above.
+      - name: Download RStudio.app artifact
+        if: inputs.build_from_source == true && inputs.rstudio_installer_url == ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rstudio-app-macos14-arm64
+          path: ${{ github.workspace }}
+
+      - name: Install RStudio from artifact
+        if: inputs.build_from_source == true && inputs.rstudio_installer_url == ''
+        run: |
+          tar -xzf "${{ github.workspace }}/RStudio.app.tar.gz" -C "${{ github.workspace }}"
+          sudo rm -rf /Applications/RStudio.app
+          sudo cp -R "${{ github.workspace }}/RStudio.app" /Applications/
+          sudo xattr -cr /Applications/RStudio.app
+          ls -la /Applications/RStudio.app/Contents/MacOS/RStudio
+
+      # Daily-download path: resolve and install the latest (or specified) .dmg.
+      # Runs when build_from_source is false or an explicit URL was provided.
+      - name: Resolve daily manifest URL
+        id: manifest
+        uses: ./.github/actions/os-resolve-daily-manifest
+
+      - name: Resolve RStudio .dmg URL
+        if: inputs.build_from_source == false || inputs.rstudio_installer_url != ''
+        id: resolve
+        env:
+          INSTALLER_URL: ${{ inputs.rstudio_installer_url }}
+          MANIFEST_URL: ${{ steps.manifest.outputs.manifest-url }}
+        run: |
+          URL="$INSTALLER_URL"
+          SHA=""
+          FILENAME=""
+          if [ -z "$URL" ]; then
+            MANIFEST=$(curl -fsSL --retry 3 --retry-delay 5 "$MANIFEST_URL")
+            # macOS ships a single universal .dmg keyed "macos" in the daily
+            # manifest (older schemas used "mac-arm64"/"mac"; kept as fallbacks).
+            URL=$(echo "$MANIFEST" | jq -r '.products.electron.platforms["macos"].link // .products.electron.platforms["mac-arm64"].link // .products.electron.platforms["mac"].link // empty')
+            SHA=$(echo "$MANIFEST" | jq -r '.products.electron.platforms["macos"].sha256 // .products.electron.platforms["mac-arm64"].sha256 // .products.electron.platforms["mac"].sha256 // empty')
+            FILENAME=$(echo "$MANIFEST" | jq -r '.products.electron.platforms["macos"].filename // .products.electron.platforms["mac-arm64"].filename // .products.electron.platforms["mac"].filename // empty')
+            if [ -z "$URL" ] || [ -z "$FILENAME" ] || [ -z "$SHA" ]; then
+              echo "::error::No usable macos entry in $MANIFEST_URL (url='$URL', filename='$FILENAME', sha256='$SHA'). Either this release branch has no macOS daily yet, or the manifest schema changed. Re-run with build_from_source to test this branch without a daily."
+              exit 1
+            fi
+            echo "Auto-resolved macOS daily:"
+            echo "  URL:      $URL"
+            echo "  SHA-256:  $SHA"
+            echo "  Filename: $FILENAME"
+          else
+            FILENAME=$(basename "$URL")
+            if [ -z "$FILENAME" ]; then
+              echo "::error::Could not derive filename from rstudio_installer_url='$URL'. Provide a URL whose path ends with a filename (e.g. .../RStudio-2024.12.0-467.dmg)."
+              exit 1
+            fi
+            echo "Using override URL: $URL (SHA-256 verification skipped)"
+          fi
+          echo "url=$URL"      >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+
+      # Downloaded fresh every run rather than cached: dailies.rstudio.com is
+      # already S3/CDN-backed, and GH Actions cache scoping means concurrent
+      # PRs can't share a cache entry with each other anyway (only with their
+      # base branch), so caching here would just duplicate the same bytes
+      # into the shared cache quota without saving meaningful time.
+      - name: Download RStudio .dmg
+        if: inputs.build_from_source == false || inputs.rstudio_installer_url != ''
+        env:
+          DOWNLOAD_URL: ${{ steps.resolve.outputs.url }}
+          DOWNLOAD_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 \
+            -o "$DOWNLOAD_FILENAME" \
+            "$DOWNLOAD_URL"
+
+      - name: Verify SHA-256
+        if: (inputs.build_from_source == false || inputs.rstudio_installer_url != '') && steps.resolve.outputs.sha256 != ''
+        env:
+          EXPECTED_SHA256: ${{ steps.resolve.outputs.sha256 }}
+          DOWNLOAD_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          expected=$(echo "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')
+          actual=$(shasum -a 256 "$DOWNLOAD_FILENAME" | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::SHA-256 mismatch. Expected: $expected. Actual: $actual."
+            exit 1
+          fi
+
+      - name: Install RStudio from .dmg
+        if: inputs.build_from_source == false || inputs.rstudio_installer_url != ''
+        env:
+          INSTALLER_FILENAME: ${{ steps.resolve.outputs.filename }}
+        run: |
+          MOUNT=$(hdiutil attach -nobrowse -readonly "$INSTALLER_FILENAME" | grep -oE '/Volumes/.*' | tail -1)
+          if [ -z "$MOUNT" ]; then
+            echo "ERROR: failed to resolve mount path from hdiutil" >&2
+            exit 1
+          fi
+          echo "Mounted at: $MOUNT"
+          sudo cp -R "$MOUNT/RStudio.app" /Applications/
+          hdiutil detach "$MOUNT"
+          sudo xattr -cr /Applications/RStudio.app
+          ls -la /Applications/RStudio.app/Contents/MacOS/RStudio
+
+      - name: Install e2e test dependencies
+        id: e2e_deps
+        uses: ./.github/actions/os-e2e-deps
+        with:
+          # RUNNER_OS is just "macOS" for every Mac runner regardless of arch OR
+          # OS version, so without a scope every macOS engine shares one
+          # os-e2e-deps cache key and restores the others' incompatible R
+          # library / pak / Playwright-browser binaries. Both axes matter here:
+          # arch (an x86_64 restore fails to dyn.load on arm64) and version
+          # (macos-26 is arm64 too, but builds against a different SDK). Scope
+          # by both.
+          cache-scope: macos14-arm64
+          r-libs-user: ${{ env.R_LIBS_USER }}
+          save-cache: ${{ !inputs.skip_e2e_deps_cache_save }}
+          # PostgreSQL server plus the PostgreSQL and SQLite ODBC drivers, for
+          # the Connections pane tests. Without this they all skip.
+          install-database-stack: 'true'
+          # Pre-install the harness's REQUIRED_PACKAGES set into the cached
+          # library (found via PW_RSTUDIO_R_LIBS_USER in the job env above),
+          # so nothing installs from CRAN at test time; a CRAN outage
+          # otherwise surfaces as mid-suite install hangs.
+          install-required-packages: "true"
+
+      # The secrets context isn't available in a step-level if:, so read the
+      # token into this step's own env and publish only a present/absent flag.
+      # Fork PRs and any caller that doesn't pass the token land on present=false,
+      # which skips the retrieve step below; the auth setup project then falls back
+      # to its no-credentials path instead of failing the run.
+      - name: Retrieve test credentials
+        id: credentials
+        uses: ./.github/actions/os-e2e-credentials
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+      # Opt this run into the Posit Assistant pre-release manifest. A per-run
+      # prefs override, never a base pref -- every other run keeps testing GA.
+      - name: Enable Posit Assistant test manifest
+        if: inputs.posit_assistant_test_manifest
+        run: |
+          echo '{"posit_assistant_test_manifest": true}' > "$GITHUB_WORKSPACE/e2e/rstudio/.prefs.local.json"
+
+      - name: Run Playwright tests
+        working-directory: e2e/rstudio
+        env:
+          PW_RSTUDIO_MODE: desktop
+          # Platform-labelled project name; playwright.config.ts uses it both as
+          # the project name in reports (so a cross-platform merged report can
+          # distinguish these results) and to derive the platform+shard-unique
+          # blob report file name.
+          PW_PROJECT_LABEL: ${{ inputs.project }}-macos14
+          # Human OS name for the "Run under test" block the harness writes to the
+          # report header and the run summary. Also the report metadata key, so it
+          # must name this engine alone: a merged multi-engine report keeps one
+          # entry per key, and engines sharing a key overwrite each other.
+          PW_OS_LABEL: macOS 14 (arm64)
+          PW_GREP: ${{ inputs.grep }}
+          PW_GREP_INVERT: ${{ inputs.grep_invert }}
+          PW_TEST_SELECTOR: ${{ inputs.test_selector }}
+          PW_TEST_IGNORE: ${{ inputs.test_ignore }}
+          PW_RSTUDIO_EXTRA_ARGS: ${{ inputs.rstudio_extra_args }}
+          # Relative to this step's working-directory. Empty (not set) unless
+          # this run opted in, leaving the fixture's default prefs alone.
+          PW_RSTUDIO_PREFS_OVERRIDE: ${{ inputs.posit_assistant_test_manifest && '.prefs.local.json' || '' }}
+          # Tells playwright.config.ts to switch to blob reporter for this shard.
+          PW_SHARD: ${{ matrix.shard }}
+          # E2E Test Insights reporter: posts per-shard results to the dashboard
+          # API. SHARD_NAME makes each shard's run id unique so shards don't
+          # overwrite each other. CONNECT_API_KEY is empty on fork PRs; the
+          # reporter still runs but its uploads fail with warnings (never fails
+          # the run).
+          CONNECT_API_KEY: ${{ secrets.CONNECT_API_KEY }}
+          POSIT_EMAIL: ${{ steps.credentials.outputs.posit-email }}
+          POSIT_PASSWORD: ${{ steps.credentials.outputs.posit-password }}
+          SHARD_NAME: desktop-macos14-${{ matrix.shard }}
+          # Print the GWT launch timeline so the next launch failure shows
+          # which phase exceeded the deadline (CDP-connect vs. bridge-installed
+          # vs. ready-flag vs. console-visible).
+          PW_DEBUG_LAUNCH: '1'
+        run: |
+          ARGS=()
+          if [ -n "$PW_TEST_SELECTOR" ]; then
+            set -f
+            ARGS+=($PW_TEST_SELECTOR)
+            set +f
+          fi
+          if [ -n "$PW_GREP" ]; then
+            ARGS+=(--grep "$PW_GREP")
+          fi
+          if [ -n "$PW_GREP_INVERT" ]; then
+            ARGS+=(--grep-invert "$PW_GREP_INVERT")
+          fi
+          ARGS+=(--shard="${{ matrix.shard }}/${{ strategy.job-total }}")
+          node scripts/run-with-heartbeat.mjs -- test "${ARGS[@]}"
+
+      - name: Upload blob report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-blob-report-macos14-${{ matrix.shard }}
+          path: e2e/rstudio/blob-report/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-macos14-${{ matrix.shard }}
+          path: e2e/rstudio/test-results/
+          if-no-files-found: ignore
+
+      # Whatever rsession is still running at the end of a failed shard gets
+      # its threads and a `sample` call graph dumped. A session wedged by code
+      # on the idle event loop (#19236) looks idle from the outside -- the
+      # call graph is what names the culprit. sample works unprivileged on
+      # the runner user's own processes.
+      - name: Collect rsession diagnostics
+        if: always()
+        run: |
+          if [ "${{ job.status }}" != "success" ]; then
+            bash e2e/rstudio/scripts/ci/rsession-diagnostics.sh "${{ github.workspace }}/rsession-diagnostics" || true
+          fi
+          if [ -d rsession-diagnostics ]; then
+            cat rsession-diagnostics/summary.txt || true
+          fi
+
+      - name: Upload rsession diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rsession-diagnostics-macos14-${{ matrix.shard }}
+          path: rsession-diagnostics/
+          if-no-files-found: ignore
+
+      # Preserved per-spec sandbox tree on failure; includes rsession logs,
+      # the spec's RStudio config / data home, and per-test working dirs.
+      # globalTeardown leaves this in place when any test failed; if every
+      # test passed the directory is gone and `if-no-files-found: ignore`
+      # silently skips upload.
+      # user-home holds the sandbox AI credential stores (.posit/ai/auth/data.json,
+      # github-copilot), and so do its per-worker and aiAuth-stripped copies
+      # (user-home-<n>, user-home-no-<provider>; see utils/auth.ts). Exclude
+      # them all explicitly rather than relying on upload-artifact skipping
+      # hidden paths by default.
+      - name: Upload PW sandbox (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pw-sandbox-macos14-${{ matrix.shard }}
+          path: |
+            ${{ github.workspace }}/pw-sandbox/
+            !${{ github.workspace }}/pw-sandbox/*/user-home*/**
+          if-no-files-found: ignore
+
+      # macOS writes Electron / rsession crash reports here; useful when a
+      # launch fails because the renderer or session process aborted before
+      # the GWT-ready handshake.
+      - name: Upload macOS diagnostic reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos14-diagnostic-reports-${{ matrix.shard }}
+          path: ~/Library/Logs/DiagnosticReports/
+          if-no-files-found: ignore
+
+  # Merge per-shard blob reports into a single HTML report, parse aggregated
+  # counts, and post a sticky PR comment with pass/fail/skip totals
+  # (when post_pr_comment is set).
+  e2e-merge:
+    needs: [shards, e2e-desktop-macos14]
+    if: always() && inputs.defer_merge != true && needs.e2e-desktop-macos14.result != 'skipped' && needs.e2e-desktop-macos14.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      # OIDC token for the S3 report upload (os-publish-e2e-report).
+      id-token: write
+      # Deleting the shard blob artifacts once merged (os-e2e-report).
+      actions: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Merge shard reports and post results
+        id: report
+        uses: ./.github/actions/os-e2e-report
+        with:
+          label: macos14
+          title: "🍎 macOS 14 Desktop E2E · ARM64"
+          runner-note: "macos-14 ARM64"
+          shard-count: ${{ needs.shards.outputs.count }}
+          result: ${{ needs.e2e-desktop-macos14.result }}
+          post-pr-comment: ${{ inputs.post_pr_comment }}
+          require-tests-passed: ${{ inputs.require_tests_passed }}
+          role-arn: ${{ secrets.AWS_E2E_REPORTS_ROLE_ARN }}
+          github-token: ${{ github.token }}
+
+      # Does nothing: the name is the point. A step name can read step outputs
+      # (jobs.<id>.steps.name allows the `steps` context), so this puts the build
+      # under test in the job's step list, readable without expanding anything.
+      # It stays here rather than inside os-e2e-report because a composite's
+      # own steps only show once that step is expanded, which defeats the
+      # purpose. The run page itself has no surface for a runtime value -- a
+      # run's title is fixed before it starts, and annotation placement is
+      # GitHub's to decide -- so the summarizer also emits this as an
+      # annotation, and this is the same fact one click in. Last, and
+      # if: always(), so the gate inside the action can't suppress it. Skipped
+      # on an empty output, which is how the summarizer reports "unknown".
+      - name: ${{ steps.report.outputs.run-under-test }}
+        if: always() && steps.report.outputs.run-under-test != ''
+        run: 'true'

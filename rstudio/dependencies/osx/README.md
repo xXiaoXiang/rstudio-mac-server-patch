@@ -1,0 +1,131 @@
+
+System Requirements
+=============================================================================
+
+These instructions *should* work on both an Intel Mac or an Apple Silicon Mac,
+running a recent macOS release, but we recommend using an Apple Silicon Mac,
+as it is required to create a Universal build.
+
+Caveat: We are not actively testing building RStudio on Intel machines, so it is
+possible it will stop working at some point.
+
+Install Required Applications for MacOS
+=============================================================================
+
+Building RStudio requires installation of several components. The following
+must be installed manually:
+
+- R:         https://www.r-project.org/
+- XCode:     https://developer.apple.com/xcode/
+
+Note that after installing XCode you should also be sure to install the XCode
+Command Line Tools, which can be done by running the following:
+
+```bash
+xcode-select --install
+```
+
+Installing Homebrew
+=============================================================================
+Before running the dependency scripts in the next section, you must install
+the Homebrew package manager.
+
+First, install Homebrew using the command given on the website at
+https://brew.sh/, currently:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Satisfy Additional Dependencies
+=============================================================================
+
+Additional dependencies can be satisfied by running the following script:
+
+```bash
+./install-dependencies-osx
+```
+
+Note that this script includes download, extraction, and compilation of
+boost so can take some time to complete.
+
+By default the script installs dependencies for your machine's own
+architecture only, which is all a routine development build needs. See
+"Universal Builds" below if you need to package for both architectures.
+
+To skip specific Homebrew formulae -- for example, when R is already
+installed from the CRAN `.pkg` -- set `RSTUDIO_SKIP_FORMULAS` to a
+space-separated list of formula names before running the script:
+
+```bash
+RSTUDIO_SKIP_FORMULAS="r" ./install-dependencies-osx
+```
+
+Universal Builds
+=============================================================================
+
+The dependency installer defaults to the host architecture, including on CI.
+Native Apple Silicon Server builds need only arm64 dependencies and do not
+require Rosetta or an Intel Homebrew. See [Server builds](SERVER.md).
+For tagged release builds and carrying the macOS patch series forward, see
+[Maintaining Server patches](MAINTAINING-SERVER.md).
+
+A universal Desktop (x86_64 + arm64) package needs
+a second, x86_64 set of dependencies. On an Apple Silicon Mac that in turn
+requires Rosetta 2 and an x86_64 Homebrew installed under `/usr/local`. Only
+set this up if you need to reproduce a universal build locally.
+
+Install Rosetta 2:
+
+```bash
+softwareupdate --install-rosetta --agree-to-license
+```
+
+Install the x86_64 Homebrew by re-running the Homebrew installer under
+`arch -x86_64`:
+
+```bash
+arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Then ask the dependency script for both architectures:
+
+```bash
+RSTUDIO_RIG_ARCH=universal ./install-dependencies-osx --arch=x86_64,arm64
+```
+
+`make-package` (below) takes the same `--arch` option; pass
+`--arch=x86_64,arm64` to it to produce the universal package.
+
+Updating OpenSSL
+=============================================================================
+
+RStudio links a static OpenSSL built from source, not Homebrew's.
+`install-dependencies-osx` downloads it from the rstudio-buildtools S3 bucket.
+To move to a new release, change `RSTUDIO_OPENSSL_VERSION` in
+`dependencies/tools/rstudio-tools.sh` and the source tarball's SHA-256 in
+`build-openssl`, then build both architectures (on Apple Silicon, with
+Rosetta 2 installed) and upload them:
+
+```bash
+./build-openssl
+../tools/upload-openssl.sh openssl/openssl-<version>-macos-*.tar.gz
+```
+
+`build-openssl` prints the archives' SHA-256s; pin them in `install-openssl`.
+
+Building the RStudio Distribution
+=============================================================================
+
+With dependencies satisfied, you should be able to produce a full packaged
+build of RStudio as follows (assuming the repo is cloned to `~/rstudio`):
+
+```bash
+cd ~/rstudio/package/osx
+./make-package
+```
+
+When completed, the resulting `.dmg` and standalone `.zip` can be found in
+`~/rstudio/package/osx/build`.
+
+Run `./make-package --help` for more information.

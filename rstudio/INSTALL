@@ -1,0 +1,231 @@
+
+Installing RStudio from Source
+=============================================================================
+
+This document describes how to build and install RStudio from the source
+distribution. Information on obtaining the RStudio source code can be found
+in the file SOURCE. Note that precompiled binaries are also available for
+Windows, macOS, as well as recent versions of various Linux distributions.
+
+To produce a redistributable installer (a DEB or RPM, a DMG, or a setup EXE)
+rather than installing directly onto the machine that builds it, see section 5
+below and package/README.md.
+
+1) Installing Dependencies
+----------------------------------------------------------------------------
+
+Building RStudio requires a number of dependencies (including R itself).
+There are platform-specific instructions for satisfying these dependencies
+within the following directories
+
+   dependencies
+      linux
+      osx
+      windows
+
+Please see the README file contained within the root of each platform's
+directory for specific instructions.
+
+
+2) Configuring the Build Environment
+----------------------------------------------------------------------------
+
+a) From the root of the RStudio tree create a build directory and then
+   change to it:
+
+   mkdir build
+   cd build
+
+
+b) Configure the build using cmake as appropriate, e.g.
+
+   cmake .. -G Ninja -DRSTUDIO_TARGET=Server -DCMAKE_BUILD_TYPE=Release
+   cmake .. -G Ninja -DRSTUDIO_TARGET=Electron -DRSTUDIO_PACKAGE_BUILD=1
+
+   Variables that control configuration include:
+
+   RSTUDIO_TARGET        Electron or Server
+
+   RSTUDIO_PACKAGE_BUILD Electron: must be set to 1 for following cases:
+                           "make install"
+                           "make-package"
+
+   CMAKE_BUILD_TYPE      Debug, Release, RelMinSize, or RelWithDebInfo
+
+   CMAKE_INSTALL_PREFIX  Defaults:
+                           Linux (Electron):    /usr/local/lib/rstudio
+                           Linux (Server):      /usr/local/lib/rstudio-server
+                           macOS:               /Applications
+                           Windows:             C:\Program Files\RStudio
+
+
+   On macOS the install prefix contains RStudio.app for Electron builds or
+   RStudioServer.app for Server builds. They can be installed together.
+
+c) There are additional considerations on Windows. First, RStudio Server
+   is not supported on Windows so the configuration always defaults to
+   Electron. Second, the Windows build uses the Ninja generator (the Visual
+   Studio multi-config generator is not supported), so configure from a
+   Visual Studio developer command prompt with:
+
+   cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+   To build on Windows:
+
+   cmake --build .
+
+
+3) Building and Installing
+----------------------------------------------------------------------------
+
+a) Acquire administrative rights (if necessary). If you have configured
+   RStudio to be installed in a protected directory (the default on all
+   platforms) then you need to run the build/install command as an
+   administrator (e.g. "su -", "sudo sh", or running a console as an
+   Administrator on Windows)
+
+
+b) Change to the build directory where you configured RStudio
+
+
+c) Run the "make install" command:
+
+   Linux & macOS:  sudo make install        OR
+   Windows:        cmake --build . --config Release --target install
+
+   NOTE: For RStudio Electron on Linux, make install automatically creates
+   an entry in the Applications -> Programming menu for RStudio.
+
+
+d) If you are installing RStudio Server some additional configuration
+   steps are required to complete the installation. These steps are
+   detailed in the section below.
+
+
+4) RStudio Server Configuration
+----------------------------------------------------------------------------
+
+If you have installed RStudio Server from source there are a number of other
+steps (some required, some optional) you should take to complete your
+installation. Note that these steps are taken automatically by the DEB
+and RPM pre-built binary distributions of RStudio Server.
+
+On macOS, follow dependencies/osx/SERVER.md instead of the Linux account and
+service commands below. The native Server build installs RStudioServer.app,
+uses Open Directory PAM authentication, and asks an administrator to approve
+its bundled LaunchDaemon in macOS System Settings > Login Items.
+Hidden accounts are optional and are not a Server build requirement.
+
+a) Create an rstudio-server system user account (RStudio will automatically
+   run under this account if it is present). You can do this with:
+
+   sudo useradd -r rstudio-server
+
+
+b) RStudio Server uses PAM to authenticate users. Some Unix systems (such
+   as Debian and Ubuntu) use default PAM settings for applications which
+   aren't explicitly registered with PAM, so don't require additional PAM
+   configuration. If however your system requires explicit registration
+   (i.e. Redhat, Fedora, openSUSE) then you need to add an
+   /etc/pam.d/rstudio file to your configuration. You can find a default
+   version of this file at:
+
+   extras
+      /pam
+         rstudio
+
+
+c) Register RStudio as a daemon using an init.d (for most systems) or
+   systemd(for Ubuntu from 15.04, RHEL from 7) or upstart (for Ubuntu
+   before 15.04) or launchd plist (for Mac OSX) script appropriate to your system.
+   The rstudio/server/extras directory contains the following scripts:
+
+   extras
+      /init.d
+         /debian
+            rstudio-server
+         /redhat
+            rstudio-server
+         /suse
+            rstudio-server
+      /systemd
+            rstudio-server.redhat.service
+            rstudio-server.service
+      /upstart
+            rstudio-server.redhat.conf
+            rstudio-server.conf
+      /launchd
+            com.rstudio.launchd.rserver.plist
+
+   NOTE: installation of init.d scripts require both copying them
+   into /etc/init.d, making them executable (chmod +x), as well as
+   executing a system dependent command to ensure that the service
+   is registered with the appropriate runlevels. For example:
+
+   Debian:      sudo update-rc.d rstudio-server defaults
+   Redhat/SUSE: sudo /sbin/chkconfig --add rstudio-server
+
+
+d) Create a soft link in /usr/sbin to the server administrative script
+
+   sudo ln -f -s /usr/local/lib/rstudio-server/bin/rstudio-server /usr/sbin/rstudio-server
+
+   Assuming you have previously installed an init.d or upstart script (as
+   described above) then you should now be able start the server with the
+   following command:
+
+   sudo rstudio-server start
+
+   Additional commands include stop, restart, offline, online, and others
+
+e) Create /var directories required for RStudio to run. This can be done with:
+
+   mkdir -p /var/log/rstudio/rstudio-server
+   mkdir -p /var/lib/rstudio-server
+
+
+5) Building Redistributable Packages
+----------------------------------------------------------------------------
+
+The steps above install RStudio onto the machine that built it. If you want an
+installer you can copy elsewhere instead, use the packaging scripts in the
+"package" directory. These build RStudio and then run CPack over the result.
+Note that the RStudio Server DEB and RPM packages perform all of the
+configuration described in section 4 automatically.
+
+Full documentation, including where each artifact is written and how to install
+it, is in package/README.md. The short version:
+
+   Linux, from package/linux:
+
+      ./make-package Server DEB
+      ./make-package Electron RPM
+
+   macOS, from package/osx:
+
+      ./make-package clean
+
+   Windows, from package\win32:
+
+      make-package.bat
+
+Set RSTUDIO_VERSION_MAJOR, RSTUDIO_VERSION_MINOR, RSTUDIO_VERSION_PATCH, and
+RSTUDIO_VERSION_SUFFIX before running any of these. If you don't, the packages
+are named after the current date rather than a version you chose.
+
+The macOS and Windows packaging scripts build the Electron desktop application.
+Native macOS Server builds use cmake --install and RStudioServer.app; see
+dependencies/osx/SERVER.md for configuration and startup approval.
+For an installable macOS Server PKG, run
+  bash package/osx-server/build-pkg.sh build-macos-server
+after the Server build. The PKG includes service-account/system setup and the
+app's explicit uninstaller. The default package is for local development;
+distribution signing and notarization are separate release steps.
+
+To build Linux packages without installing the build dependencies on your own
+machine -- or to build for a distribution you aren't running -- use
+docker/docker-compile.sh, which performs the build inside a container:
+
+   ./docker/docker-compile.sh jammy server 2026.8.0+1
+
+

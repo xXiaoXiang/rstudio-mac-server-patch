@@ -1,3 +1,2 @@
-# Patch context and the verbatim upstream license retain original whitespace.
-patches/*.patch -whitespace
-COPYING -whitespace
+* -text
+workspace-state/git-history/*.part* -diff
