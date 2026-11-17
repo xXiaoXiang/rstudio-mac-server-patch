@@ -1,2 +1,2 @@
 * -text
-workspace-state/git-history/*.part* -diff
+workspace-state/git-history/rstudio-git.tar.gz.* -diff
