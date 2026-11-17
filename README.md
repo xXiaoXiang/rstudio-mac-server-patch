@@ -1,128 +1,13 @@
-# RStudio Server for macOS: patch series and packages
+# Patched Development Workspace Backup
 
-This repository stores the native macOS Server patches and release automation.
-It does not duplicate RStudio's source tree or require a GitHub fork. Every build
-checks out a versioned tag from [rstudio/rstudio](https://github.com/rstudio/rstudio),
-applies the checksummed patches, and builds a matching arm64 Server and browser UI.
-Download completed packages from [Releases](https://github.com/xXiaoXiang/rstudio-mac-server-patch/releases).
+This branch is a source and configuration backup of the RStudio Server on
+macOS VM. It excludes the sibling rstudio-2026.11.0-203 directory, generated
+build outputs, downloaded dependencies, and credentials. The main branch stays
+dedicated to the patch series and release automation.
 
-The initial supported baseline is **v2026.11.0+203**. macOS Server is a community
-port; these packages are not official Posit macOS Server releases. Electron
-Desktop keeps its original `RStudio.app` name; Server installs as
-`RStudioServer.app` with PAM authentication, per-account UIDs, startup approval,
-independent service/startup controls and an Admin Info window for configuration
-and account-management commands.
+Start with [the restore guide](workspace-state/RESTORE.md) to restore the RStudio local Git history
+and rebuild the Server package. The original RStudio checkout was shallow, but
+its local refs and available objects are preserved in checksummed archive parts.
 
-Installation and usage: [Server guide](docs/SERVER.md).
-Source branch maintenance: [Maintaining the patches](docs/MAINTAINING-SERVER.md).
-These guides are maintained directly in this repository, outside the patches.
-
-## Automatic packages
-
-The **Build and publish macOS Server** workflow checks upstream tags daily at
-04:23 UTC. It accepts numeric release tags from **2026.11 onward**, excludes
-development/preview suffixes, and builds up to four pending versions per run.
-RStudio currently uses versioned Git tags rather than GitHub Release entries;
-the workflow therefore watches tags. A tag's appearance is the automation's
-release signal; this does not independently check the Posit download website.
-
-It uses GitHub's standard `macos-15` **arm64** runner, installs the dependencies
-pinned by the selected source release, and reuses a cached native dependency
-snapshot when the release and dependency hashes match. Each GitHub Release has
-one uploaded asset: RStudioServer-<version>-arm64.pkg (for example,
-RStudioServer-2026.11.0-203-arm64.pkg). Release tags use the upstream version,
-such as v2026.11.0+203, without a macOS patch suffix.
-
-A new patch revision rebuilds and replaces the package on that same release.
-An explicit manual tag also rebuilds an existing release. Replacement happens
-only after a successful build and package verification. Patch conflicts or build
-failures prevent publication. Only the publishing job can write releases.
-
-GitHub automatically adds Source code (zip) and Source code (tar.gz). These are
-archives of this small patch repository at the release tag, **not** the full
-patched RStudio source. They cannot be replaced with custom source assets.
-To reconstruct the matching full source, fetch the upstream tag and apply the
-patch series using the Local build instructions below. The release tag remains fixed at the initial release commit. For replacement
-packages, use the exact patch-source commit linked in the release body; the
-automatic archives may describe an earlier patch revision.
-
-The full patched source archive, PROVENANCE.json, checksums and build logs stay
-in Actions artifacts for 90 days; they are not attached to the Release. The
-release body contains the package SHA256, upstream/patch commits, and a link to
-the build. The patches and exact upstream tag remain available after the Actions
-artifacts expire.
-
-The initial workflow produces an **ad hoc signed app in an unsigned PKG**.
-Developer ID signing and Apple notarization are not configured. R is installed
-separately on the target Mac. The build disables the native C++ unit suite; the
-three optional PAM/account/service developer scripts are not run by CI.
-
-To start a specific build, open **Actions → Build and publish macOS Server → Run
-workflow**, enter `v2026.11.0+203`, and choose whether to publish. Leaving the tag
-blank processes pending versions. Unpublished test builds remain available as
-Actions artifacts for 90 days. GitHub can disable schedules on inactive public
-repositories; check the Actions page if scheduled runs stop.
-
-## Install, upgrade and remove
-
-Quit every active Server R session using **Session → Quit Session**, then quit
-the RStudioServer control app before installing a new PKG. Installing over the
-development app is supported; a full uninstall is unnecessary for an upgrade.
-After installation, open `/Applications/RStudioServer.app`, enable startup and
-approve its background item in System Settings when prompted. Startup is a
-LaunchDaemon, not an Open at Login application.
-
-To remove the installation instead, quit all sessions and the control app, then
-run in your own Terminal:
-
-```sh
-sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/uninstall-rstudio-server
-```
-
-This removes the app, service registration, installer-owned service identity and
-package receipt. User accounts/homes, modified or pre-existing settings, logs,
-database and account-management records are preserved. R, Homebrew and source
-build dependencies are separate. Do not remove the app in Finder first: macOS
-cannot run its uninstaller when it is dragged to Trash.
-
-## Local build
-
-On a native arm64 Mac with Xcode Command Line Tools and Homebrew:
-
-```sh
-git clone --depth=1 --branch 'v2026.11.0+203' https://github.com/rstudio/rstudio.git upstream
-python3 tools/release.py apply --source upstream --tag 'v2026.11.0+203'
-bash tools/build-macos.sh "$PWD/upstream" 'v2026.11.0+203' "$PWD/dist"
-```
-
-The dependency installer runs as your normal account and uses sudo for system
-setup when necessary. GitHub-hosted macOS runners provide passwordless sudo.
-The local source-archive/provenance step expects this patch repository to have a
-Git commit. Local builds do not install or restart the app.
-
-## Maintain the patches
-
-Keep development source branches in your separate RStudio checkout. Export only
-the commits after their explicit upstream base marker:
-
-```sh
-python3 tools/export-patches.py --source ../rstudio-2026.11.0-203 \
-  --base v2026.11.0+203 --branch macos-server/2026.11.0-203-v2 --revision 3
-```
-
-The exporter omits Markdown files and the upstream INSTALL guide, so patches
-contain source/build revisions only. Edit docs/ directly for guide changes.
-Commit the regenerated patch files, guides and manifest here. A rebase of the source
-branch requires updating the `--base` boundary. Do not commit generated source,
-downloaded dependencies, PKGs, signing certificates or account data.
-
-The small `tests/` suite validates release selection and patch integrity.
-The validation workflow also checks patch application to the baseline release.
-The optional upstream `probe-server-accounts.py` and two `test-server-*.py`
-scripts are retained in the patch series for deliberate developer use; they are
-not build, installation, or release requirements.
-
-## License
-
-The patches and build tooling are provided under AGPL-3.0, as described in
-[COPYING](COPYING). Upstream notices remain in the patched source and packages.
+The Linux portal under R_in_conda/ requires CONDA_R_FLASK_SECRET_KEY before
+launch. Its previous signing key is intentionally absent from this backup.
