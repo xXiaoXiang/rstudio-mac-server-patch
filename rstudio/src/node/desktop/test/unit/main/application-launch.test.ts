@@ -1,0 +1,202 @@
+/*
+ * application-launch.test.ts
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+import { describe } from 'mocha';
+import { assert } from 'chai';
+import sinon from 'sinon';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import childProcess, { ChildProcess, SpawnOptions } from 'child_process';
+import { app } from 'electron';
+
+import { getenv, setenv } from '../../../src/core/environment';
+import { kProjectNone, kRStudioInitialProject, kRStudioInitialWorkingDir } from '../../../src/core/r-user-data';
+import { ApplicationLaunch, resolveProjectFile } from '../../../src/main/application-launch';
+import { MainWindow } from '../../../src/main/main-window';
+import { createSinonStubInstance, restore, saveAndClear } from '../unit-utils';
+
+describe('ApplicationLaunch', () => {
+  const tempDirs: string[] = [];
+  const launchEnvVars: Record<string, string> = {
+    [kRStudioInitialProject]: '',
+    [kRStudioInitialWorkingDir]: '',
+  };
+
+  beforeEach(() => {
+    saveAndClear(launchEnvVars);
+  });
+
+  afterEach(() => {
+    restore(launchEnvVars);
+    sinon.restore();
+    while (tempDirs.length) {
+      fs.rmSync(tempDirs.pop() as string, { recursive: true, force: true });
+    }
+  });
+
+  function projectDir(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rstudio-application-launch-test-'));
+    tempDirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'test.Rproj'), '');
+    return dir;
+  }
+
+  // the relaunched instance picks up its initial project and working directory
+  // from the environment passed to spawn
+  function captureLaunchEnv(): { project: string; workingDir: string } {
+    const launchEnv = { project: '', workingDir: '' };
+    sinon.stub(childProcess, 'spawn').callsFake((...args: unknown[]) => {
+      const env = (args[2] as SpawnOptions).env ?? {};
+      launchEnv.project = env[kRStudioInitialProject] ?? '';
+      launchEnv.workingDir = env[kRStudioInitialWorkingDir] ?? '';
+      return { unref: sinon.stub() } as unknown as ChildProcess;
+    });
+    return launchEnv;
+  }
+
+  it('static init returns new instance', () => {
+    const appLaunch = ApplicationLaunch.init();
+    assert.isObject(appLaunch);
+  });
+
+  it('new window matches created window', () => {
+    const appLaunch = ApplicationLaunch.init();
+    const testWindow = createSinonStubInstance(MainWindow);
+    appLaunch.setActivationWindow(testWindow);
+
+    const createdWindow = appLaunch.mainWindow as MainWindow;
+
+    assert.strictEqual(testWindow, createdWindow, 'Test window does not match created window');
+  });
+
+  it('launchRStudio forwards --automation-agent to the relaunched instance', () => {
+    const spawnStub = sinon.stub(childProcess, 'spawn').returns({ unref: sinon.stub() } as unknown as ChildProcess);
+    const appLaunch = ApplicationLaunch.init();
+
+    appLaunch.launchRStudio({ noProject: true });
+    assert.notInclude(spawnStub.firstCall.args[1] as string[], '--automation-agent');
+
+    app.commandLine.appendSwitch('automation-agent');
+    try {
+      appLaunch.launchRStudio({ noProject: true });
+    } finally {
+      app.commandLine.removeSwitch('automation-agent');
+    }
+    assert.include(spawnStub.secondCall.args[1] as string[], '--automation-agent');
+  });
+
+  it('launchRStudio forwards --no-sandbox to the relaunched instance', () => {
+    const spawnStub = sinon.stub(childProcess, 'spawn').returns({ unref: sinon.stub() } as unknown as ChildProcess);
+    const appLaunch = ApplicationLaunch.init();
+
+    // the test runner itself is started with --no-sandbox
+    const hadSwitch = app.commandLine.hasSwitch('no-sandbox');
+    try {
+      app.commandLine.removeSwitch('no-sandbox');
+      appLaunch.launchRStudio({ noProject: true });
+      assert.notInclude(spawnStub.firstCall.args[1] as string[], '--no-sandbox');
+
+      app.commandLine.appendSwitch('no-sandbox');
+      appLaunch.launchRStudio({ noProject: true });
+      assert.include(spawnStub.secondCall.args[1] as string[], '--no-sandbox');
+    } finally {
+      if (hadSwitch) {
+        app.commandLine.appendSwitch('no-sandbox');
+      } else {
+        app.commandLine.removeSwitch('no-sandbox');
+      }
+    }
+  });
+
+  it('launchRStudio opens the project found in the working directory', () => {
+    const launchEnv = captureLaunchEnv();
+    const dir = projectDir();
+
+    ApplicationLaunch.init().launchRStudio({ workingDirectory: dir });
+
+    assert.equal(launchEnv.project, path.join(dir, 'test.Rproj'));
+    assert.equal(launchEnv.workingDir, dir);
+  });
+
+  it('launchRStudio opens the given project file in its directory', () => {
+    const launchEnv = captureLaunchEnv();
+    const dir = projectDir();
+    const projectFile = path.join(dir, 'test.Rproj');
+
+    ApplicationLaunch.init().launchRStudio({ projectFilePath: projectFile });
+
+    assert.equal(launchEnv.project, projectFile);
+    assert.equal(launchEnv.workingDir, dir);
+  });
+
+  it('launchRStudio asks for no project, and no working directory, when noProject is requested', () => {
+    const launchEnv = captureLaunchEnv();
+
+    ApplicationLaunch.init().launchRStudio({ noProject: true });
+
+    // the session needs an explicit "none" so it doesn't restore the last project, and no
+    // working directory of ours so it uses the user's default working directory
+    assert.equal(launchEnv.project, kProjectNone);
+    assert.isEmpty(launchEnv.workingDir);
+  });
+
+  it('launchRStudio ignores an inherited project and working directory when noProject is requested', () => {
+    const launchEnv = captureLaunchEnv();
+    const dir = projectDir();
+
+    // set when this instance was itself started by opening a project
+    setenv(kRStudioInitialProject, path.join(dir, 'test.Rproj'));
+    setenv(kRStudioInitialWorkingDir, dir);
+
+    ApplicationLaunch.init().launchRStudio({ noProject: true });
+
+    assert.equal(launchEnv.project, kProjectNone);
+    assert.isEmpty(launchEnv.workingDir);
+
+    // and our own environment is left alone
+    assert.equal(getenv(kRStudioInitialProject), path.join(dir, 'test.Rproj'));
+    assert.equal(getenv(kRStudioInitialWorkingDir), dir);
+  });
+
+  it('Resolve Empty Project File Path', () => {
+    const projectFilePath = resolveProjectFile('./../');
+    assert.isEmpty(projectFilePath);
+  });
+
+  it('Resolve Project File Path', () => {
+    const filename = 'test.rproj';
+    fs.writeFileSync('./' + filename, '');
+
+    const rprojExtension = 'rproj';
+    const projectFilePath = resolveProjectFile('./');
+    const extensionRegexp = new RegExp(/(?:\.([^.]+))?$/);
+
+    const hasExtension = extensionRegexp.test(projectFilePath);
+    assert.isTrue(hasExtension, 'File does not have extension');
+    assert.equal(projectFilePath, filename, 'Filename does not match with test file');
+
+    try {
+      const isRprojExtensionValid =
+        (extensionRegexp.exec(projectFilePath) as string[])[1].toLowerCase() === rprojExtension;
+
+      assert.isTrue(isRprojExtensionValid, 'File extension is not .rproj');
+
+      fs.unlinkSync('./' + filename);
+    } catch (_err: unknown) {
+      assert.isTrue(false, 'Error happened when trying to assert rproj extension');
+    }
+  });
+});

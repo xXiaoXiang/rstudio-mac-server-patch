@@ -1,0 +1,109 @@
+/*
+ * application-launch.ts
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+import path from 'path';
+import { spawn } from 'child_process';
+import { existsSync, readdirSync } from 'fs';
+import { kProjectNone, kRStudioInitialProject, kRStudioInitialWorkingDir } from '../core/r-user-data';
+import { MainWindow } from './main-window';
+import { isAutomated } from './utils';
+import { app } from 'electron';
+
+// every launch states exactly one intent: open this project file, start in this directory
+// (opening the project found there, if any), or start with no project in the user's default
+// working directory
+export type LaunchRStudioOptions = { projectFilePath: string } | { workingDirectory: string } | { noProject: true };
+
+export function resolveProjectFile(projectDir: string): string {
+  // check that the project directory exists
+  if (!existsSync(projectDir)) {
+    return '';
+  }
+
+  // list files in the directory, looking for a .Rproj file
+  const files = readdirSync(projectDir, { encoding: 'utf-8' });
+  for (const file of files) {
+    const ext = path.extname(file).toLowerCase();
+    if (ext === '.rproj') {
+      return path.join(projectDir, file);
+    }
+  }
+
+  // nothing found
+  return '';
+}
+
+export class ApplicationLaunch {
+  mainWindow?: MainWindow;
+  static init(): ApplicationLaunch {
+    return new ApplicationLaunch();
+  }
+
+  setActivationWindow(window: MainWindow): void {
+    this.mainWindow = window;
+  }
+
+  activateWindow(): void {
+    // TODO - reimplement (if needed at all)
+  }
+
+  launchRStudio(options: LaunchRStudioOptions): void {
+    // in devmode, we need to pass the directory path when launching the application;
+    // for package builds, we have no such requirement
+    const argv = app.isPackaged ? [] : [process.argv[1]];
+
+    // keep the relaunched instance from stealing focus during automation runs
+    if (isAutomated()) {
+      argv.push('--automation-agent');
+    }
+
+    // where Chromium's sandbox can't start (e.g. a dev build on Linux with unprivileged user
+    // namespaces restricted), the new instance would abort at startup without this
+    if (app.commandLine.hasSwitch('no-sandbox')) {
+      argv.push('--no-sandbox');
+    }
+
+    // this instance may have been started by opening a project or a file, which leaves these
+    // variables set in our own environment; give the new session a copy without them
+    const env = { ...process.env };
+    delete env[kRStudioInitialProject];
+    delete env[kRStudioInitialWorkingDir];
+
+    if ('noProject' in options) {
+      // ask for no project explicitly, so the session doesn't restore the last one; with no
+      // working directory of our own the session uses the user's default working directory
+      env[kRStudioInitialProject] = kProjectNone;
+    } else if ('projectFilePath' in options) {
+      env[kRStudioInitialWorkingDir] = path.dirname(options.projectFilePath);
+      if (existsSync(options.projectFilePath)) {
+        env[kRStudioInitialProject] = options.projectFilePath;
+      }
+    } else {
+      env[kRStudioInitialWorkingDir] = options.workingDirectory;
+      const projectFile = resolveProjectFile(options.workingDirectory);
+      if (projectFile) {
+        env[kRStudioInitialProject] = projectFile;
+      }
+    }
+
+    // run it
+    const childProcess = spawn(process.execPath, argv, {
+      detached: true,
+      stdio: 'ignore', // don't reuse the stdio from parent
+      env,
+    });
+    childProcess.unref();
+  }
+}

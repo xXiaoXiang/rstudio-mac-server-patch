@@ -1,0 +1,27 @@
+{
+  "source_snapshot": {
+    "branch": "feature/macos-server",
+    "head": "fb4b89b6ebb9ed1a49b0ed6167bea295d4af2b28",
+    "base_marker": "macos-server/base-main-2da6d1b",
+    "base_commit": "2da6d1b0e60d243299ac8f5545714623875434bd"
+  },
+  "server_build": {
+    "target": "Server",
+    "architecture": "arm64",
+    "recommended_minimum_macos": "13.0",
+    "install_prefix": "/Applications",
+    "build_type": "Release",
+    "generator": "Ninja",
+    "gwt_build": true,
+    "unit_tests_disabled_for_original_build": true
+  },
+  "latest_release": {
+    "upstream_tag": "v2026.11.0+203",
+    "local_branch": "macos-server/2026.11.0-203-v2",
+    "local_head": "bdc5f6ce04f2824474491aae80ed3239191df70c",
+    "patch_repository_commit": "542f7cecd006150c490dc41981d05667b79814d8",
+    "published_build_commit": "af779eae74dbad5f17dcbe9c66dd9fbceee3dd10",
+    "package": "RStudioServer-2026.11.0-203-arm64.pkg",
+    "package_sha256": "2787743a09944f5e0d1cfbdfa06e37434b4944e371e9e8346ead4c4f509efb30"
+  }
+}

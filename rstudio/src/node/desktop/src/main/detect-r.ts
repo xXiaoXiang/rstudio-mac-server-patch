@@ -1,0 +1,1043 @@
+/*
+ * detect-r.ts
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+import path, { join } from 'path';
+
+import { execSync, spawn, spawnSync } from 'child_process';
+import { existsSync, readdirSync, statSync } from 'fs';
+
+import { Environment, getenv, setenv, setVars } from '../core/environment';
+import { Expected, ok, err, expect } from '../core/expected';
+import { logger } from '../core/logger';
+import { Err, success, safeError } from '../core/err';
+import { ChooseRModalWindow } from '..//ui/widgets/choose-r';
+import { createStandaloneErrorDialog } from './utils';
+import { t } from 'i18next';
+
+import { ElectronDesktopOptions, fixWindowsRExecutablePath } from './preferences/electron-desktop-options';
+import { FilePath } from '../core/file-path';
+
+import desktop from '../native/desktop.node';
+import { EOL } from 'os';
+import { kWindowsRExe } from '../ui/utils';
+import { dialog } from 'electron';
+import { appState } from './app-state';
+import { REnvironmentCache } from './r-environment-cache';
+
+let kLdLibraryPathVariable: string;
+if (process.platform === 'darwin') {
+  kLdLibraryPathVariable = 'DYLD_FALLBACK_LIBRARY_PATH';
+} else {
+  kLdLibraryPathVariable = 'LD_LIBRARY_PATH';
+}
+
+// The library path RStudio was launched with. Preparing the environment for
+// an R replaces the process's value with that R's paths, so the user's own
+// is kept aside: every R is queried with it and extends it, including an R
+// switched to later, whose paths must not follow those of the previous R.
+const kUserLdLibraryPath = getenv(kLdLibraryPathVariable);
+
+// The PATH RStudio was launched with, kept aside for the same reason: on
+// Windows the session's R goes in front of it, and an R switched to later
+// must not leave the previous R's directory behind it.
+const kUserPath = getenv('PATH');
+
+interface REnvironment {
+  rScriptPath: string;
+  version: string;
+  envVars: Environment;
+  ldLibraryPath: string;
+}
+
+/**
+ * Tells the user why there is no R to start a session with: no installation
+ * was found at all, there is no R at the path given, or an R was found but
+ * could not be used. Only an RLaunchError is shown, since it names the R and
+ * what it reported; any other error was logged where it happened and would
+ * tell the user no more than the generic message does.
+ */
+export async function showRNotFoundError(error?: Error) {
+  const { title, message } = rNotFoundDialog(error);
+  await createStandaloneErrorDialog(title, message);
+}
+
+/**
+ * The title and message showRNotFoundError() shows for an error.
+ */
+export function rNotFoundDialog(error?: Error): { title: string; message: string } {
+  if (!(error instanceof RLaunchError)) {
+    return { title: t('detectRTs.rNotFound'), message: t('detectRTs.couldNotLocateAnRInstallationOnTheSystem') };
+  }
+
+  const title = error.executableMissing ? t('detectRTs.rNotFound') : t('detectRTs.rFailedToStart');
+  return { title, message: error.message };
+}
+
+function executeCommand(command: string): Expected<string> {
+  return expect(() => {
+    return execSync(command, { encoding: 'utf-8' }).trim();
+  });
+}
+
+/**
+ * True when the Windows R chooser was explicitly requested, via the
+ * environment or by holding Ctrl at launch.
+ */
+export function rChooserRequested(): boolean {
+  return getenv('RSTUDIO_DESKTOP_PROMPT_FOR_R').length !== 0 || desktop.isCtrlKeyDown();
+}
+
+/**
+ * True when Windows startup is going to show the R chooser, as far as can be
+ * predicted without consulting R: explicitly requested, or a first run with
+ * no remembered selection to reuse.
+ */
+export function rChooserLikely(): boolean {
+  if (rChooserRequested()) {
+    return true;
+  }
+  if (getenv('RSTUDIO_WHICH_R').length !== 0) {
+    return false;
+  }
+
+  // a stored candidate that no longer exists on disk will fail validation
+  // and land in the chooser anyway. NOTE: full parity with promptUserForR's
+  // acceptance (isValidBinary) is deliberately not attempted: it launches R
+  // synchronously, which is the very cost the background probe exists to
+  // hide, and a stored R that exists but fails pays a single R attempt
+  // either way (the probe tries it first; validation then reads the cache)
+  return !storedRCandidatesWin32().some((candidate) => existsSync(candidate.path));
+}
+
+/**
+ * Resolves an R home directory to the R executable it holds (bin/x64/Rterm.exe,
+ * then bin/i386/Rterm.exe, on Windows; bin/R elsewhere). Any other path -- an
+ * executable, a directory holding no R, or a path that doesn't exist -- is
+ * returned as it is, so that validation reports it.
+ */
+export function resolveRHome(rPath: string, platform = process.platform): string {
+  try {
+    if (!statSync(rPath).isDirectory()) {
+      return rPath;
+    }
+  } catch {
+    return rPath;
+  }
+
+  const executables = platform === 'win32' ? [`bin/x64/${kWindowsRExe}`, `bin/i386/${kWindowsRExe}`] : ['bin/R'];
+  for (const executable of executables) {
+    const candidate = join(rPath, executable);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return rPath;
+}
+
+/**
+ * The R named by the RSTUDIO_WHICH_R environment variable: an R executable,
+ * or an R home directory, which resolves to the executable it holds. Empty
+ * when the variable is unset.
+ */
+export function rFromRStudioWhichR(): string {
+  const rstudioWhichR = getenv('RSTUDIO_WHICH_R');
+  return rstudioWhichR ? resolveRHome(rstudioWhichR) : '';
+}
+
+export async function promptUserForR(platform = process.platform): Promise<Expected<string | null>> {
+  const options = ElectronDesktopOptions();
+
+  if (platform === 'win32') {
+    const showUi = rChooserRequested();
+
+    if (!showUi) {
+      // nothing to do if RSTUDIO_WHICH_R is set
+      const rstudioWhichR = rFromRStudioWhichR();
+      if (rstudioWhichR) {
+        logger().logDebug(`Using R from RSTUDIO_WHICH_R: ${rstudioWhichR}`);
+        return ok(rstudioWhichR);
+      }
+
+      for (const candidate of storedRCandidatesWin32()) {
+        if (!candidate.validate) {
+          logger().logDebug(`Using default R installation at path: ${candidate.path}`);
+          return ok(candidate.path);
+        }
+
+        logger().logDebug(`Trying version of R stored in RStudio Desktop options: ${candidate.path}`);
+        if (isValidBinary(candidate.path)) {
+          logger().logDebug(`Validation succeeded; using R: ${candidate.path}`);
+          return ok(candidate.path);
+        } else {
+          logger().logDebug(`Validation failed; skipping R: ${candidate.path}`);
+        }
+      }
+    }
+
+    // discover available R installations
+    const rInstalls = findRInstallationsWin32();
+    if (rInstalls.length === 0) {
+      logger().logDebug('No R installations found via registry or common R install locations.');
+    }
+
+    // ask the user what version of R they'd like to use
+    const chooseRDialog = new ChooseRModalWindow(rInstalls);
+
+    const [data, error] = await chooseRDialog.showModal();
+    if (error) {
+      return err(error);
+    }
+
+    // if path is null, the operation was cancelled by the user
+    if (data == null || data.binaryPath == null) {
+      return ok(null);
+    }
+
+    // reset some options
+    const path = data.binaryPath as string;
+    options.setUseDefault32BitR(data.useDefault32BitR || false);
+    options.setUseDefault64BitR(data.useDefault64BitR || false);
+    options.setRExecutablePath(path);
+
+    // if the user has changed the default rendering engine,
+    // then we'll need to ask them to restart RStudio now
+    const enginePref = options.renderingEngine() || 'auto';
+    const engineValue = data.renderingEngine || 'auto';
+    if (enginePref !== engineValue) {
+      options.setRenderingEngine(engineValue);
+      appState().modalTracker.trackElectronModalSync(() =>
+        dialog.showMessageBoxSync({
+          title: t('chooseRDialog.renderingEngineChangedTitle'),
+          message: t('chooseRDialog.renderingEngineChangedMessage'),
+          type: 'info',
+        }),
+      );
+
+      // TODO: It'd be nice if we could use app.relaunch(), but that doesn't
+      // seem to do what we want it to?
+      return ok(null);
+    }
+
+    // set RSTUDIO_WHICH_R to signal which version of R to be used
+    setenv('RSTUDIO_WHICH_R', path);
+    return ok(path);
+  }
+
+  return err(new Error('This window can only be opened on Windows'));
+}
+
+/**
+ * Detect R and prepare environment for launching the rsession process.
+ *
+ * This entails setting environment variables relevant to R on startup
+ * // (for example, R_HOME) and other platform-specific work required
+ * for R to launch.
+ */
+interface RCandidateWin32 {
+  path: string;
+
+  // the defaults recorded in the registry are trusted as they stand; a path
+  // the user stored in the options is checked before use
+  validate: boolean;
+}
+
+/**
+ * The R executables the Windows startup prefers when the user is not asked,
+ * in order: the default 32-bit or 64-bit installation when the options ask
+ * for one (and it exists), then the executable stored in the options.
+ */
+function storedRCandidatesWin32(): RCandidateWin32[] {
+  const options = ElectronDesktopOptions();
+  const candidates: RCandidateWin32[] = [];
+
+  if (options.useDefault32BitR()) {
+    logger().logDebug('User has requested the default 32-bit R installation.');
+    const installPath = findDefault32Bit();
+    if (installPath) {
+      const rPath = `${installPath}/bin/i386/${kWindowsRExe}`;
+      if (existsSync(rPath)) {
+        candidates.push({ path: rPath, validate: false });
+      }
+    }
+  }
+
+  if (options.useDefault64BitR()) {
+    logger().logDebug('User has requested the default 64-bit R installation.');
+    const installPath = findDefault64Bit();
+    if (installPath) {
+      const rPath = `${installPath}/bin/x64/${kWindowsRExe}`;
+      if (existsSync(rPath)) {
+        candidates.push({ path: rPath, validate: false });
+      }
+    }
+  }
+
+  const rBinDir = options.rBinDir();
+  if (rBinDir) {
+    candidates.push({ path: fixWindowsRExecutablePath(`${rBinDir}/${kWindowsRExe}`), validate: true });
+  }
+
+  return candidates;
+}
+
+/**
+ * The default installations recorded in the registry, 64-bit first, as
+ * scanForRWin32 would try them.
+ */
+function registryRCandidatesWin32(): string[] {
+  const candidates: string[] = [];
+
+  if (process.arch === 'x64') {
+    const x64InstallPath = findDefaultInstallPathWin32('R64');
+    if (x64InstallPath) {
+      candidates.push(`${x64InstallPath}/bin/x64/${kWindowsRExe}`);
+    }
+  }
+
+  const i386InstallPath = findDefaultInstallPathWin32('R');
+  if (i386InstallPath) {
+    candidates.push(`${i386InstallPath}/bin/i386/${kWindowsRExe}`);
+  }
+
+  return candidates;
+}
+
+export function prepareEnvironment(rPath: string): Err {
+  try {
+    return prepareEnvironmentImpl(rPath);
+  } catch (error: unknown) {
+    logger().logError(error);
+    return safeError(error);
+  }
+}
+
+function prepareEnvironmentImpl(rPath: string): Err {
+  // attempt to detect R environment
+  const [rEnvironment, error] = detectREnvironment(rPath);
+  if (error) {
+    return error;
+  }
+
+  // set environment variables from R
+  setVars(rEnvironment.envVars);
+
+  // on Linux + macOS, forward LD_LIBRARY_PATH and friends
+  if (process.platform !== 'win32') {
+    process.env[kLdLibraryPathVariable] = rEnvironment.ldLibraryPath;
+  }
+
+  // on Windows, ensure R is on the PATH so that companion DLLs
+  // in the same directory can be resolved
+  const scriptPath = rEnvironment.rScriptPath;
+  if (process.platform === 'win32') {
+    process.env.PATH = windowsSessionPath(path.dirname(scriptPath));
+  }
+
+  return success();
+}
+
+/**
+ * The PATH a session runs with on Windows: the R's bin directory ahead of
+ * the PATH RStudio was launched with, whichever R was prepared before.
+ */
+export function windowsSessionPath(binDir: string): string {
+  return kUserPath ? `${binDir};${kUserPath}` : binDir;
+}
+
+// Querying R costs a process launch (~150ms or more). The same executable is
+// queried while scanning for installations and again when preparing the
+// session environment, so successful results are remembered per path. The
+// query also runs in the background from the moment the app starts (see
+// startRDetection), which normally fills the cache before anything asks.
+const rEnvironmentCache = new Map<string, REnvironment>();
+let diskCache: REnvironmentCache | undefined;
+
+function environmentDiskCache(): REnvironmentCache | undefined {
+  try {
+    diskCache ??= new REnvironmentCache();
+    return diskCache;
+  } catch {
+    return undefined;
+  }
+}
+
+export function detectREnvironment(rPath: string): Expected<REnvironment> {
+  const cached = rEnvironmentCache.get(rPath);
+  if (cached) {
+    return ok(cached);
+  }
+
+  const rExecutable = rExecutableFor(rPath);
+  const environment = rQueryEnvironment();
+  const remembered = readRememberedEnvironment(rPath, rExecutable, environment);
+  if (remembered) {
+    return remembered;
+  }
+  logger().logDebug(`Querying information about R executable at path: ${rExecutable}`);
+
+  const executableMissing = !existsSync(rExecutable.getAbsolutePath());
+  const launch = rQueryCommand(rExecutable.getAbsolutePath(), environment);
+  const [spawned, spawnError] = expect(() => {
+    return spawnSync(launch.command, launch.args, {
+      encoding: 'utf-8',
+      input: rQueryScript(),
+      env: launch.env,
+    });
+  });
+
+  // spawnSync reports most launch failures in its result, but it can also throw
+  let query: RQueryResult;
+  if (spawnError) {
+    query = { stdout: '', stderr: '', status: null, error: spawnError, executableMissing };
+  } else {
+    query = {
+      stdout: spawned.stdout,
+      stderr: spawned.stderr,
+      status: spawned.status,
+      signal: spawned.signal,
+      error: spawned.error,
+      executableMissing,
+    };
+  }
+  const result = rememberREnvironment(rPath, parseRQueryResult(rPath, query));
+  persistEnvironment(rExecutable, environment, result, query);
+  return result;
+}
+
+/**
+ * The asynchronous twin of detectREnvironment(); same query, same cache.
+ * With `timeoutMs`, an R that does not answer in time is killed and reported
+ * as an error rather than waited for.
+ */
+export async function detectREnvironmentAsync(rPath: string, timeoutMs = 0): Promise<Expected<REnvironment>> {
+  const cached = rEnvironmentCache.get(rPath);
+  if (cached) {
+    return ok(cached);
+  }
+
+  const rExecutable = rExecutableFor(rPath);
+  const environment = rQueryEnvironment();
+  const remembered = readRememberedEnvironment(rPath, rExecutable, environment);
+  if (remembered) {
+    return remembered;
+  }
+  logger().logDebug(`Querying information about R executable at path: ${rExecutable} (in background)`);
+
+  const executableMissing = !existsSync(rExecutable.getAbsolutePath());
+  const launch = rQueryCommand(rExecutable.getAbsolutePath(), environment);
+  const result = await new Promise<RQueryResult>((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    const child = spawn(launch.command, launch.args, {
+      env: launch.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let timer: NodeJS.Timeout | null = null;
+    const settle = (outcome: RQueryResult) => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolve({ ...outcome, executableMissing });
+    };
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        child.kill();
+        settle({ stdout, stderr, status: null, error: new RQueryTimeout(timeoutMs) });
+      }, timeoutMs);
+    }
+    child.stdout.on('data', (data) => (stdout += data));
+    child.stderr.on('data', (data) => (stderr += data));
+    child.on('error', (error) => settle({ stdout, stderr, status: null, error }));
+    child.on('close', (code, signal) => settle({ stdout, stderr, status: code, signal }));
+
+    // R may exit before reading its input; that is reported through 'close'
+    child.stdin.on('error', () => undefined);
+    child.stdin.end(rQueryScript());
+  });
+
+  // an R that answered in full and then hung is not one to restart into:
+  // parseRQueryResult() would accept that output, and cache it
+  if (result.error instanceof RQueryTimeout) {
+    logger().logError(result.error);
+    return err(result.error);
+  }
+
+  const parsed = rememberREnvironment(rPath, parseRQueryResult(rPath, result));
+  persistEnvironment(rExecutable, environment, parsed, result);
+  return parsed;
+}
+
+/**
+ * Replays a remembered query for this executable and environment, if any.
+ */
+function readRememberedEnvironment(
+  rPath: string,
+  rExecutable: FilePath,
+  environment: NodeJS.ProcessEnv,
+): Expected<REnvironment> | undefined {
+  const remembered = environmentDiskCache()?.read(rExecutable.getAbsolutePath(), environment);
+  if (!remembered) {
+    return undefined;
+  }
+  return rememberREnvironment(rPath, parseRQueryResult(rPath, { stdout: remembered, stderr: '', status: 0 }));
+}
+
+/**
+ * Remembers a query across launches, but only a complete, successful one.
+ */
+function persistEnvironment(
+  rExecutable: FilePath,
+  environment: NodeJS.ProcessEnv,
+  result: Expected<REnvironment>,
+  query: RQueryResult,
+): void {
+  if (!result[1] && query.status === 0 && query.stdout) {
+    environmentDiskCache()?.write(rExecutable.getAbsolutePath(), environment, query.stdout);
+  }
+}
+
+function rememberREnvironment(rPath: string, result: Expected<REnvironment>): Expected<REnvironment> {
+  const [environment, error] = result;
+  if (!error) {
+    rEnvironmentCache.set(rPath, environment);
+  }
+  return result;
+}
+
+function rExecutableFor(rPath: string): FilePath {
+  // resolve path to binary if we were given a directory
+  const rExecutable = new FilePath(rPath);
+  if (rExecutable.isDirectory()) {
+    return rExecutable.completeChildPath(process.platform === 'win32' ? kWindowsRExe : 'R');
+  }
+  return rExecutable;
+}
+
+// small script for querying information about R; the marker character
+// '\x1E' lets us find our output even when the R installation prints
+// something on startup. kQueryFieldCount is how many values it writes;
+// writeLines() puts the separator after every value, the last included, so
+// a complete answer ends with one
+const kQueryFieldCount = 9;
+function rQueryScript(): string {
+  return String.raw`
+cat("\x1E", sep = "")
+writeLines(sep = "\x1F", c(
+  format(getRversion()),
+  R.home(),
+  R.home("doc"),
+  R.home("include"),
+  R.home("share"),
+  paste(R.version$crt, collapse = ""),
+  .Platform$r_arch,
+  Sys.getenv("${kLdLibraryPathVariable}"),
+  Sys.getenv("R_PLATFORM")
+))`;
+}
+
+// A versioned install inside the macOS R framework. Its bin/R launcher script
+// hard-codes the framework's "Current" default as R_HOME, so querying such an
+// install through the script reports the default R rather than the version
+// asked for. Instead, the steps of the script that matter are taken with the
+// install's own R_HOME: source its etc/ldpaths (which sets the library path
+// the session inherits from the query), then run its real executable. The
+// framework's default path (Resources/bin/R under R.framework itself) is
+// left to the script.
+const kFrameworkVersionPattern = /^(.*\/R\.framework\/Versions\/[^/]+\/Resources)\/bin\/R$/;
+
+const kFrameworkLauncherScript = '. "$R_HOME/etc/ldpaths" && exec "$R_HOME/bin/exec/R" "$@"';
+
+export function frameworkVersionHome(rExecutable: string): string | null {
+  const match = kFrameworkVersionPattern.exec(rExecutable);
+  return match ? match[1] : null;
+}
+
+export interface RQueryCommand {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+/**
+ * The command and environment to query the given R with. The environment
+ * given (the query environment by default) is left as is: a framework
+ * version's query extends a copy of it.
+ */
+export function rQueryCommand(rExecutable: string, environment = rQueryEnvironment()): RQueryCommand {
+  const args = ['--vanilla', '-s'];
+
+  const home = frameworkVersionHome(rExecutable);
+  if (home === null) {
+    return { command: rExecutable, args, env: environment };
+  }
+
+  const env = { ...environment, R_HOME: home };
+  return { command: '/bin/sh', args: ['-c', kFrameworkLauncherScript, 'R', ...args], env };
+}
+
+function rQueryEnvironment(): NodeJS.ProcessEnv {
+  // remove R-related environment variables before invoking R
+  // note that we intentionally preserve the user's LD_LIBRARY_PATH
+  // see https://github.com/rstudio/rstudio/issues/15044 for motivation
+  const envCopy = Object.assign({}, process.env);
+  delete envCopy['R_HOME'];
+  delete envCopy['R_ARCH'];
+  delete envCopy['R_DOC_DIR'];
+  delete envCopy['R_INCLUDE_DIR'];
+  delete envCopy['R_RUNTIME'];
+  delete envCopy['R_SHARE_DIR'];
+  delete envCopy['R_PLATFORM'];
+
+  // the process's own value holds the paths of an R prepared earlier
+  if (process.platform !== 'win32') {
+    if (kUserLdLibraryPath) {
+      envCopy[kLdLibraryPathVariable] = kUserLdLibraryPath;
+    } else {
+      delete envCopy[kLdLibraryPathVariable];
+    }
+  }
+
+  return envCopy;
+}
+
+/** What launching R and running the query script produced. */
+export interface RQueryResult {
+  stdout: string | null;
+  stderr: string | null;
+  status: number | null;
+  /** The signal that ended R, when it did not exit on its own. */
+  signal?: NodeJS.Signals | null;
+  error?: Error;
+  /**
+   * Whether nothing existed at the executable's path when it was launched:
+   * the R is not installed, or not where it was recorded, rather than
+   * broken. Decided by looking at the path, not at how the launch failed:
+   * an existing R whose interpreter or loader is missing fails with ENOENT
+   * too, and a missing framework version is launched through /bin/sh, which
+   * exits normally with an error of its own.
+   */
+  executableMissing?: boolean;
+}
+
+/**
+ * An R that did not answer the query: it could not be launched, or it started
+ * and exited without running the query script to the end. The message is for
+ * the user and names the R, how it ended, and what it printed, so that a
+ * broken R is not mistaken for a missing one. An R that is not there at all
+ * (executableMissing) is reported as missing, not broken.
+ */
+export class RLaunchError extends Error {
+  constructor(
+    public readonly rPath: string,
+    public readonly result: RQueryResult,
+  ) {
+    super(rLaunchFailureMessage(rPath, result));
+    this.name = 'RLaunchError';
+  }
+
+  /** Whether the failure is that there is no executable at the path. */
+  get executableMissing(): boolean {
+    return this.result.executableMissing === true;
+  }
+}
+
+// how much of R's stderr the user is shown: enough for R's own
+// "Fatal error:" lines and a short traceback, not a whole startup log
+const kStderrTailLines = 10;
+const kStderrTailLineLength = 200;
+
+/**
+ * The user-facing description of a failed R query.
+ */
+export function rLaunchFailureMessage(rPath: string, result: RQueryResult): string {
+  const launchError = result.error
+    ? t('detectRTs.launchError', { error: result.error.message || String(result.error) })
+    : undefined;
+
+  // an R that is not there never ran, so there is nothing more to report
+  if (result.executableMissing) {
+    return [t('detectRTs.noRExecutableAt', { rPath }), launchError].filter(Boolean).join('\n\n');
+  }
+
+  const parts = [t('detectRTs.rFoundButFailedToStart', { rPath })];
+
+  if (launchError) {
+    parts.push(launchError);
+  }
+  if (result.signal) {
+    parts.push(t('detectRTs.terminatedBySignal', { signal: result.signal }));
+  }
+  if (result.status !== null) {
+    parts.push(t('detectRTs.exitStatus', { status: result.status }));
+  }
+
+  const tail = stderrTail(result.stderr);
+  parts.push(tail ? t('detectRTs.rReported', { output: tail }) : t('detectRTs.rProducedNoErrorOutput'));
+
+  return parts.join('\n\n');
+}
+
+function stderrTail(stderr: string | null): string {
+  return (stderr || '')
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .slice(-kStderrTailLines)
+    .map((line) => (line.length > kStderrTailLineLength ? line.substring(0, kStderrTailLineLength) + '...' : line))
+    .join('\n');
+}
+
+/** The query's R was killed for not answering within detectREnvironmentAsync()'s timeout. */
+class RQueryTimeout extends Error {
+  constructor(timeoutMs: number) {
+    super(`R did not answer within ${timeoutMs / 1000} seconds`);
+  }
+}
+
+/**
+ * Turns the output of the R query script into the environment needed to
+ * launch a session with that R.
+ */
+export function parseRQueryResult(rPath: string, result: RQueryResult): Expected<REnvironment> {
+  // NOTE: It's possible for spawnSync to fail to launch a process,
+  // and so exit with a non-zero status code, but without an error.
+  // For that reason, we need to check for a non-zero exit code
+  // rather than just a non-null error.
+  //
+  // As an added safe-guard, if an error occurs, but we still have
+  // something on 'stdout', try and use that to activate this version
+  // of R. Maybe the process exited abnormally for an unknown reason,
+  // even though it started and gave us the necessary information?
+  //
+  // Also, contrary to the declared type signatures, the values in 'result' can
+  // be null, so check those in a 'null'-y way.
+  const stdout = result.stdout || '';
+  const index = stdout.indexOf('\x1E');
+  const fields = index === -1 ? [] : stdout.substring(index + 1).split('\x1F');
+
+  // why the answer cannot be used, if it cannot: R never ran, R ran but
+  // never reached the query script, or R died partway through it. Only
+  // the trailing separator shows that the last field was written in full,
+  // so a complete answer has one more piece than it has fields
+  let failure: string | undefined;
+  if (!stdout) {
+    failure = 'produced no output';
+  } else if (index === -1) {
+    failure = 'did not run the query script (no output marker)';
+  } else if (fields.length <= kQueryFieldCount) {
+    failure = `answered with ${fields.length - 1} of ${kQueryFieldCount} fields`;
+  }
+
+  // a failed query, or an R that answered but did not end normally, is
+  // logged at warning level, so the default log says why a found R was
+  // rejected; a clean success stays quiet
+  const abnormal = failure !== undefined || result.status !== 0 || !!result.signal || !!result.error;
+  const log = (message: string) => (abnormal ? logger().logWarning(message) : logger().logDebug(message));
+  log(`R at ${rPath} ${failure ?? 'answered the query'}`);
+  log(`stdout: ${stdout.replaceAll('\x1E', EOL).replaceAll('\x1F', ';') || '[no stdout produced]'}`);
+  log(`stderr: ${result.stderr || '[no stderr produced]'}`);
+  log(
+    `status: ${result.status}${result.signal ? ` (${result.signal})` : ''} [${result.status === 0 ? 'success' : 'failure'}]`,
+  );
+  if (result.error) {
+    log(`error:  ${result.error}`);
+  }
+
+  if (failure) {
+    return err(new RLaunchError(rPath, result));
+  }
+
+  // unwrap query results
+  const [rVersion, rHome, rDocDir, rIncludeDir, rShareDir, rRuntime, rArch, rLdLibraryPath, rPlatform] = fields;
+
+  let adjustedRLdLibraryPath = rLdLibraryPath;
+
+  // if this appears to be a conda installation of R, manually set LD_LIBRARY_PATH appropriately
+  // https://github.com/rstudio/rstudio/issues/13184
+  if (adjustedRLdLibraryPath.length === 0 && rPlatform.indexOf('-conda-') !== -1) {
+    const rLibPaths = [`${rHome}/lib`, `${rHome}/../../lib`]
+      .filter((value) => existsSync(value))
+      .map((value) => path.normalize(value));
+
+    adjustedRLdLibraryPath = rLibPaths.join(':');
+  }
+
+  if (process.platform !== 'win32' && kUserLdLibraryPath != '') {
+    logger().logDebug(`Pre-pending user-defined ${kLdLibraryPathVariable} to path set by R: ${adjustedRLdLibraryPath}`);
+    adjustedRLdLibraryPath = kUserLdLibraryPath + ':' + adjustedRLdLibraryPath;
+  }
+
+  // put it all together
+  return ok({
+    rScriptPath: rPath,
+    version: rVersion,
+    envVars: {
+      R_HOME: rHome,
+      R_DOC_DIR: rDocDir,
+      R_INCLUDE_DIR: rIncludeDir,
+      R_SHARE_DIR: rShareDir,
+      R_RUNTIME: rRuntime,
+      R_ARCH: rArch,
+      R_PLATFORM: rPlatform,
+    },
+    ldLibraryPath: adjustedRLdLibraryPath,
+  });
+}
+
+export function scanForR(): Expected<string> {
+  // if the RSTUDIO_WHICH_R environment variable is set, use that
+  // note that this does not pick up variables set in a user's bash profile, for example
+  const rstudioWhichR = rFromRStudioWhichR();
+
+  if (rstudioWhichR) {
+    logger().logDebug(`Using ${rstudioWhichR} (found by RSTUDIO_WHICH_R environment variable)`);
+    return ok(rstudioWhichR);
+  }
+
+  // otherwise, use platform-specific lookup strategies
+  logger().logDebug('Scanning system for R installations');
+  if (process.platform === 'win32') {
+    return scanForRWin32();
+  } else {
+    return scanForRPosix();
+  }
+}
+
+function defaultRLocationsPosix(): string[] {
+  const defaultLocations = ['/usr/bin/R', '/usr/local/bin/R', '/opt/local/bin/R'];
+
+  if (process.platform == 'darwin') {
+    // For Mac, we want to first look in a list of hard-coded locations
+    // also check framework directory and then homebrew ARM locations for macOS
+    defaultLocations.push('/Library/Frameworks/R.framework/Resources/bin/R');
+    defaultLocations.push('/opt/homebrew/bin/R');
+  }
+
+  return defaultLocations;
+}
+
+// for linux, look for R on the PATH
+// should we launch the default shell to pick up the user modifications to the path?
+function rOnPathLinux(): string | null {
+  const [rLocation, error] = executeCommand('/usr/bin/which R');
+  if (!error && rLocation) {
+    return rLocation;
+  }
+  return null;
+}
+
+/**
+ * Looks for a usable R in the well-known POSIX locations. When none of them
+ * works but one of them exists, the error is that R's launch failure, so the
+ * caller can tell "no R installed" from "R installed but broken".
+ *
+ * `locations` and `platform` are parameters for testing.
+ */
+export function scanForRPosix(locations = defaultRLocationsPosix(), platform = process.platform): Expected<string> {
+  if (platform !== 'darwin') {
+    const rLocation = rOnPathLinux();
+    if (rLocation) {
+      logger().logDebug(`Using ${rLocation} (found by /usr/bin/which/R)`);
+      return ok(rLocation);
+    }
+  }
+
+  let launchError: RLaunchError | undefined;
+  for (const location of locations) {
+    const error = validateRBinary(location);
+    if (!error) {
+      logger().logDebug(`Using ${location} (found by searching known locations)`);
+      return ok(location);
+    }
+
+    // remember the first R that was found but could not be started
+    if (error instanceof RLaunchError) {
+      launchError ??= error;
+    }
+  }
+
+  return err(launchError);
+}
+
+// --- early detection --------------------------------------------------------
+
+let rDetection: Promise<void> | undefined;
+
+/**
+ * The R executables startup would consider, in order, without asking the
+ * user: RSTUDIO_WHICH_R, then the platform's stored or well-known locations.
+ */
+function rCandidates(): string[] {
+  const rstudioWhichR = rFromRStudioWhichR();
+  if (rstudioWhichR) {
+    return [rstudioWhichR];
+  }
+
+  if (process.platform === 'win32') {
+    return [...storedRCandidatesWin32().map((candidate) => candidate.path), ...registryRCandidatesWin32()];
+  }
+
+  const candidates = defaultRLocationsPosix();
+  if (process.platform !== 'darwin') {
+    const rLocation = rOnPathLinux();
+    if (rLocation) {
+      candidates.unshift(rLocation);
+    }
+  }
+  return candidates;
+}
+
+async function detectFirstValidR(): Promise<void> {
+  for (const candidate of rCandidates()) {
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    const [, error] = await detectREnvironmentAsync(candidate);
+    if (!error) {
+      return;
+    }
+  }
+}
+
+/**
+ * Starts querying the R that startup is going to pick, so the answer is in
+ * the cache by the time the launch sequence asks for it. Call as early as
+ * possible; Electron's own startup is long enough to hide the query.
+ */
+export function startRDetection(): void {
+  if (rDetection !== undefined) {
+    return;
+  }
+  rDetection = detectFirstValidR().catch((error: unknown) => logger().logError(error));
+}
+
+/**
+ * Resolves once the early query (if one was started) has finished, so that
+ * the synchronous detection path finds its result in the cache.
+ */
+export async function rDetectionReady(): Promise<void> {
+  if (rDetection !== undefined) {
+    await rDetection;
+  }
+}
+
+export function findRInstallationsWin32(): string[] {
+  const rInstallations = desktop.searchRegistryForInstallationsOfR();
+  logger().logDebug(`Found the following R installations in the registry: ${JSON.stringify(rInstallations, null, 2)}`);
+
+  // look for R installations in some common locations
+  const commonLocations = [
+    'C:/R',
+    `${getenv('ProgramFiles')}/R`,
+    `${getenv('ProgramFiles(x86)')}/R`,
+    `${getenv('LOCALAPPDATA')}/Programs/R`,
+  ];
+
+  for (const location of commonLocations) {
+    // nothing to do if it doesn't exist
+    if (!existsSync(location)) {
+      continue;
+    }
+
+    // read directories and check if they're valid R installations
+    const rDirs = readdirSync(location, { encoding: 'utf-8' });
+    for (const rDir of rDirs) {
+      const path = join(location, rDir);
+      if (existsSync(path)) {
+        logger().logDebug(`Found R installation at path: ${path}`);
+        rInstallations.push(path);
+      }
+    }
+  }
+
+  // Remove duplicates
+  const uniqueInstallations = Array.from(new Set(rInstallations));
+  logger().logDebug(`Found the following R installations: ${JSON.stringify(uniqueInstallations, null, 2)}`);
+  return uniqueInstallations;
+}
+
+export function isValidInstallation(rInstallPath: string, archDir: string): boolean {
+  if (process.platform !== 'win32') {
+    logger().logErrorMessage('Windows-only API invoked on non-Windows codepath (isValidInstallation)');
+    return true;
+  }
+
+  const rExePath = path.normalize(`${rInstallPath}/bin/${archDir}/${kWindowsRExe}`);
+  return isValidBinary(rExePath);
+}
+
+export function isValidBinary(rExePath: string): boolean {
+  return validateRBinary(rExePath) == null;
+}
+
+/**
+ * Why the R executable at this path cannot be used, or null when it can. A
+ * path with nothing at it gives a plain Error; an R that was found but did
+ * not answer the query gives that query's RLaunchError.
+ */
+export function validateRBinary(rExePath: string): Err {
+  if (!existsSync(rExePath)) {
+    return new Error(`${rExePath} does not exist`);
+  }
+
+  logger().logDebug(`Validating R installation at path: ${rExePath}`);
+  const [, error] = detectREnvironment(rExePath);
+  return error;
+}
+
+function findDefaultInstallPathWin32(registryVersionKey: string): string {
+  const rLocation = desktop.searchRegistryForDefaultInstallationOfR(registryVersionKey);
+  if (rLocation.length === 0) {
+    logger().logWarning('No default R installation was found in the registry.');
+    return '';
+  }
+
+  if (!existsSync(rLocation)) {
+    logger().logWarning(`Default version of R recorded in registry ${rLocation} does not exist.`);
+    return '';
+  }
+
+  return rLocation;
+}
+
+function scanForRWin32(): Expected<string> {
+  // if the RSTUDIO_WHICH_R environment variable is set, use that
+  const rstudioWhichR = rFromRStudioWhichR();
+  if (rstudioWhichR) {
+    logger().logDebug(`Using R ${rstudioWhichR} (found by RSTUDIO_WHICH_R environment variable)`);
+    return ok(rstudioWhichR);
+  }
+
+  // look for the default 64-bit, then 32-bit, version of R
+  for (const binaryPath of registryRCandidatesWin32()) {
+    if (isValidBinary(binaryPath)) {
+      logger().logDebug(`Using R ${binaryPath} (found via registry)`);
+      return ok(binaryPath);
+    }
+  }
+
+  // nothing found; return empty filepath
+  logger().logDebug('Failed to discover R');
+  return err();
+}
+
+export function findDefault32Bit(): string {
+  return findDefaultInstallPathWin32('R');
+}
+
+export function findDefault64Bit(): string {
+  return findDefaultInstallPathWin32('R64');
+}

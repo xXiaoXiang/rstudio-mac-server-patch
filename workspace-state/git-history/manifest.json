@@ -1,0 +1,286 @@
+{
+  "format": "concatenated gzip tar",
+  "parts": [
+    {
+      "file": "rstudio-git.tar.gz.chunk001",
+      "size": 4194304,
+      "sha256": "59b04de0dbb08bd451c0b18979054b0bc6029560589768e8c9bed14d0d531a52"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk002",
+      "size": 4194304,
+      "sha256": "f3412520913a166947b6cf84da171b4a5fdb3d23e9b1917be0da7a509eaf58a6"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk003",
+      "size": 4194304,
+      "sha256": "1668cc89545a5231fe3779aedcd9a69bfaa94692bb8e23e2b38aea82b8c5c448"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk004",
+      "size": 4194304,
+      "sha256": "a4675d1730c157996268ea29ee420339a9e3be091eb9bfe09d119f70256a076c"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk005",
+      "size": 4194304,
+      "sha256": "544b68815b57d93e7b617d247a7e87d216b5cf2413ed3c0a4a8bf30129d0630c"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk006",
+      "size": 4194304,
+      "sha256": "026545dbf759f03d0d8e669349835697ddd868c31263d1bcfbc232bbdf2f3306"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk007",
+      "size": 4194304,
+      "sha256": "bd68dc87dfde62da1d246a06a661b994ea59bed1e2587524f890c52d40d0d6dd"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk008",
+      "size": 4194304,
+      "sha256": "c5c1934ddc9e24fa6253a148516ba17a61e8fe7a6a33cf462289bee622c455e4"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk009",
+      "size": 4194304,
+      "sha256": "c4016e15cb8098ca1cc956193cea8b9c645619eaa6e34dfa4503a4bac802719e"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk010",
+      "size": 4194304,
+      "sha256": "ac6b454a2381701eb773a4281a4e420e09d03e3a4a032045db158cf8dd6afa6b"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk011",
+      "size": 4194304,
+      "sha256": "080a8f9e5e38975eb4a40ee576b4c51159e39085c8e39b23236b65932193b20a"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk012",
+      "size": 4194304,
+      "sha256": "2be19714456874d80e631f2f3b1b8fcaec01d85eb043858774a97eeaaa659c74"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk013",
+      "size": 4194304,
+      "sha256": "692fdedf32995699fe3c8a54ce6f75bb14c79c8ea3207cae4bfea32fd44ad262"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk014",
+      "size": 4194304,
+      "sha256": "9585986b4ff320b74774f40bc7374a2a4703d8613466f461b6116a217af9fb9b"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk015",
+      "size": 4194304,
+      "sha256": "bf5ab39ab0ff7dcdbf32fd6fd701f39ebfde7857e554013d0bada062f6adaa75"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk016",
+      "size": 4194304,
+      "sha256": "262085bdeef20d1ade99ac92d9b4556e755e8e990bd842b8df84488222147ed9"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk017",
+      "size": 4194304,
+      "sha256": "a3ab0510e53964dad8a4c682a336c979ab83c87f7c02703389b329999014bb7b"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk018",
+      "size": 4194304,
+      "sha256": "c1ef856048df71670fb006709bc3ab513b846dd942c1075c183ef9f016e53de7"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk019",
+      "size": 4194304,
+      "sha256": "ff2603c45b3d9a3a52c857c4e16277554c65294c27a33f4c9632f7d7ba5b19aa"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk020",
+      "size": 4194304,
+      "sha256": "13115e69232bf21505737fc287acf53cf5276256dca2b8d96126680b40efddba"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk021",
+      "size": 4194304,
+      "sha256": "686a04f03556782836e4757cb74b63c3528467fe36b4f80b4d5b1c8cb43cb802"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk022",
+      "size": 4194304,
+      "sha256": "8d2cdf22b790a41cce33b1ed625af4e4b61cf86430d169671534e61729e14139"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk023",
+      "size": 4194304,
+      "sha256": "c29862dd1180f5cb1862f9b9d84d324aa48b713103276ca7ae54b2fce9d289f3"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk024",
+      "size": 4194304,
+      "sha256": "3bf42be2bc3ad3a7259cf99c34995639ea866928f98b925350101e0a04c462aa"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk025",
+      "size": 4194304,
+      "sha256": "aea249c5cb35e5dbbb93bda86b45f9f318e23185af60376dd86d506af2d065d8"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk026",
+      "size": 4194304,
+      "sha256": "b672e0236db70c91a02ee8c712aaf8ae98010dc42d7e62dcbd10864304a2fc44"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk027",
+      "size": 4194304,
+      "sha256": "3410a55fc159ad4796051738697f91f46497f4411bb77faf680c8db2c06d5fb1"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk028",
+      "size": 4194304,
+      "sha256": "05de7e1532b1d979a9e18868b0918b139b00dbe75279166fdecb49ce2f6fe26d"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk029",
+      "size": 4194304,
+      "sha256": "f5f3ca37e4abf45d9d998f47985f4600f620bde4acf8db0b3446329d15f7c5e8"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk030",
+      "size": 4194304,
+      "sha256": "3094777c25ce2234be367296f725935651ba4f94e846b50d0e7252c3fc83a4a9"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk031",
+      "size": 4194304,
+      "sha256": "0c9fa99a575a60adef17657e5e55abacb5acc32f91961d9cadd898b2fd1c6a85"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk032",
+      "size": 4194304,
+      "sha256": "a8d7fde4c53f27c7bac033ce1d9d64bf1311eeb53d7f3d424994674fae6cc001"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk033",
+      "size": 4194304,
+      "sha256": "03e37af85439160ddceea7107033460ec0e54939738020f01ce91e41e2c6c2f8"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk034",
+      "size": 4194304,
+      "sha256": "21a402ec19e983f13626ed7cda57c2aa04a29094bc4b19175bd69fd99c6e25ad"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk035",
+      "size": 4194304,
+      "sha256": "86904d8d32d8652d75361105fdac501a317add6162110e20c5eadca81ce68fe9"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk036",
+      "size": 4194304,
+      "sha256": "f627582da51171eed64f8c98b8323e17aa00c02335f6a4a52cf871b2d4f4d719"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk037",
+      "size": 4194304,
+      "sha256": "631610331edc7e55b150f63ad8221c69c0656ef96763ac422f38610a51735f8a"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk038",
+      "size": 4194304,
+      "sha256": "cabf215ff1a61006c7e33b814c92f68cb5b378ac3d8a4196009a099420bc19f7"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk039",
+      "size": 4194304,
+      "sha256": "f0fca232115bf53aff85ae3b4227715d13f06c9610cd0aca0220dd5b482aa5c6"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk040",
+      "size": 4194304,
+      "sha256": "18e0655d9aff3118080000feb7912efce30e05879681adc42c35cd7e1fd19822"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk041",
+      "size": 4194304,
+      "sha256": "50fa4ef54b228bb685f3f4501511ef6f249e120898e19c2aef29c96fba600136"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk042",
+      "size": 4194304,
+      "sha256": "b5cd5edb669878bfdfd775661606e290bdbd12a3616ff6cccedc792976baaf98"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk043",
+      "size": 4194304,
+      "sha256": "4bab7a0c5eadac28b12ad4899aec7a985055d8daed83c1739636c7ef35e24285"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk044",
+      "size": 4194304,
+      "sha256": "d11e0f169716bb94fb682d94ef287d93846e86901da5afff24aa1cc5dc17440d"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk045",
+      "size": 4194304,
+      "sha256": "e22fa01e4720f9416650dc301053c793c7ea4c947bf9e29c634cb519a0305749"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk046",
+      "size": 4194304,
+      "sha256": "17345a94eab2931ffacbe6daa3e6ae8be6ec5f357f2d3061179d422469ad6cef"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk047",
+      "size": 4194304,
+      "sha256": "06e8e8eb8050e78c4f0db281da73e9df7a8ba7ebfe9137d9a3e1395f136bf7b9"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk048",
+      "size": 4194304,
+      "sha256": "0fb3d8e0b774b3e8efd8b39d7c494ec198177c5de6822432c8abfc5e13522552"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk049",
+      "size": 4194304,
+      "sha256": "92a41eac51a81a632c114b70b3c931ee5d66074161b7538bff74dd46f93bc3b9"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk050",
+      "size": 4194304,
+      "sha256": "72b3269f7794e689de8f5e53ef1316c7852101e9df449a7075bd842c63545b92"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk051",
+      "size": 4194304,
+      "sha256": "077042935e731387da733ff7e9505d2c2b91bbca2accee0640ac29682b086fce"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk052",
+      "size": 4194304,
+      "sha256": "ae8b44507dc9a0b1f59673c197f25475a009fa1b3d18134f0573422ea7b30f90"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk053",
+      "size": 4194304,
+      "sha256": "ada05cb0f927b58b39da56e90868c04c62365a960ad8dab0e41b6a7f8452ac46"
+    },
+    {
+      "file": "rstudio-git.tar.gz.chunk054",
+      "size": 1511124,
+      "sha256": "462ce1a235f444472d16b21cb45e80068b40944fca8b37703c94de8b745e977e"
+    }
+  ],
+  "repository": "rstudio",
+  "head": "fb4b89b6ebb9ed1a49b0ed6167bea295d4af2b28",
+  "shallow": true,
+  "omitted_git_metadata": [
+    "worktrees",
+    "index",
+    "hooks",
+    "FETCH_HEAD",
+    "ORIG_HEAD"
+  ],
+  "config": "sanitized; upstream URL and standard local core/branch settings only"
+}
