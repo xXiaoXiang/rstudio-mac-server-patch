@@ -34,7 +34,7 @@ pinned by the selected source release, builds the full Server/UI, and publishes:
 - `PROVENANCE.json` with upstream/patch commits and package/source hashes
 - `SHA256SUMS` and installation notes
 
-Releases are named `v2026.11.0+203-macos.2`, for example. Existing published assets
+Releases are named `v2026.11.0+203-macos.3`, for example. Existing published assets
 are not overwritten. Increment `revision` in `patches/series.json` when updating
 the patch series. Patch conflicts or build/package failures prevent publication.
 Only the separate publishing job has permission to write releases.
@@ -94,7 +94,7 @@ the commits after their explicit upstream base marker:
 
 ```sh
 python3 tools/export-patches.py --source ../rstudio-2026.11.0-203 \
-  --base v2026.11.0+203 --branch macos-server/2026.11.0-203-v2 --revision 2
+  --base v2026.11.0+203 --branch macos-server/2026.11.0-203-v2 --revision 3
 ```
 
 The exporter omits Markdown files and the upstream INSTALL guide, so patches

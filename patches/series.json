@@ -5,7 +5,7 @@
     11
   ],
   "tested_release": "v2026.11.0+203",
-  "revision": 2,
+  "revision": 3,
   "base_commit": "187ef1689bea1e8a4724e478a23ad8d390678d0f",
   "patches": [
     {
@@ -18,7 +18,7 @@
     },
     {
       "file": "0003-Add-native-macOS-Server-app-with-service-and-account.patch",
-      "sha256": "2ac36b2a1232e68a5653188840cf4f1eff7d3bd14ace1874e0710ffe60c6268b"
+      "sha256": "3f2c113f44af0d39aef68760be64644e2e35d480b2d428dbe7ac333598beb020"
     }
   ]
 }

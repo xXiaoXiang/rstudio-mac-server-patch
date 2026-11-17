@@ -145,8 +145,9 @@ uninstall-service reverses installer-owned system setup while retaining the app.
 ## Configuration and service controls
 
 The control app displays **RStudio Server Status: Running / Dead** and
-**RStudio Server Auto Startup: Enabled / Disabled**, using green for running or
-enabled and red for dead or disabled. Running means the app's rserver process
+**RStudio Server Auto Startup: Enabled / Disabled**. Only the state words use
+green for running/enabled and red for dead/disabled; the prefixes keep the
+normal label color (black in light mode). Running means the app's rserver process
 exists; it does not guarantee that HTTP requests or R sessions are healthy.
 The status refreshes every two seconds. **Start Server / Stop Server** changes
 the current service state. **Enable Auto Startup / Disable Auto Startup** changes

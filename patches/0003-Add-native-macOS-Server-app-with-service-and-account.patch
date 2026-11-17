@@ -1,4 +1,4 @@
-From 22fae323a7f63a6378b0cfaccbdddfc2c2e046bf Mon Sep 17 00:00:00 2001
+From bdc5f6ce04f2824474491aae80ed3239191df70c Mon Sep 17 00:00:00 2001
 From: Xiao Xiang <baron@macos.shared>
 Date: Tue, 17 Nov 2026 16:18:59 +0800
 Subject: [PATCH 3/3] Add native macOS Server app with service and account
@@ -7,15 +7,15 @@ Subject: [PATCH 3/3] Add native macOS Server app with service and account
 ---
  cmake/globals.cmake                           |  19 +-
  .../osx/test-server-administration.py         | 203 ++++++++++++
- dependencies/osx/test-server-integration.py   | 129 ++++++++
+ dependencies/osx/test-server-integration.py   | 146 +++++++++
  package/CMakeLists.txt                        |   6 +-
  package/osx-server/build-pkg.sh               |  48 +++
  package/osx-server/scripts/postinstall        |  15 +
  package/osx-server/scripts/preinstall         |  45 +++
  src/cpp/server/CMakeLists.txt                 |  26 +-
- .../extras/admin/rstudio-server-install.mac   | 208 +++++++++++++
- .../extras/admin/rstudio-server-users.mac     | 279 +++++++++++++++++
- .../server/extras/admin/rstudio-server.mac.in | 181 +++++++++--
+ .../extras/admin/rstudio-server-install.mac   | 208 ++++++++++++
+ .../extras/admin/rstudio-server-users.mac     | 279 ++++++++++++++++
+ .../server/extras/admin/rstudio-server.mac.in | 185 +++++++++--
  .../extras/admin/uninstall-rstudio-server.mac |   4 +
  src/cpp/server/extras/conf/rserver-mac.conf   |   5 +
  .../com.rstudio.launchd.rserver.plist.in      |  19 +-
@@ -23,9 +23,9 @@ Subject: [PATCH 3/3] Add native macOS Server app with service and account
  src/cpp/server/extras/macos/Info.plist.in     |  24 ++
  src/cpp/server/extras/macos/ServerAdmin.h     |   8 +
  src/cpp/server/extras/macos/ServerAdmin.m     | 184 +++++++++++
- src/cpp/server/extras/macos/ServerApp.m       | 290 ++++++++++++++++++
+ src/cpp/server/extras/macos/ServerApp.m       | 300 ++++++++++++++++++
  src/cpp/session/CMakeLists.txt                |   4 +-
- 20 files changed, 1673 insertions(+), 43 deletions(-)
+ 20 files changed, 1704 insertions(+), 43 deletions(-)
  create mode 100644 dependencies/osx/test-server-administration.py
  create mode 100644 dependencies/osx/test-server-integration.py
  create mode 100755 package/osx-server/build-pkg.sh
@@ -292,10 +292,10 @@ index 0000000000000000000000000000000000000000..55b31514a5f2751ba5149420a0af265d
 +    unittest.main(verbosity=2)
 diff --git a/dependencies/osx/test-server-integration.py b/dependencies/osx/test-server-integration.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..90b4ca163523d40615a4d211160bdca015eeb78a
+index 0000000000000000000000000000000000000000..8d445c3407ea3eead7eec17d7db670bdbd2e3fbe
 --- /dev/null
 +++ b/dependencies/osx/test-server-integration.py
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,146 @@
 +#!/usr/bin/env python3
 +"""Optional developer integration checks; no system mutations.
 +
@@ -379,6 +379,20 @@ index 0000000000000000000000000000000000000000..90b4ca163523d40615a4d211160bdca0
 +launchctl() {
 + printf '%s\n' "$*" >> "$MOCK_LOG"
 + if [ "$1" = print ]; then return "$MOCK_PRINT_STATUS"; fi
++ if [ "$1" = bootstrap ]; then
++    # Validate the actual generated job before startServer removes it.
++    python3 - "$3" <<'PYJOB'
++import os, plistlib, sys
++from pathlib import Path
++path = Path(sys.argv[1])
++assert path.suffix == ".plist", "launchd requires a .plist path"
++assert path.parent.stat().st_mode & 0o077 == 0, "job directory must be private"
++data = plistlib.loads(path.read_bytes())
++assert "BundleProgram" not in data
++assert Path(data["Program"]).is_absolute()
++PYJOB
++    return $?
++ fi
 +}
 +''' + operation + "\n"
 +            control = prefix / "control"
@@ -399,7 +413,10 @@ index 0000000000000000000000000000000000000000..90b4ca163523d40615a4d211160bdca0
 +        self.assertEqual(result.returncode, 0, result.stderr)
 +        self.assertEqual(calls[0], "print " + target)
 +        self.assertTrue(calls[1].startswith("bootstrap system /private/tmp/rstudio-server-launch."))
-+        self.assertFalse(Path(calls[1].split(" ", 2)[2]).exists())
++        job = Path(calls[1].split(" ", 2)[2])
++        self.assertEqual(job.name, "rserver.plist")
++        self.assertFalse(job.exists())
++        self.assertFalse(job.parent.exists())
 +        result, calls = self.run_admin("stopServer")
 +        self.assertEqual(result.returncode, 0, result.stderr)
 +        self.assertEqual(calls, ["print " + target, "bootout " + target])
@@ -1146,10 +1163,10 @@ index 0000000000000000000000000000000000000000..16782037f910a3dea5c4a7a6d76910e5
 + main "$@"
 +fi
 diff --git a/src/cpp/server/extras/admin/rstudio-server.mac.in b/src/cpp/server/extras/admin/rstudio-server.mac.in
-index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e346a3591d 100644
+index 6438d255dedf590d15b1551d4ca8adb2d083bab1..d1539d1d5f22e71b3cad5f2f65e8fac5bbd1bd0d 100644
 --- a/src/cpp/server/extras/admin/rstudio-server.mac.in
 +++ b/src/cpp/server/extras/admin/rstudio-server.mac.in
-@@ -1,19 +1,135 @@
+@@ -1,19 +1,139 @@
  #!/bin/bash
  
 +SERVICE_LABEL=com.rstudio.launchd.rserver
@@ -1177,14 +1194,18 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
 + # an equivalent job with an absolute Program; it is not installed in an
 + # auto-loaded LaunchDaemons directory and does not change startup approval.
 + local servicePlist="$SERVER_PREFIX/../../Library/LaunchDaemons/com.rstudio.launchd.rserver.plist"
-+ local manualPlist result
-+ manualPlist=$(/usr/bin/mktemp /private/tmp/rstudio-server-launch.XXXXXX) || return $?
++ local manualDirectory manualPlist result
++ # launchd rejects a service path without the .plist extension (error 5).
++ # A private directory also prevents another user replacing the job file.
++ manualDirectory=$(/usr/bin/mktemp -d /private/tmp/rstudio-server-launch.XXXXXX) || return $?
++ manualPlist="$manualDirectory/rserver.plist"
 + /bin/cp "$servicePlist" "$manualPlist" &&
 + /usr/bin/plutil -remove BundleProgram "$manualPlist" &&
 + /usr/bin/plutil -insert Program -string "$SERVER_PREFIX/bin/rserver" "$manualPlist" &&
 + launchctl bootstrap system "$manualPlist"
 + result=$?
 + /bin/rm -f "$manualPlist"
++ /bin/rmdir "$manualDirectory"
 + return "$result"
 +}
 +
@@ -1248,7 +1269,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
 + }
 + trap '/bin/rm -f "$candidate"; /bin/rmdir "$SERVER_CONFIG_DIR/.network-settings-lock"' EXIT
 + renderNetworkConfig "$SERVER_CONFIG_FILE" "$1" "$2" > "$candidate" || return $?
-+ "$SERVER_PREFIX/bin/rserver" --config-file "$candidate" --test-config || return $?
++ "$SERVER_PREFIX/bin/rserver" --config-file "$candidate" --check-config || return $?
 + mode=$(/usr/bin/stat -f '%Lp' "$SERVER_CONFIG_FILE") || return $?
 + /bin/cp -p "$SERVER_CONFIG_FILE" "$SERVER_CONFIG_FILE.previous" &&
 + /usr/sbin/chown 0:0 "$candidate" && /bin/chmod "$mode" "$candidate" &&
@@ -1270,7 +1291,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
 +
  testConfig() {
 - ${CMAKE_INSTALL_PREFIX}/bin/rserver --test-config
-+ "$SERVER_PREFIX/bin/rserver" --test-config
++ "$SERVER_PREFIX/bin/rserver" --check-config
  }
  
  checkConfig() {
@@ -1289,7 +1310,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
  }
  
  isServerRunning() {
-@@ -23,23 +139,41 @@ isServerRunning() {
+@@ -23,23 +143,41 @@ isServerRunning() {
  
  case "$1" in
  
@@ -1338,7 +1359,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
          ;;
  
      test-config)
-@@ -56,16 +190,17 @@ case "$1" in
+@@ -56,16 +194,17 @@ case "$1" in
          ;;
  
      verify-installation)
@@ -1359,7 +1380,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
          ;;
  
      suspend-session)
-@@ -111,17 +246,17 @@ case "$1" in
+@@ -111,17 +250,17 @@ case "$1" in
          ;;
  
      offline)
@@ -1385,7 +1406,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e3
          ;;
  
      active-sessions)
-@@ -133,6 +268,6 @@ case "$1" in
+@@ -133,6 +272,6 @@ case "$1" in
          ;;
  
      *)
@@ -1710,10 +1731,10 @@ index 0000000000000000000000000000000000000000..3302a0029bf1f37b17a5e9de5fd1e4c7
 +@end
 diff --git a/src/cpp/server/extras/macos/ServerApp.m b/src/cpp/server/extras/macos/ServerApp.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..67543edca5dac31ce58196ee39920f35df1bb3d9
+index 0000000000000000000000000000000000000000..ef9a393d1757e58aeb559c36ae9ab9c81914f004
 --- /dev/null
 +++ b/src/cpp/server/extras/macos/ServerApp.m
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,300 @@
 +/*
 + * Copyright (C) 2026 by Posit Software, PBC
 + * Licensed under the GNU Affero General Public License, version 3.
@@ -1767,6 +1788,18 @@ index 0000000000000000000000000000000000000000..67543edca5dac31ce58196ee39920f35
 +   return [service unregisterAndReturnError:error];
 +}
 +
++static void setStatus(NSTextField *label, NSString *prefix, NSString *state, BOOL positive)
++{
++   NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
++      initWithString:[prefix stringByAppendingString:state]
++      attributes:@{NSForegroundColorAttributeName:NSColor.labelColor,
++                   NSFontAttributeName:label.font}];
++   [text addAttribute:NSForegroundColorAttributeName
++      value:positive ? NSColor.systemGreenColor : NSColor.systemRedColor
++      range:NSMakeRange(prefix.length, state.length)];
++   label.attributedStringValue = text;
++}
++
 +@interface ServerAppDelegate : NSObject <NSApplicationDelegate>
 +@property(strong) NSWindow *window;
 +@property(strong) NSTextField *serverStatusLabel;
@@ -1800,12 +1833,10 @@ index 0000000000000000000000000000000000000000..67543edca5dac31ce58196ee39920f35
 +         free(pids);
 +      }
 +   }
-+   self.serverStatusLabel.stringValue = running ? @"RStudio Server Status: Running" : @"RStudio Server Status: Dead";
-+   self.serverStatusLabel.textColor = running ? NSColor.systemGreenColor : NSColor.systemRedColor;
++   setStatus(self.serverStatusLabel, @"RStudio Server Status: ", running ? @"Running" : @"Dead", running);
 +   self.serverButton.title = running ? @"Stop Server" : @"Start Server";
 +   BOOL enabled = serverService().status == SMAppServiceStatusEnabled;
-+   self.startupStatusLabel.stringValue = enabled ? @"RStudio Server Auto Startup: Enabled" : @"RStudio Server Auto Startup: Disabled";
-+   self.startupStatusLabel.textColor = enabled ? NSColor.systemGreenColor : NSColor.systemRedColor;
++   setStatus(self.startupStatusLabel, @"RStudio Server Auto Startup: ", enabled ? @"Enabled" : @"Disabled", enabled);
 +   self.startupButton.title = enabled ? @"Disable Auto Startup" : @"Enable Auto Startup";
 +}
 +
