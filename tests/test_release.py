@@ -113,16 +113,15 @@ class PublishingTests(unittest.TestCase):
                     release.publish_command(args)
                 return [call.args[0] for call in command.call_args_list]
 
-    def test_publish_uploads_only_pkg_and_refreshes_tag_after_verification(self):
+    def test_publish_uploads_only_pkg_and_preserves_existing_tag(self):
         calls = self.run_publish(None)
         upload = calls[0]
         self.assertEqual(upload[:3], ["gh", "release", "upload"])
         self.assertEqual(upload[-2], "--clobber")
         self.assertTrue(upload[-1].endswith("RStudioServer-2026.11.0-203-arm64.pkg"))
         self.assertEqual(len(upload), 8)
-        self.assertIn("PATCH", calls[1])
-        self.assertIn("sha=abc123", calls[1])
-        self.assertEqual(calls[2][:3], ["gh", "release", "edit"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][:3], ["gh", "release", "edit"])
 
     def test_bad_uploaded_digest_prevents_tag_update_and_publication(self):
         calls = self.run_publish("sha256:" + "0" * 64)

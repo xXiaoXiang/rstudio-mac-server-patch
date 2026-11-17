@@ -198,13 +198,15 @@ def provenance_command(args):
         "Install R separately. Quit active Server sessions and the control app before "
         "installing/upgrading. Open RStudioServer.app afterward and approve background "
         "startup in System Settings when requested. Existing user homes are preserved.\n\n"
-        "GitHub's automatic source ZIP/tar.gz contain the patch repository, not the full RStudio tree. "
+        "GitHub's automatic source ZIP/tar.gz contain the patch repository at the original release tag, not the full RStudio tree. "
+        "For replacement packages use the exact patch-source commit linked below. "
         "Reconstruct the matching source using the upstream tag and tools/release.py apply. "
         "The full patched source and build records are also retained in the linked Actions run. "
         "Live account/PAM and service tests are optional developer tools and do not run in CI.\n"
     )
     notes += ("\n\nUpstream: " + release.tag + " (" + record["upstream_commit"] + ").\n"
-              + "Patch repository commit: " + record["patch_repository_commit"] + ".\n"
+              + "[Exact patch source](https://github.com/" + os.environ.get("GITHUB_REPOSITORY", "xXiaoXiang/rstudio-mac-server-patch")
+              + "/tree/" + record["patch_repository_commit"] + "): " + record["patch_repository_commit"] + ".\n"
               + "Package SHA256: " + record["package_sha256"] + ".\n\n"
               + "[Build and source artifacts](" + record["workflow_url"] + ").\n\n"
               + "<!-- macos-patch-revision: " + str(data["revision"]) + " -->\n")
@@ -248,7 +250,7 @@ def publish_command(args):
     package_asset = next(asset for asset in uploaded["assets"] if asset["name"] == item["package"])
     if package_asset.get("digest") != "sha256:" + digest(output / item["package"]):
         raise ValueError("Uploaded package digest does not match the completed build")
-    # Keep the automatic patch-repository archives current on replacement builds.
+    # Create a missing release tag; never rewrite an existing source snapshot.
     reference = "repos/" + args.repository + "/git/ref/tags/" + quote(item["release_tag"], safe="")
     result = subprocess.run(["gh", "api", reference], capture_output=True, text=True)
     if result.returncode:
@@ -256,10 +258,6 @@ def publish_command(args):
             raise RuntimeError(result.stderr)
         command(["gh", "api", "--method", "POST", "repos/" + args.repository + "/git/refs",
                  "-f", "ref=refs/tags/" + item["release_tag"], "-f", "sha=" + args.commit])
-    else:
-        command(["gh", "api", "--method", "PATCH", "repos/" + args.repository
-                 + "/git/refs/tags/" + quote(item["release_tag"], safe=""),
-                 "-f", "sha=" + args.commit, "-F", "force=true"])
     command(["gh", "release", "edit", item["release_tag"], "--repo", args.repository,
              "--title", "RStudio Server " + release.version + " for macOS arm64",
              "--notes-file", str(output / "RELEASE-NOTES.md"),

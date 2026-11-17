@@ -42,8 +42,9 @@ GitHub automatically adds Source code (zip) and Source code (tar.gz). These are
 archives of this small patch repository at the release tag, **not** the full
 patched RStudio source. They cannot be replaced with custom source assets.
 To reconstruct the matching full source, fetch the upstream tag and apply the
-patch series using the Local build instructions below. The release tag is
-updated to the patch commit used by each successful replacement build.
+patch series using the Local build instructions below. The release tag remains fixed at the initial release commit. For replacement
+packages, use the exact patch-source commit linked in the release body; the
+automatic archives may describe an earlier patch revision.
 
 The full patched source archive, PROVENANCE.json, checksums and build logs stay
 in Actions artifacts for 90 days; they are not attached to the Release. The
