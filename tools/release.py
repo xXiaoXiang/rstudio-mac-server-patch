@@ -233,22 +233,28 @@ def publish_command(args):
                       + "-source.tar.gz", "PROVENANCE.json", "RELEASE-NOTES.md"}
     if {Path(path).name for path in assets} != expected_names:
         raise ValueError("Incomplete release assets")
-    result = subprocess.run(["gh", "api", "repos/" + args.repository + "/releases/tags/"
-                             + quote(item["release_tag"], safe="")], text=True, capture_output=True)
-    if result.returncode:
-        if "HTTP 404" not in result.stderr:
-            raise RuntimeError(result.stderr)
+    # New drafts can have no Git tag yet and return 404 from releases/tags.
+    # Resolve drafts by listing releases, then verify assets by numeric ID.
+    records = gh_pages("repos/" + args.repository + "/releases?per_page=100")
+    current = next((record for record in records if record["tag_name"] == item["release_tag"]), None)
+    if current is None:
         command(["gh", "release", "create", item["release_tag"], "--repo", args.repository,
                  "--target", args.commit, "--title", "RStudio Server " + release.version
                  + " for macOS arm64",
                  "--notes-file", str(output / "RELEASE-NOTES.md"), "--draft"])
+        current = next(record for record in gh_pages("repos/" + args.repository
+            + "/releases?per_page=100") if record["tag_name"] == item["release_tag"])
     # Check all build artifacts above, but attach only the completed installer.
-    command(["gh", "release", "upload", item["release_tag"], "--repo", args.repository,
-             "--clobber", str(output / item["package"])])
+    expected_digest = "sha256:" + digest(output / item["package"])
+    existing_asset = next((asset for asset in current.get("assets", [])
+                           if asset["name"] == item["package"]), {})
+    if existing_asset.get("digest") != expected_digest:
+        command(["gh", "release", "upload", item["release_tag"], "--repo", args.repository,
+                 "--clobber", str(output / item["package"])])
     uploaded = json.loads(subprocess.check_output(["gh", "api", "repos/" + args.repository
-        + "/releases/tags/" + quote(item["release_tag"], safe="")], text=True))
+        + "/releases/" + str(current["id"])], text=True))
     package_asset = next(asset for asset in uploaded["assets"] if asset["name"] == item["package"])
-    if package_asset.get("digest") != "sha256:" + digest(output / item["package"]):
+    if package_asset.get("digest") != expected_digest:
         raise ValueError("Uploaded package digest does not match the completed build")
     # Create a missing release tag; never rewrite an existing source snapshot.
     reference = "repos/" + args.repository + "/git/ref/tags/" + quote(item["release_tag"], safe="")

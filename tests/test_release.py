@@ -104,6 +104,8 @@ class PublishingTests(unittest.TestCase):
             args = SimpleNamespace(tag="v2026.11.0+203", output=output,
                 repository="example/patches", commit="abc123", latest=True)
             with patch.object(release, "command") as command, \
+                 patch.object(release, "gh_pages", return_value=[{
+                     "id": 123, "tag_name": "v2026.11.0+203", "draft": True}]), \
                  patch.object(release.subprocess, "run", return_value=response), \
                  patch.object(release.subprocess, "check_output", return_value=json.dumps(uploaded)):
                 if remote_digest:
