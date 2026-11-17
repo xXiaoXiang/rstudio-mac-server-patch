@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE module PUBLIC "-//Google Inc.//DTD Google Web Toolkit 2.8.2//EN" "http://www.gwtproject.org/doctype/2.9.0/gwt-module.dtd">
+
+<!--
+   While this module is used for compilation of RStudio Server, it also
+   needs to be able to serve the front-end for RStudio Desktop, for remote
+   desktop configurations. For that reason, we don't try to explicitly set
+   'rstudio.desktop' or 'rstudio.electron' below.
+-->
+
+<module rename-to="rstudio">
+   <inherits name="org.rstudio.studio.RStudio" />
+   <set-property name="compiler.stackMode" value="native"/>
+
+   <!-- user.agent is deliberately left at the base module's values: pinning
+        it to one browser trips GWT's UserAgentAsserter in the others, and
+        hands them that browser's deferred-binding implementations -->
+
+   <!-- the base module uses a script-tag install (installCode=false), which
+        requires same-origin scripts; Super Dev Mode serves code from the code
+        server on another origin, so restore the default install here -->
+   <set-configuration-property name="installCode" value="true"/>
+   <!-- dev language for i18n development -->
+   <extend-property name="locale" values="en,fr,dev"/>
+   <!--<set-property name="locale" value="dev"/>-->
+</module>

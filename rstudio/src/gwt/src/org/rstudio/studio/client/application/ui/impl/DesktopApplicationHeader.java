@@ -1,0 +1,1059 @@
+/*
+ * DesktopApplicationHeader.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.application.ui.impl;
+
+import java.util.ArrayList;
+
+import org.rstudio.core.client.BrowseCap;
+import org.rstudio.core.client.ElementIds;
+import org.rstudio.core.client.StartupTiming;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.command.AppMenuBar;
+import org.rstudio.core.client.command.CommandBinder;
+import org.rstudio.core.client.command.Handler;
+import org.rstudio.core.client.command.impl.DesktopMenuCallback;
+import org.rstudio.core.client.dom.DomUtils;
+import org.rstudio.core.client.dom.WindowEx;
+import org.rstudio.core.client.js.JsObject;
+import org.rstudio.core.client.theme.res.ThemeResources;
+import org.rstudio.core.client.theme.res.ThemeStyles;
+import org.rstudio.core.client.Debug;
+import org.rstudio.core.client.widget.MessageDialog;
+import org.rstudio.core.client.widget.Operation;
+import org.rstudio.studio.client.RStudioGinjector;
+import org.rstudio.studio.client.application.ApplicationQuit;
+import org.rstudio.studio.client.application.ApplicationQuit.QuitContext;
+import org.rstudio.studio.client.application.Desktop;
+import org.rstudio.studio.client.application.DesktopHooks;
+import org.rstudio.studio.client.application.DesktopInfo;
+import org.rstudio.studio.client.application.IgnoredUpdates;
+import org.rstudio.studio.client.application.StudioClientApplicationConstants;
+import org.rstudio.studio.client.application.events.DesktopMouseNavigateEvent;
+import org.rstudio.studio.client.application.events.DesktopUpdateDownloadProgressEvent;
+import org.rstudio.studio.client.application.events.DesktopUpdateDownloadedEvent;
+import org.rstudio.studio.client.application.events.EventBus;
+import org.rstudio.studio.client.application.model.ApplicationServerOperations;
+import org.rstudio.studio.client.application.model.UpdateCheckResult;
+import org.rstudio.studio.client.application.ui.ApplicationHeader;
+import org.rstudio.studio.client.application.ui.GlobalToolbar;
+import org.rstudio.studio.client.common.GlobalDisplay;
+import org.rstudio.studio.client.projects.Projects;
+import org.rstudio.studio.client.common.debugging.ErrorManager;
+import org.rstudio.studio.client.events.EditEvent;
+import org.rstudio.studio.client.server.ServerError;
+import org.rstudio.studio.client.server.ServerRequestCallback;
+import org.rstudio.studio.client.workbench.TrustPresenter;
+import org.rstudio.studio.client.workbench.codesearch.CodeSearch;
+import org.rstudio.studio.client.workbench.commands.Commands;
+import org.rstudio.studio.client.workbench.events.PushClientStateEvent;
+import org.rstudio.studio.client.workbench.events.SessionInitEvent;
+import org.rstudio.studio.client.workbench.model.ClientInitState;
+import org.rstudio.studio.client.workbench.model.ClientState;
+import org.rstudio.studio.client.workbench.model.Session;
+import org.rstudio.studio.client.workbench.model.SessionInfo;
+import org.rstudio.studio.client.workbench.model.helper.JSObjectStateValue;
+import org.rstudio.studio.client.workbench.prefs.model.UserPrefs;
+import org.rstudio.studio.client.workbench.views.console.events.SendToConsoleEvent;
+import org.rstudio.studio.client.workbench.views.files.events.ShowFolderEvent;
+import org.rstudio.studio.client.workbench.views.source.editors.text.ace.AceEditorNative;
+import org.rstudio.studio.client.workbench.views.source.editors.text.ace.Selection;
+
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.core.client.JsArrayString;
+import com.google.gwt.core.client.Scheduler;
+import com.google.gwt.core.client.Scheduler.ScheduledCommand;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.dom.client.NativeEvent;
+import com.google.gwt.resources.client.ClientBundle;
+import com.google.gwt.resources.client.ImageResource;
+import com.google.gwt.user.client.Timer;
+import com.google.gwt.user.client.Window;
+import com.google.gwt.user.client.ui.Widget;
+import com.google.inject.Inject;
+import com.google.inject.Provider;
+
+public class DesktopApplicationHeader implements ApplicationHeader,
+                                      WebApplicationHeaderOverlay.Context
+{
+   public DesktopApplicationHeader()
+   {
+      RStudioGinjector.INSTANCE.injectMembers(this);
+   }
+
+   @Inject
+   public void initialize(final Commands commands,
+                          EventBus events,
+                          final Session session,
+                          ApplicationServerOperations server,
+                          Provider<DesktopHooks> pDesktopHooks,
+                          Provider<CodeSearch> pCodeSearch,
+                          Provider<UserPrefs> pUIPrefs,
+                          ErrorManager errorManager,
+                          GlobalDisplay globalDisplay,
+                          ApplicationQuit appQuit,
+                          TrustPresenter trustPresenter)
+   {
+      commands_ = commands;
+      session_ = session;
+      eventBus_= events;
+      pUIPrefs_ = pUIPrefs;
+      globalDisplay_ = globalDisplay;
+      server_ = server;
+      appQuit_ = appQuit;
+      binder_.bind(commands, this);
+      overlay_ = new WebApplicationHeaderOverlay();
+
+      commands.mainMenu(new DesktopMenuCallback());
+
+      pDesktopHooks.get();
+
+      commands.uploadFile().remove();
+      commands.exportFiles().remove();
+      commands.updateCredentials().remove();
+
+      commands.checkForUpdates().setVisible(true);
+      commands.showLogFiles().setVisible(true);
+      commands.diagnosticsReport().setVisible(true);
+      commands.showFolder().setVisible(true);
+      
+      if (BrowseCap.isElectron())
+      {
+         // we use a preview listener because we need to ensure the event
+         // is handled before anything else in the IDE surface might try
+         // to handle the mouse event
+         addBackForwardMouseDownHandlers();
+      }
+      else
+      {
+         commands.showA11yDiagnostics().remove();
+      }
+      
+      events.addHandler(SessionInitEvent.TYPE, (SessionInitEvent sie) ->
+      {
+         final SessionInfo sessionInfo = session.getSessionInfo();
+
+         toolbar_.completeInitialization(sessionInfo);
+
+         ignoredUpdatesState_ = new IgnoredUpdatesStateValue(sessionInfo.getClientState());
+
+         Scheduler.get().scheduleFinally(new ScheduledCommand()
+         {
+            public void execute()
+            {
+               StartupTiming.mark("workbench-initialized");
+               Desktop.getFrame().onWorkbenchInitialized(
+                     StringUtil.notNull(sessionInfo.getScratchDir()));
+
+               if (sessionInfo.getDisableCheckForUpdates())
+                  commands.checkForUpdates().remove();
+
+               if (!sessionInfo.getDisableCheckForUpdates() &&
+                   pUIPrefs_.get().checkForUpdates().getValue())
+               {
+                  checkForUpdates(false);
+               }
+            }
+         });
+      });
+
+      events.addHandler(ShowFolderEvent.TYPE, new ShowFolderEvent.Handler()
+      {
+         public void onShowFolder(ShowFolderEvent event)
+         {
+            Desktop.getFrame().showFolder(StringUtil.notNull(event.getPath().getPath()));
+         }
+      });
+
+      events.addHandler(DesktopUpdateDownloadedEvent.TYPE, this::onUpdateDownloaded);
+      events.addHandler(DesktopUpdateDownloadProgressEvent.TYPE, this::onUpdateDownloadProgress);
+
+      toolbar_ = new GlobalToolbar(commands, events, pCodeSearch, pUIPrefs_.get(), trustPresenter);
+      ThemeStyles styles = ThemeResources.INSTANCE.themeStyles();
+      toolbar_.getWrapper().addStyleName(styles.desktopGlobalToolbarWrapper());
+   }
+
+   private class IgnoredUpdatesStateValue extends JSObjectStateValue
+   {
+      public IgnoredUpdatesStateValue(ClientInitState clientState)
+      {
+         super("updates",
+               "ignoredUpdates",
+               ClientState.PERSISTENT,
+               clientState,
+               false);
+         finishInit(clientState);
+      }
+
+      @Override
+      protected void onInit(JsObject value)
+      {
+         if (value != null)
+            ignoredUpdates_ = value.cast();
+      }
+
+      @Override
+      protected JsObject getValue()
+      {
+         ignoredUpdatesDirty_ = false;
+         return ignoredUpdates_.cast();
+      }
+
+      @Override
+      protected boolean hasChanged()
+      {
+         return ignoredUpdatesDirty_;
+      }
+
+      public JsArrayString getIgnoredUpdates()
+      {
+         return ignoredUpdates_.getIgnoredUpdates();
+      }
+
+      public void addIgnoredUpdate(String update) {
+         ignoredUpdates_.addIgnoredUpdate(update);
+         ignoredUpdatesDirty_ = true;
+      }
+
+      public void removeIgnoredUpdates() {
+         ignoredUpdates_.removeIgnoredUpdates();
+         ignoredUpdatesDirty_ = true;
+      }
+
+      private IgnoredUpdates ignoredUpdates_ = IgnoredUpdates.create();
+      private boolean ignoredUpdatesDirty_ = false;
+   }
+
+   @Override
+   public void showToolbar(boolean showToolbar)
+   {
+      toolbar_.setVisible(showToolbar);
+   }
+
+   @Override
+   public boolean isToolbarVisible()
+   {
+      return toolbar_.isVisible();
+   }
+
+   @Override
+   public void focusToolbar()
+   {
+      toolbar_.setFocus();
+   }
+
+   @Override
+   public void focusGoToFunction()
+   {
+      toolbar_.focusGoToFunction();
+   }
+
+   private void fireEditEvent(final int type)
+   {
+      eventBus_.fireEvent(new EditEvent(true, type));
+   }
+
+   interface Resources extends ClientBundle
+   {
+      @Source("signOut_2x.png")
+      ImageResource signOut2x();
+   }
+
+   private static final DesktopApplicationHeader.Resources RESOURCES =  (DesktopApplicationHeader.Resources) GWT.create(DesktopApplicationHeader.Resources.class);
+
+   private void undoAce() {
+      // Undo on the ACE editor has to be called manually since Electron cannot trigger it
+      AceEditorNative editorNative = AceEditorNative.getEditor(DomUtils.getActiveElement());
+      if (editorNative != null) {
+         editorNative.execCommand("undo");
+      } else {
+         Desktop.getFrame().undo();
+      }
+   }
+
+   private void redoAce() {
+      // Redo on the ACE editor has to be called manually since Electron cannot trigger it
+      AceEditorNative editorNative = AceEditorNative.getEditor(DomUtils.getActiveElement());
+      if (editorNative != null) {
+         editorNative.execCommand("redo");
+      } else {
+         Desktop.getFrame().redo();
+      }
+   }
+
+   @Handler
+   void onUndoDummy() {
+      if (BrowseCap.isElectron()) {
+         undoAce();
+      } else {
+         Desktop.getFrame().undo();
+      }
+   }
+
+   @Handler
+   void onRedoDummy()
+   {
+      if (BrowseCap.isElectron()) {
+         redoAce();
+      } else {
+         Desktop.getFrame().redo();
+      }
+   }
+
+   @Handler
+   void onCutDummy()
+   {
+      if (isSelectionEmpty()) return;
+      fireEditEvent(EditEvent.TYPE_CUT);
+      Desktop.getFrame().clipboardCut();
+   }
+
+   @Handler
+   void onCopyDummy()
+   {
+      if (isSelectionEmpty()) return;
+      fireEditEvent(EditEvent.TYPE_COPY);
+      Desktop.getFrame().clipboardCopy();
+   }
+
+   @Handler
+   void onPasteDummy()
+   {
+      fireEditEvent(EditEvent.TYPE_PASTE);
+      Desktop.getFrame().clipboardPaste();
+   }
+
+   @Handler
+   void onPasteWithIndentDummy()
+   {
+      fireEditEvent(EditEvent.TYPE_PASTE_WITH_INDENT);
+      Desktop.getFrame().clipboardPaste();
+   }
+
+   @Handler
+   void onShowLogFiles()
+   {
+      Desktop.getFrame().showFolder(StringUtil.notNull(session_.getSessionInfo().getLogDir()));
+   }
+
+   @Handler
+   void onDiagnosticsReport()
+   {
+      eventBus_.fireEvent(
+         new SendToConsoleEvent("rstudioDiagnosticsReport()", true));
+
+      new Timer() {
+         @Override
+         public void run()
+         {
+            Desktop.getFrame().showFolder("~/rstudio-diagnostics");
+         }
+      }.schedule(1000);
+
+   }
+
+   @Handler
+   void onOpenDeveloperConsole()
+   {
+      int port = DesktopInfo.getChromiumDevtoolsPort();
+      if (port == 0)
+      {
+         globalDisplay_.showErrorMessage(
+               constants_.errorOpeningDevToolsCaption(),
+               constants_.cannotActivateDevtoolsMessage());
+      }
+      else
+      {
+         globalDisplay_.openMinimalWindow(
+               ("http://127.0.0.1:" + DesktopInfo.getChromiumDevtoolsPort()),
+               Window.getClientWidth() - 20,
+               Window.getClientHeight() - 20);
+      }
+   }
+
+   @Handler
+   void onShowGpuDiagnostics()
+   {
+      globalDisplay_.openMinimalWindow("chrome://gpu", 500, 400);
+   }
+
+   @Handler
+   void onToggleGpuExclusionList()
+   {
+      Desktop.getFrame().getIgnoreGpuExclusionList((Boolean ignore) ->
+      {
+         Desktop.getFrame().setIgnoreGpuExclusionList(!ignore);
+         promptGpuSettingRestart();
+      });
+   }
+
+   @Handler
+   void onToggleGpuDriverBugWorkarounds()
+   {
+      Desktop.getFrame().getDisableGpuDriverBugWorkarounds((Boolean disable) ->
+      {
+         Desktop.getFrame().setDisableGpuDriverBugWorkarounds(!disable);
+         promptGpuSettingRestart();
+      });
+   }
+
+   private void promptGpuSettingRestart()
+   {
+      globalDisplay_.showYesNoMessage(
+            GlobalDisplay.MSG_QUESTION,
+            constants_.gpuSettingChangedCaption(),
+            constants_.gpuSettingChangedMessage(),
+            () -> appQuit_.doRestart(session_),
+            true);
+   }
+
+   @Handler
+   void onShowA11yDiagnostics()
+   {
+      globalDisplay_.openMinimalWindow("chrome://accessibility", 500, 400);
+   }
+
+   @Handler
+   void onReloadUi()
+   {
+      WindowEx.get().reload();
+   }
+
+   @Handler
+   void onCheckForUpdates()
+   {
+      checkForUpdates(true);
+   }
+
+   public int getPreferredHeight()
+   {
+      if (toolbar_.isVisible())
+         return 29;
+      else
+         return 5;
+   }
+
+   public Widget asWidget()
+   {
+      return toolbar_;
+   }
+
+   private void checkForUpdates(final boolean manual)
+   {
+      // the desktop frame checks the builds site itself and can download and
+      // install the update; where it can't (Linux, Pro builds, a build not on
+      // the site, site unreachable, RSTUDIO_DISABLE_IN_APP_UPDATES set) the
+      // session's check runs as before
+      if (!Desktop.hasDesktopFrame())
+      {
+         checkForUpdatesViaSession(manual);
+         return;
+      }
+
+      Desktop.getFrame().checkForUpdates(manual, (String json) ->
+      {
+         UpdateCheckResult result = UpdateCheckResult.fromJson(json);
+         String status = result.getStatus();
+         if (status != "available" && status != "up-to-date")
+            checkForUpdatesViaSession(manual);
+         else if (result.confirmWithSession())
+            confirmUpdateCheckWithSession(result, manual);
+         else
+            respondToUpdateCheck(result, manual);
+      });
+   }
+
+   /**
+    * For release builds the session's check (rstudio.org's check_for_update)
+    * runs as well: it is where Posit withdraws a release and marks one
+    * urgent, which the builds site does not know, so its answer decides
+    * whether, and how urgently, the desktop's installable update is offered.
+    */
+   private void confirmUpdateCheckWithSession(UpdateCheckResult desktopResult,
+                                              boolean manual)
+   {
+      server_.checkForUpdates(manual,
+            new ServerRequestCallback<UpdateCheckResult>()
+      {
+         @Override
+         public void onResponseReceived(UpdateCheckResult sessionResult)
+         {
+            respondToUpdateCheck(
+                  UpdateCheckResult.reconcile(desktopResult, sessionResult),
+                  manual);
+         }
+
+         @Override
+         public void onError(ServerError error)
+         {
+            // the builds site answered, so go with what it said
+            Debug.logToConsole("Could not confirm the update check with the session: " +
+                               error.getMessage());
+            respondToUpdateCheck(desktopResult, manual);
+         }
+      });
+   }
+
+   private void checkForUpdatesViaSession(final boolean manual)
+   {
+      server_.checkForUpdates(manual,
+            new ServerRequestCallback<UpdateCheckResult>()
+      {
+         @Override
+         public void onResponseReceived(UpdateCheckResult result)
+         {
+            respondToUpdateCheck(result, manual);
+         }
+
+         @Override
+         public void onError(ServerError error)
+         {
+            // Only show the error message when manually checking for updates 
+            if (manual)
+            {
+               globalDisplay_.showErrorMessage(constants_.errorCheckingUpdatesMessage(),
+                     constants_.errorOccurredCheckingUpdatesMessage()
+                     + error.getMessage()
+                     + "\n\n"
+                     + constants_.visitWebsiteForNewVersionText());
+            }
+         }
+      });
+   }
+
+   private void respondToUpdateCheck(final UpdateCheckResult result,
+                                     boolean manual)
+   {
+      boolean ignoredUpdate = false;
+      String updateVersion = result.getUpdateVersion();
+      boolean updateAvailable = updateVersion.length() > 0;
+      if (updateAvailable)
+      {
+         JsArrayString ignoredUpdates = ignoredUpdatesState_.getIgnoredUpdates();
+         for (int i = 0; i < ignoredUpdates.length(); i++)
+         {
+            if (ignoredUpdates.get(i) == updateVersion)
+            {
+               ignoredUpdate = true;
+            }
+         }
+      }
+      // Show dialog if there's an update available and either:
+      // 1) The user is manually checking for this update (whether the update
+      //    was previously ignored doesn't matter); or
+      // 2) This is an automatic update check and the version wasn't previously
+      //    ignored
+      if (updateAvailable && (manual || !ignoredUpdate))
+      {
+         ArrayList<String> buttonLabels = new ArrayList<>();
+         ArrayList<String> elementIds = new ArrayList<>();
+         ArrayList<Operation> buttonOperations = new ArrayList<>();
+         boolean isManualAndIgnored = manual && ignoredUpdate;
+
+         if (result.canInstall())
+         {
+            // the desktop frame downloads in the background and fires
+            // DesktopUpdateDownloadedEvent when the restart can be offered
+            buttonLabels.add(constants_.installAndRestartButtonLabel());
+            elementIds.add(ElementIds.DIALOG_YES_BUTTON);
+            buttonOperations.add(() -> downloadUpdate(updateVersion));
+         }
+         else
+         {
+            buttonLabels.add(constants_.quitDownloadButtonLabel());
+            elementIds.add(ElementIds.DIALOG_YES_BUTTON);
+            buttonOperations.add(new Operation() {
+               @Override
+               public void execute()
+               {
+                  appQuit_.prepareForQuit(constants_.updateRStudioCaption(), new QuitContext()
+                  {
+                     @Override
+                     public void onReadyToQuit(boolean saveChanges)
+                     {
+                        // the download page only once the quit is under way
+                        if (appQuit_.performQuit(null, saveChanges))
+                           Desktop.getFrame().browseUrl(StringUtil.notNull(result.getUpdateUrl()));
+                     }
+                  });
+               }
+            });
+         }
+
+         // Only show "Remind Later" if the user isn't manually checking for an
+         // update, which happens to be an ignored version. Essentially, it's not
+         // possible for a user to un-ignore a version.
+         if (!isManualAndIgnored) {
+            buttonLabels.add(constants_.remindLaterButtonLabel());
+            elementIds.add(ElementIds.DIALOG_NO_BUTTON);
+            buttonOperations.add(new Operation() {
+               @Override
+               public void execute()
+               {
+                  // Don't do anything here; the prompt will re-appear the next
+                  // time we do an update check
+               }
+            });
+         }
+
+         // If update has been ignored, give an option to stop ignoring it
+         if (isManualAndIgnored)
+         {
+            buttonLabels.add(constants_.stopIgnoringUpdatesButtonLabel());
+            elementIds.add(ElementIds.DIALOG_RETRY_BUTTON);
+            buttonOperations.add(new Operation() {
+               @Override
+               public void execute()
+               {
+                  ignoredUpdatesState_.removeIgnoredUpdates();
+                  // Trigger an update to the persistent updates state file
+                  eventBus_.fireEvent(new PushClientStateEvent(true));
+
+                  // Let user know what happened
+                  globalDisplay_.showMessage(
+                     MessageDialog.INFO,
+                     constants_.autoUpdateReenabledCaption(),
+                     constants_.autoUpdateReenabledMessage());
+               }
+            });
+         }
+
+         // Only provide the option to ignore the update if it's not urgent.
+         if (result.getUpdateUrgency() == 0)
+         {
+            // We need to use a final variable here because we're using it in an
+            // anonymous inner class
+            final boolean finalIgnoredUpdate = ignoredUpdate;
+            buttonLabels.add(constants_.ignoreUpdateButtonLabel());
+            elementIds.add(ElementIds.DIALOG_CANCEL_BUTTON);
+            buttonOperations.add(new Operation() {
+               @Override
+               public void execute()
+               {
+                  // only run the following code if we didn't already ignore the update
+                  if (!finalIgnoredUpdate)
+                  {
+                     ignoredUpdatesState_.addIgnoredUpdate(result.getUpdateVersion());
+                     // Trigger an update to the persistent updates state file
+                     eventBus_.fireEvent(new PushClientStateEvent(true));
+                  }
+               }
+            });
+         }
+
+         String updateMessage = isManualAndIgnored
+               ? result.getUpdateMessage() + "\n\n" + constants_.updateDisabledForVersionText(updateVersion)
+               : result.getUpdateMessage();
+
+         globalDisplay_.showGenericDialog(GlobalDisplay.MSG_QUESTION,
+               constants_.updateAvailableCaption(),
+               updateMessage,
+               buttonLabels,
+               elementIds,
+               buttonOperations, 0);
+      }
+      else if (manual)
+      {
+         globalDisplay_.showMessage(GlobalDisplay.MSG_INFO,
+                              constants_.noUpdateAvailableCaption(),
+                              constants_.usingNewestVersionMessage());
+      }
+   }
+
+   /**
+    * Have the desktop frame download `version`, showing how far along it is
+    * until DesktopUpdateDownloadedEvent says how that went.
+    */
+   private void downloadUpdate(String version)
+   {
+      // a check during a download may offer an update again; the desktop
+      // ignores a repeat request and reports one for another build as a
+      // failure, so keep a single indicator. Either way it tells the
+      // in-flight build's percentage again, which puts back an indicator
+      // for that build should the refusal take this one down
+      dismissUpdateProgress();
+
+      updateProgress_ = globalDisplay_.showPercentProgress(constants_.downloadingUpdateMessage(version));
+      updateProgressVersion_ = version;
+      Desktop.getFrame().downloadUpdate(version);
+   }
+
+   private void dismissUpdateProgress()
+   {
+      if (updateProgress_ != null)
+      {
+         updateProgress_.dismiss();
+         updateProgress_ = null;
+         updateProgressVersion_ = null;
+      }
+   }
+
+   private void onUpdateDownloadProgress(DesktopUpdateDownloadProgressEvent event)
+   {
+      // the desktop reports only the build it is downloading, so with no
+      // indicator up (a refused request for another build took it down, or
+      // the page reloaded) show one for it; one showing another build is
+      // for a request the desktop is about to refuse
+      if (updateProgress_ == null)
+      {
+         updateProgress_ = globalDisplay_.showPercentProgress(constants_.downloadingUpdateMessage(event.getVersion()));
+         updateProgressVersion_ = event.getVersion();
+      }
+
+      if (event.getVersion().equals(updateProgressVersion_))
+         updateProgress_.setPercent(event.getPercent());
+   }
+
+   private void onUpdateDownloaded(DesktopUpdateDownloadedEvent event)
+   {
+      dismissUpdateProgress();
+
+      if (!event.succeeded())
+      {
+         globalDisplay_.showErrorMessage(constants_.updateDownloadFailedCaption(),
+               constants_.updateDownloadFailedMessage()
+               + event.getErrorMessage()
+               + "\n\n"
+               + constants_.visitWebsiteForNewVersionText());
+         return;
+      }
+
+      offerRestart(event.getVersion());
+   }
+
+   private void offerRestart(String version)
+   {
+      ArrayList<String> buttonLabels = new ArrayList<>();
+      ArrayList<String> elementIds = new ArrayList<>();
+      ArrayList<Operation> buttonOperations = new ArrayList<>();
+
+      buttonLabels.add(constants_.restartNowButtonLabel());
+      elementIds.add(ElementIds.DIALOG_YES_BUTTON);
+      buttonOperations.add(() ->
+      {
+         // check before the save prompts, for prompt feedback; installUpdate()
+         // checks again once they are answered, since another RStudio window
+         // or another download may have started while they were up
+         Desktop.getFrame().canInstallUpdate(version, (String blocker) ->
+         {
+            unlessUpdateBlocked(version, blocker, () ->
+            {
+               // the usual quit sequence (save prompts, session shutdown) runs
+               // first; the desktop frame applies the update as it quits and
+               // reopens the current project, as Restart RStudio does
+               appQuit_.prepareForQuit(constants_.updateRStudioCaption(), new QuitContext()
+               {
+                  @Override
+                  public void onReadyToQuit(boolean saveChanges)
+                  {
+                     String project = StringUtil.nullCoalesce(
+                           session_.getSessionInfo().getActiveProjectFile(),
+                           Projects.NONE);
+
+                     // a quit may already be under way (a project switch
+                     // whose .Last() is slow, say, or this dialog answered
+                     // twice): nothing is recorded for it, and the update
+                     // stays downloaded for the next check
+                     ApplicationQuit.QuitClaim claim = appQuit_.claimQuit();
+                     if (claim == null)
+                     {
+                        globalDisplay_.showMessage(GlobalDisplay.MSG_WARNING,
+                              constants_.updateRStudioCaption(),
+                              constants_.quitAlreadyInProgressMessage());
+                        return;
+                     }
+
+                     // quit only once the desktop frame has recorded the
+                     // install: a quit it refused would leave the user with
+                     // neither RStudio nor the update
+                     final String requestId = StringUtil.makeRandomId(16);
+                     Desktop.getFrame().installUpdate(version, project, requestId, (String installBlocker) ->
+                     {
+                        // the checks outlasted the claim, and a later restart
+                        // took its place; that one records and installs
+                        if ("superseded".equals(installBlocker))
+                        {
+                           claim.release();
+                           return;
+                        }
+
+                        if (installBlocker.length() > 0)
+                        {
+                           claim.release();
+                           unlessUpdateBlocked(version, installBlocker, () -> {});
+                           return;
+                        }
+
+                        // the install is recorded, and any exit would now
+                        // apply it: should this quit not happen (replaced
+                        // while its saves stall, say), it must be cancelled
+                        claim.armed();
+
+                        // only a released or replaced claim can refuse; then
+                        // the record is this request's to drop (by its id, so
+                        // a later request's record is kept)
+                        if (!claim.performQuit(null, saveChanges, null, null, null))
+                           Desktop.getFrame().cancelUpdateInstall(requestId);
+                     });
+                  }
+               });
+            });
+         });
+      });
+
+      // a downloaded update stays staged, so "Later" costs nothing: the next
+      // check offers the restart again without downloading twice (and on
+      // macOS Squirrel applies it at the next launch regardless)
+      buttonLabels.add(constants_.restartLaterButtonLabel());
+      elementIds.add(ElementIds.DIALOG_NO_BUTTON);
+      buttonOperations.add(() -> {});
+
+      globalDisplay_.showGenericDialog(GlobalDisplay.MSG_QUESTION,
+            constants_.updateDownloadedCaption(),
+            constants_.updateDownloadedMessage(version),
+            buttonLabels,
+            elementIds,
+            buttonOperations, 0);
+   }
+
+   /**
+    * Run `proceed` when the desktop frame answered that `version` can be
+    * installed (`blocker` is empty); otherwise deal with what blocks it,
+    * keeping the session running.
+    */
+   private void unlessUpdateBlocked(String version, String blocker, Operation proceed)
+   {
+      // this is not the downloaded update (its installer was cleaned away,
+      // or a later download replaced it): fetch it again, and the ready
+      // dialog follows
+      if (blocker == "missing")
+      {
+         downloadUpdate(version);
+         return;
+      }
+
+      // every window is its own process, and neither installer will swap
+      // the application while another is alive; quitting this one alone
+      // would leave the user without RStudio and without the update.
+      // Offer the restart again once the warning is dismissed, so closing
+      // the other windows does not need a new update check.
+      if (blocker.length() > 0)
+      {
+         String message = blocker == "other-instances"
+               ? constants_.closeOtherWindowsToUpdateMessage()
+               : constants_.cannotCheckOtherWindowsMessage();
+         globalDisplay_.showMessage(GlobalDisplay.MSG_WARNING,
+               constants_.updateRStudioCaption(),
+               message,
+               (Operation) () -> offerRestart(version));
+         return;
+      }
+
+      proceed.execute();
+   }
+
+   public static boolean isSelectionEmpty()
+   {
+      Element activeElement = DomUtils.getActiveElement();
+      AceEditorNative editor = AceEditorNative.getEditor(activeElement);
+      if (editor != null)
+      {
+         Selection selection = editor.getSession().getSelection();
+         return selection.isEmpty();
+      }
+
+      // NOTE: we currently use this for managing copy + paste
+      // behaviors, but copy + paste seems to do the right thing
+      // regardless of whether the user has highlighted some text
+      // or not _outside_ of an Ace instance, and we can't always
+      // detect if the document has a selection (e.g. if an iframe
+      // has focus)
+      return false;
+   }
+
+   private static boolean isFocusInAceInstance()
+   {
+      Element focusElem = DomUtils.getActiveElement();
+      if (focusElem != null)
+         return focusElem.hasClassName("ace_text-input");
+      return false;
+   }
+
+   @Override
+   public void addCommand(Widget widget)
+   {
+      toolbar_.addRightWidget(widget);
+   }
+
+   @Override
+   public Widget addCommandSeparator()
+   {
+      return toolbar_.addRightSeparator();
+   }
+
+   @Override
+   public void addLeftCommand(Widget widget)
+   {
+      toolbar_.addLeftWidget(widget);
+   }
+
+   @Override
+   public void addLeftCommand(Widget widget, String width)
+   {
+      toolbar_.addLeftWidget(widget);
+   }
+
+   @Override
+   public void addRightCommand(Widget widget)
+   {
+      toolbar_.addRightWidget(widget);
+   }
+
+   @Override
+   public Widget addRightCommandSeparator()
+   {
+      return toolbar_.addRightSeparator();
+   }
+
+   @Override
+   public void addProjectCommand(Widget widget)
+   {
+
+   }
+
+   @Override
+   public Widget addProjectCommandSeparator()
+   {
+      return null;
+   }
+
+   @Override
+   public void addProjectRightCommand(Widget widget)
+   {
+      toolbar_.addRightWidget(widget);
+   }
+
+   @Override
+   public Widget addProjectRightCommandSeparator()
+   {
+      return toolbar_.addRightSeparator();
+   }
+
+   @Override
+   public void addUserCommand(Widget widget)
+   {
+
+   }
+
+   @Override
+   public AppMenuBar getMainMenu()
+   {
+      return null;
+   }
+   
+   private void onMouseForward(NativeEvent event)
+   {
+      eventBus_.fireEvent(new DesktopMouseNavigateEvent(true, event.getClientX(), event.getClientY()));
+   }
+   
+   private void onMouseBack(NativeEvent event)
+   {
+      eventBus_.fireEvent(new DesktopMouseNavigateEvent(false, event.getClientX(), event.getClientY()));
+   }
+   
+   private final native void addBackForwardMouseDownHandlers()
+   /*-{
+      
+      var self = this;
+      var eventTarget = null;
+      
+      // Suppress 'mousedown' clicks from the back / forward mouse buttons.
+      // Otherwise, they might send focus just before attempting navigation,
+      // which is annoying if the mouse is within an editable text field
+      // (e.g. an editor in the Source pane).
+      $doc.body.addEventListener("mousedown", $entry(function(event) {
+         
+         var button = event.button;
+         if (button === 3 || button == 4)
+         {
+            // Save the event target, so we can detect if 'mousedown' and 'mouseup'
+            // happened over the same click target.
+            eventTarget = event.target;
+            
+            // Suppress events otherwise.
+            event.stopPropagation();
+            event.preventDefault();
+         }
+         
+      }), true);
+      
+      // Handle navigation attempts in 'mouseup'.
+      $doc.body.addEventListener("mouseup", $entry(function(event) {
+         
+         // Get the event targets.
+         var oldEventTarget = eventTarget;
+         var newEventTarget = event.target;
+         
+         // Clear the cached event target.
+         eventTarget = null;
+         
+         // If the event target changed, nothing to do.
+         var eventsMatch = oldEventTarget === newEventTarget;
+         
+         // Check and handle mouse back / forward buttons.
+         var button = event.button;
+         if (button === 3)
+         {
+            event.stopPropagation();
+            event.preventDefault();
+            if (eventsMatch)
+            {
+               self.@org.rstudio.studio.client.application.ui.impl.DesktopApplicationHeader::onMouseBack(*)(event);
+            }
+         }
+         else if (button === 4)
+         {
+            event.stopPropagation();
+            event.preventDefault();
+            if (eventsMatch)
+            {
+               self.@org.rstudio.studio.client.application.ui.impl.DesktopApplicationHeader::onMouseForward(*)(event);
+            }
+         }
+         
+      }), true);
+      
+   }-*/;
+   
+   public interface Binder
+         extends CommandBinder<Commands, DesktopApplicationHeader>
+   {
+   }
+
+   private static Binder binder_ = GWT.create(Binder.class);
+   private Commands commands_;
+   private Session session_;
+   private EventBus eventBus_;
+   private GlobalToolbar toolbar_;
+   private GlobalDisplay globalDisplay_;
+   Provider<UserPrefs> pUIPrefs_;
+   private ApplicationServerOperations server_;
+   private IgnoredUpdatesStateValue ignoredUpdatesState_;
+   private GlobalDisplay.PercentProgress updateProgress_;
+   /** the build updateProgress_ is shown for */
+   private String updateProgressVersion_;
+   private ApplicationQuit appQuit_;
+   private WebApplicationHeaderOverlay overlay_;
+   private static final StudioClientApplicationConstants constants_ = GWT.create(StudioClientApplicationConstants.class);
+}

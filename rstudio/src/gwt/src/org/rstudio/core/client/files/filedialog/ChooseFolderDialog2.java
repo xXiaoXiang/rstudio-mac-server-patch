@@ -1,0 +1,103 @@
+/*
+ * ChooseFolderDialog2.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.core.client.files.filedialog;
+
+import com.google.gwt.aria.client.Roles;
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.event.logical.shared.SelectionEvent;
+import com.google.gwt.user.client.ui.Widget;
+import org.rstudio.core.client.CoreClientConstants;
+import org.rstudio.core.client.files.FileSystemContext;
+import org.rstudio.core.client.files.FileSystemItem;
+import org.rstudio.core.client.widget.ProgressOperationWithInput;
+
+import java.util.ArrayList;
+
+public class ChooseFolderDialog2 extends FileSystemDialog
+{
+   public ChooseFolderDialog2(String title,
+                              String label,
+                              FileSystemContext context,
+                              boolean allowFolderCreation,
+                              ProgressOperationWithInput<FileSystemItem> operation)
+   {
+      super(title, null, Roles.getDialogRole(), label, context, "", allowFolderCreation, operation);
+   }
+
+   @Override
+   public String getFilenameLabel()
+   {
+      return constants_.fileNameLabel();
+   }
+
+   @Override
+   public Widget createMainWidget()
+   {
+      Widget widget = super.createMainWidget();
+      browser_.setFilenameEnabled(false);
+      browser_.getFilenameStyle().setBackgroundColor("transparent");
+      return widget;
+   }
+
+   @Override
+   protected void focusInitialControl()
+   {
+      // the folder list is the chooser's main control; its first item gets
+      // focus without being selected, so the chosen folder is unchanged
+      browser_.focusDirectoryWhenListed();
+   }
+
+   @Override
+   public FileSystemItem[] ls()
+   {
+      FileSystemItem[] items = super.ls();
+      ArrayList<FileSystemItem> dirs = new ArrayList<>();
+      for (FileSystemItem item : items)
+         if (item.isDirectory())
+            dirs.add(item);
+      return dirs.toArray(new FileSystemItem[0]);
+   }
+
+   @Override
+   public void onSelection(SelectionEvent<FileSystemItem> event)
+   {
+      super.onSelection(event);
+      FileSystemItem item = event.getSelectedItem();
+      if (item != null)
+      {
+         // use the same target as double-clicking the row: the parent for
+         // `..`, or the target of a macOS Finder alias / Windows shortcut.
+         // Resolve the event's own item: RowTable doesn't promise that its
+         // stored selection matches the event while firing (clear() doesn't).
+         browser_.setFilename(browser_.resolveItem(item).getPath());
+      }
+      else if (!browser_.isNavigating())
+      {
+         // every redraw of the listing clears the selection, whether a listing
+         // arrived or a navigation failed; with nothing selected, the choice
+         // is the directory being shown (#18938). A clear while a listing
+         // loads (the progress view) is skipped: pwd() is still the directory
+         // being left, and a deferred Choose waits for the listing anyway.
+         browser_.setFilename(context_.pwd());
+      }
+   }
+
+   @Override
+   protected FileSystemItem getSelectedItem()
+   {
+      return FileSystemItem.createDir(browser_.getFilename());
+   }
+   private static final CoreClientConstants constants_ = GWT.create(CoreClientConstants.class);
+}

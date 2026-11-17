@@ -1,0 +1,268 @@
+/*
+ * FileBrowserWidget.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.core.client.files.filedialog;
+
+import org.rstudio.core.client.ElementIds;
+import org.rstudio.core.client.dom.DomUtils;
+import org.rstudio.core.client.events.SelectionCommitEvent;
+import org.rstudio.core.client.files.FileSystemContext;
+import org.rstudio.core.client.files.FileSystemItem;
+
+import com.google.gwt.dom.client.Document;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.dom.client.Style;
+import com.google.gwt.event.dom.client.KeyPressHandler;
+import com.google.gwt.event.dom.client.KeyUpHandler;
+import com.google.gwt.event.logical.shared.SelectionHandler;
+import com.google.gwt.user.client.ui.Composite;
+import com.google.gwt.user.client.ui.DockPanel;
+import com.google.gwt.user.client.ui.HorizontalPanel;
+import com.google.gwt.user.client.ui.TextBox;
+import com.google.gwt.user.client.ui.Widget;
+import org.rstudio.core.client.widget.FormLabel;
+
+public class FileBrowserWidget extends Composite
+                 implements FileSystemContext.Callbacks
+{
+   public interface Host extends SelectionCommitEvent.Handler<FileSystemItem>,
+                                 SelectionHandler<FileSystemItem>
+   {
+      String getFilenameLabel();
+      void onError(String errorMessage);
+      void maybeAccept();
+      FileSystemItem[] ls();
+   }
+
+   public FileBrowserWidget(FileSystemContext context,
+                            Host host)
+   {
+      context_ = context;
+      host_ = host;
+
+      breadcrumb_ = new PathBreadcrumbWidget(context_);
+      breadcrumb_.addSelectionCommitHandler(host);
+
+      directory_ = new DirectoryContentsWidget(context_);
+      directory_.addSelectionHandler(host);
+      directory_.addSelectionCommitHandler(host);
+
+      // the listing of the initial directory is already in flight when the
+      // dialog creates us; onNavigated() delivers it
+      navigating_ = true;
+      directory_.showProgress(true);
+
+      DockPanel dockPanel = new DockPanel();
+      Widget topWidget = createTopWidget();
+      if (topWidget != null)
+         dockPanel.add(topWidget, DockPanel.NORTH);
+      dockPanel.add(breadcrumb_, DockPanel.NORTH);
+      dockPanel.add(directory_, DockPanel.CENTER);
+
+      initWidget(dockPanel);
+   }
+
+   // Public methods ----------------------------------------------------------
+
+   public void setFilename(String filename)
+   {
+      if (filename_ != null)
+         filename_.setText(filename);
+      else
+         initialFilename_ = filename;
+   }
+
+   public String getFilename()
+   {
+      return filename_.getText();
+   }
+
+   public void setFilenameEnabled(boolean enabled)
+   {
+      filename_.setEnabled(enabled);
+   }
+
+   public void selectFilename()
+   {
+      filename_.selectAll();
+   }
+
+   public void setFilenameFocus(boolean focus)
+   {
+      filename_.setFocus(focus);
+   }
+
+   public Style getFilenameStyle()
+   {
+     return filename_.getElement().getStyle();
+   }
+
+   public void onNavigated()
+   {
+      navigating_ = false;
+
+      String dir = context_.pwd();
+
+      final FileSystemItem[] parsedDir = context_.parseDir(dir);
+      breadcrumb_.setDirectory(parsedDir, null);
+      directory_.setContents(
+            host_.ls(),
+            parsedDir.length > 1 ? parsedDir[parsedDir.length-2] : null);
+
+      // the dialog sets its own initial focus once shown (focusInitialControl);
+      // focusing the list for the first listing raced it, flashing focus on
+      // the list or taking it from the dialog's initial control
+      // a pending request yields to focus the user has moved meanwhile
+      boolean pendingFocus = directoryFocusPending_ && isNothingFocused();
+      if (initialListingShown_ || pendingFocus)
+         setDirectoryFocus(true);
+      initialListingShown_ = true;
+      directoryFocusPending_ = false;
+   }
+
+   public void cd(String path)
+   {
+      navigating_ = true;
+      directory_.showProgress(true);
+      context_.cd(path);
+   }
+
+   public void cd(FileSystemItem dir)
+   {
+      assert dir.isDirectory();
+      cd(dir.getPath());
+   }
+
+   public void addKeyUpHandler(KeyUpHandler handler)
+   {
+      filename_.addKeyUpHandler(handler);
+   }
+
+   public void addKeyPressHandler(KeyPressHandler handler)
+   {
+      filename_.addKeyPressHandler(handler);
+   }
+
+   public void setSelectedRow(Integer row)
+   {
+      directory_.setSelectedRow(row);
+   }
+
+   public void setDirectoryFocus(boolean focus)
+   {
+      directory_.setFocus(focus);
+   }
+
+   private static boolean isNothingFocused()
+   {
+      Element active = DomUtils.getActiveElement();
+      return active == null || active == Document.get().getBody();
+   }
+
+   /**
+    * Focuses the directory list now, or once the first listing arrives: until
+    * then the list is not attached and cannot take focus.
+    */
+   public void focusDirectoryWhenListed()
+   {
+      if (initialListingShown_)
+         setDirectoryFocus(true);
+      else
+         directoryFocusPending_ = true;
+   }
+
+   @Override
+   public void onError(String errorMessage)
+   {
+      onNavigated();
+   }
+
+   @Override
+   public void onDirectoryCreated(FileSystemItem directory)
+   {
+      directory_.addDirectory(directory);
+   }
+
+   public String getSelectedValue()
+   {
+      return directory_.getSelectedValue();
+   }
+
+   public FileSystemItem getSelectedItem()
+   {
+      return directory_.getSelectedItem();
+   }
+
+   public FileSystemItem getSelectedTarget()
+   {
+      return directory_.getSelectedTarget();
+   }
+
+   public FileSystemItem resolveItem(FileSystemItem item)
+   {
+      return directory_.resolveItem(item);
+   }
+
+   public FileSystemItem getCurrentDirectory()
+   {
+      return context_.pwdItem();
+   }
+
+   /**
+    * @return true while a directory listing is in flight, i.e. from the
+    * dialog opening or a cd() until the matching onNavigated()
+    */
+   public boolean isNavigating()
+   {
+      return navigating_;
+   }
+
+   // Private methods ---------------------------------------------------------
+
+   private Widget createTopWidget()
+   {
+      String nameLabel = host_.getFilenameLabel();
+      if (nameLabel == null)
+         return null;
+
+      HorizontalPanel filenamePanel = new HorizontalPanel();
+      FileDialogStyles styles = FileDialogResources.INSTANCE.styles();
+      filenamePanel.setStylePrimaryName(styles.filenamePanel());
+      filenamePanel.setVerticalAlignment(HorizontalPanel.ALIGN_MIDDLE);
+
+      filename_ = new TextBox();
+      if (initialFilename_ != null)
+         filename_.setText(initialFilename_);
+      filename_.setStylePrimaryName(styles.filename());
+      filename_.getElement().setId(ElementIds.FILE_DIALOG_NAME_PROMPT);
+
+      FormLabel filenameLabel = new FormLabel(nameLabel + ":", filename_, false);
+      filenameLabel.setStylePrimaryName(styles.filenameLabel());
+      filenamePanel.add(filenameLabel);
+      filenamePanel.add(filename_);
+      filenamePanel.setCellWidth(filename_, "100%");
+
+      return filenamePanel;
+   }
+
+   private PathBreadcrumbWidget breadcrumb_;
+   private DirectoryContentsWidget directory_;
+   private TextBox filename_;
+   private boolean navigating_;
+   private boolean initialListingShown_;
+   private boolean directoryFocusPending_;
+   private FileSystemContext context_;
+   private String initialFilename_;
+   private Host host_;
+}

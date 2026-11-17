@@ -1,0 +1,291 @@
+/*
+ * DesktopFrame.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.application;
+
+import org.rstudio.core.client.CommandWithArg;
+import org.rstudio.core.client.Point;
+import org.rstudio.core.client.SessionServer;
+import org.rstudio.core.client.js.BaseExpression;
+import org.rstudio.core.client.js.JavaScriptPassthrough;
+import org.rstudio.core.client.js.JsObject;
+
+import com.google.gwt.core.client.JsArray;
+import com.google.gwt.core.client.JsArrayInteger;
+import com.google.gwt.core.client.JsArrayString;
+import com.google.gwt.user.client.Command;
+
+import elemental2.dom.File;
+
+/**
+ * This is an interface to callbacks registered by the desktop frame.
+ */
+@BaseExpression("$wnd.desktop")
+public interface DesktopFrame extends JavaScriptPassthrough
+{
+   void writeStdout(String text);
+   void writeStderr(String text);
+   
+   void browseUrl(String url);
+
+   // in-app updates (see src/node/desktop/src/main/updater.ts); the callback
+   // receives a JSON object with the same keys as the check_for_updates RPC
+   // plus "status" and "can-install"
+   void checkForUpdates(boolean manual, CommandWithArg<String> callback);
+   // the version the user accepted, as the check reported it
+   void downloadUpdate(String version);
+   // "" when `version`, the update a ready dialog named, can be applied now;
+   // otherwise why not: "missing" (it is not the downloaded update -- its
+   // installer is gone, or a later download replaced it -- so download it
+   // again), "other-instances" (other RStudio windows -- separate processes
+   // -- are open) or "unknown" (that check itself failed)
+   void canInstallUpdate(String version, CommandWithArg<String> callback);
+   // record that the quit about to happen installs `version` and that the
+   // relaunched RStudio should open the project file (or Projects.NONE);
+   // `requestId` names this request for cancelUpdateInstall(). Answers like
+   // canInstallUpdate(), or "superseded" when a later request took its
+   // place; the quit must follow only on ""
+   void installUpdate(String version,
+                      String projectFilePath,
+                      String requestId,
+                      CommandWithArg<String> callback);
+   // the quit installUpdate() recorded for `requestId` is not going to
+   // happen after all (a record a later request made is kept)
+   void cancelUpdateInstall(String requestId);
+
+   void getOpenFileName(String caption,
+                        String label,
+                        String dir,
+                        String filter,
+                        boolean canChooseDirectories,
+                        boolean focusOpener,
+                        CommandWithArg<String> callback);
+   
+   void getSaveFileName(String caption,
+                        String label,
+                        String dir, 
+                        String defaultExtension, 
+                        boolean forceDefaultExtension,
+                        boolean focusOpener,
+                        CommandWithArg<String> callback);
+   
+   void getExistingDirectory(String caption,
+                             String label,
+                             String dir,
+                             boolean focusOpener,
+                             CommandWithArg<String> callback);
+   
+   void undo();
+   void redo();
+   
+   void clipboardCut();
+   void clipboardCopy();
+   void clipboardPaste();
+   
+   void setClipboardText(String text);
+   void getClipboardText(CommandWithArg<String> callback);
+   void getClipboardUris(CommandWithArg<JsArrayString> callback);
+   void getClipboardImage(CommandWithArg<String> callback);
+   
+   void setGlobalMouseSelection(String selection);
+   void getGlobalMouseSelection(CommandWithArg<String> callback);
+   
+   void doesWindowExistAtCursorPosition(CommandWithArg<Boolean> callback);
+   void getCursorPosition(CommandWithArg<Point> callback);
+   
+   void onWorkbenchInitialized(String scratchDir);
+   void showFolder(String path);
+   void showFile(String path);
+
+   // macOS only; the callback receives { elsewhere: the extensions still owned
+   // by another application, error: why some could not be changed, or empty }
+   void setDefaultApplicationForRFiles(CommandWithArg<JsObject> callback);
+   void beep();
+   void showWordDoc(String path);
+   void showPDF(String path, int pdfPage);
+   void prepareShowWordDoc();
+   void prepareShowPptPresentation();
+   void showPptPresentation(String path);
+   void openMinimalWindow(String name, String url, int width, int height);
+   void activateMinimalWindow(String name);
+   void activateSatelliteWindow(String name);
+   void prepareForSatelliteWindow(String name, int x, int y, int width,
+                                  int height, Command onPrepared);
+   void prepareForNamedWindow(String name, boolean allowExternalNavigation,
+         boolean showDesktopToolbar, Command onPrepared);
+
+   void setNumGwtModalsShowing(int numModalsShowing);
+
+   void copyPageRegionToClipboard(int left, int top, int width, int height,
+                                  Command onCopied);
+
+   void copyImageAtXYToClipboard(int absoluteLeft, int absoluteTop,
+                                 Command completed);
+   
+   void exportPageRegionToFile(String targetPath, 
+                               String format, 
+                               int left, 
+                               int top, 
+                               int width, 
+                               int height,
+                               CommandWithArg<Void> callback);
+
+   void printText(String text);
+   
+   void supportsClipboardMetafile(CommandWithArg<Boolean> callback);
+
+   void showMessageBox(int type,
+                       String caption,
+                       String message,
+                       String buttons,
+                       int defaultButton,
+                       int cancelButton,
+                       CommandWithArg<Double> callback);
+
+   void promptForText(String title,
+                      String label,
+                      String initialValue,
+                      int type,
+                      String rememberPasswordPrompt,
+                      boolean rememberByDefault,
+                      int selectionStart,
+                      int selectionLength,
+                      String okButtonCaption,
+                      CommandWithArg<String> callback);
+
+   void bringMainFrameToFront();
+   void bringMainFrameBehindActive();
+   
+   void desktopRenderingEngine(CommandWithArg<String> callback);
+   void setDesktopRenderingEngine(String engine);
+
+   // R version selection currently Win32 only
+   void getRVersion(CommandWithArg<String> callback);
+   void chooseRVersion(CommandWithArg<String> callback);
+
+   void getDisplayDpi(CommandWithArg<String> callback);
+
+   void cleanClipboard();
+   
+   public static final int PENDING_QUIT_NONE = 0;
+   public static final int PENDING_QUIT_AND_EXIT = 1;
+   public static final int PENDING_QUIT_AND_RESTART = 2;
+   public static final int PENDING_QUIT_RESTART_AND_RELOAD = 3;
+   
+   // callback receives "" once the frame has recorded the quit (and the R,
+   // prepared by setPendingRVersion(), it should restart with, if any), or
+   // why it could not; the quit must not go on without the record
+   void setPendingQuit(int pendingQuit, String rExecutablePath, CommandWithArg<String> callback);
+   void setPendingProject(String projectFilePath);
+
+   // the R executable the next session (a pending restart) should use; the
+   // callback receives an error message when that R can't be used, and ""
+   // once it is ready for the restart a quit then names in setPendingQuit()
+   void setPendingRVersion(String rExecutablePath, CommandWithArg<String> callback);
+
+   // make the macOS framework version of R with the given home run as itself
+   // rather than as the framework's default version; the callback receives an
+   // error message on failure, and "" otherwise
+   void makeROrthogonal(String rHome, CommandWithArg<String> callback);
+   void launchSession(boolean reload);
+   
+   void openProjectInNewWindow(String projectFilePath);
+   void openSessionInNewWindow(String workingDirectoryPath);
+
+   void setFixedWidthFont(String font);
+   void setZoomLevel(double zoomLevel);
+   
+   void zoomIn();
+   void zoomOut();
+   void zoomActualSize();
+   void getZoomLevel(CommandWithArg<Double> callback);
+   
+   void setBackgroundColor(JsArrayInteger rgbColor);
+   void changeTitleBarColor(int r, int g, int b);
+   void syncToEditorTheme(boolean isDark);
+   void setMousewheelZoomEnabled(boolean enabled);
+   void setMousewheelZoomDebounce(double debounceMs);
+   
+   void setEnableAccessibility(boolean enable);
+   void setDisableRendererAccessibility(boolean disable);
+
+   void setAutohideMenubar(boolean enable);
+
+   void getClipboardMonitoring(CommandWithArg<Boolean> callback);
+   void setClipboardMonitoring(boolean monitoring);
+   
+   void getIgnoreGpuExclusionList(CommandWithArg<Boolean> callback);
+   void setIgnoreGpuExclusionList(boolean ignore);
+   
+   void getDisableGpuDriverBugWorkarounds(CommandWithArg<Boolean> callback);
+   void setDisableGpuDriverBugWorkarounds(boolean disable);
+   
+   void showLicenseDialog();
+   void getInitMessages(CommandWithArg<String> callback);
+   void getLicenseStatusMessage(CommandWithArg<String> callback);
+   void allowProductUsage(CommandWithArg<Boolean> callback);
+   
+   void externalSynctexPreview(String pdfPath, int page);
+   
+   void externalSynctexView(String pdfFile, 
+                            String srcFile, 
+                            int line,
+                            int column);
+   
+   void toggleFullscreenMode();
+   
+   void reloadZoomWindow();
+   
+   void setViewerUrl(String url, Command callback);
+   void reloadViewerZoomWindow(String url);
+   void setPresentationUrl(String url);
+   void setTutorialUrl(String url);
+
+   void setShinyDialogUrl(String url);
+
+   void injectShinyDialogCss(String css);
+
+   void allowNavigation(String url, CommandWithArg<Boolean> callback);
+
+   void setBusy(boolean busy);
+   
+   void setWindowTitle(String title);
+   
+   void installRtools(String version, String installerPath);
+
+   void onSessionQuit();
+
+   void crashDesktopApplication();
+
+   void getSessionServer(CommandWithArg<SessionServer> callback);
+   void getSessionServers(CommandWithArg<JsArray<SessionServer>> callback);
+   void reconnectToSessionServer(SessionServer server);
+
+   void setLauncherServer(SessionServer server, CommandWithArg<Boolean> callback);
+   void connectToLauncherServer();
+
+   void getLauncherServer(CommandWithArg<SessionServer> callback);
+   void startLauncherJobStatusStream(String jobId);
+   void stopLauncherJobStatusStream(String jobId);
+   void startLauncherJobOutputStream(String jobId);
+   void stopLauncherJobOutputStream(String jobId);
+   void controlLauncherJob(String jobId, String operation);
+   void getJobContainerUser();
+   void validateJobsConfig();
+   void getProxyPortNumber(CommandWithArg<Double> callback);
+
+   void signOut();
+
+   String getPathForFile(File file);
+}

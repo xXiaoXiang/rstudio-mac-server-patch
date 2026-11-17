@@ -1,0 +1,332 @@
+/*
+ * FileDialog.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.core.client.files.filedialog;
+
+import com.google.gwt.aria.client.DialogRole;
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.event.logical.shared.SelectionEvent;
+
+import org.rstudio.core.client.CoreClientConstants;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.events.SelectionCommitEvent;
+import org.rstudio.core.client.files.FileSystemContext;
+import org.rstudio.core.client.files.FileSystemItem;
+import org.rstudio.core.client.widget.ProgressOperationWithInput;
+
+public abstract class FileDialog extends FileSystemDialog
+{
+   protected FileDialog(String title,
+                        String caption,
+                        DialogRole role,
+                        String buttonName,
+                        boolean promptOnOverwrite,
+                        boolean allowNonexistentFile,
+                        boolean allowFolderCreation,
+                        FileSystemContext context,
+                        String filter,
+                        ProgressOperationWithInput<FileSystemItem> operation)
+   {
+      super(title, caption, role, buttonName, context, filter, allowFolderCreation,
+            operation);
+
+      promptOnOverwrite_ = promptOnOverwrite;
+      allowNonexistentFile_ = allowNonexistentFile;
+   }
+
+   /**
+    * This should ONLY be called from the accept() method, otherwise the
+    * filename may contain invalid data which could throw an exception.
+    * @return the item named by the filename, or null when it is empty
+    */
+   @Override
+   protected FileSystemItem getSelectedItem()
+   {
+      // an empty name is not a valid path element; resolving it would yield
+      // the current directory disguised as a file
+      String filename = browser_.getFilename().trim();
+      if (filename.isEmpty())
+         return null;
+
+      FileSystemItem item = context_.itemForName(filename, false, false);
+
+      // follow macOS Finder aliases / Windows shortcuts so accepting one
+      // acts on its target rather than the link file
+      return item != null ? item.resolveAliasTarget() : null;
+   }
+
+   @Override
+   public String getFilenameLabel()
+   {
+      return constants_.getFilenameLabel();
+   }
+
+   /**
+    * Validate the current state of the dialog. Subclasses can override
+    * this but super.shouldAccept() MUST be the last validation that occurs.
+    * @return true if the dialog is in a valid state for acceptance
+    */
+   protected boolean shouldAccept()
+   {
+      // It's possible the user has typed the name of a file, but hasn't
+      // actually selected a file in the browser. If the user has typed
+      // a filename, then prefer using that over what the previously
+      // selected file might have been.
+      //
+      // Note that selecting an item in the file widget will also update
+      // the browser filename.
+      String filename = browser_.getFilename().trim();
+      if (StringUtil.isNullOrEmpty(filename))
+      {
+         // a selected folder row is a request to navigate into it; the `..`
+         // row resolves to the parent, which the name validation below would
+         // otherwise reject as an illegal name (#19427)
+         FileSystemItem selected = browser_.getSelectedTarget();
+         if (selected != null && selected.isDirectory())
+         {
+            cd(selected.getPath());
+            return false;
+         }
+
+         filename = browser_.getSelectedValue().trim();
+      }
+
+      if (filename.length() == 0)
+      {
+         // an accept deferred (#18922) behind a navigation that an earlier
+         // accept turned into (a selected folder row, `~`, `..`, a typed
+         // `dir/`) arrives to find the name that navigation consumed; any
+         // other accept asked to save with an empty name
+         if (!(inDeferredAccept_ && arrivedFromAccept_))
+         {
+            browser_.selectFilename();
+            showError(constants_.nameEmptyMessage());
+         }
+         return false;
+      }
+
+      // a typed `..` names the parent, like the `..` row; the name validation
+      // below would reject it
+      if (filename == "~" || filename == "..")
+      {
+         browser_.setFilename("");
+         cd(filename);
+         return false;
+      }
+      // Make sure the browser's notion of the filename is in sync.
+      browser_.setFilename(filename);
+
+      int lastIndex = filename.lastIndexOf('/');
+      if (lastIndex >= 0)
+      {
+         String dir = StringUtil.substring(filename, 0, lastIndex);
+         if (dir.length() == 0)
+            dir = "/";
+         String file = StringUtil.substring(filename, lastIndex + 1);
+
+         // Targeted fix for "611: Permission denied error when attempting to
+         // browse /shared folder in open file dialog". The /shared folder
+         // doesn't have list permissions.
+         if (dir.equals("/shared"))
+         {
+            cd(filename);
+            return false;
+         }
+
+         browser_.setFilename(file);
+         browser_.setFilenameEnabled(false);
+         acceptOnNavigated_ = true;
+         splitPath_ = filename;
+         cd(dir);
+         return false;
+      }
+
+      String filenameValidationError = context_.validatePathElement(filename, true);
+      if (filenameValidationError != null)
+      {
+         browser_.selectFilename();
+         showError(filenameValidationError);
+         return false;
+      }
+
+      if (navigateIfDirectory())
+         return false;
+
+      boolean useExactFilename =
+            browser_.getSelectedValue() != null &&
+            browser_.getSelectedValue() == filename;
+
+      if (!useExactFilename || getAlwaysMungeFilename())
+      {
+         browser_.setFilename(mungeFilename(filename));
+      }
+
+      if (navigateIfDirectory())
+         return false;
+
+      FileSystemItem item = context_.itemForName(filename, true, false);
+      if (item == null)
+      {
+         if (!allowNonexistentFile_)
+         {
+            showError(constants_.nonexistentFileMessage());
+            return false;
+         }
+      }
+      else
+      {
+         if (item.isDirectory())
+         {
+            assert false : "This case should be covered by navigateIfDirectory";
+            return false;
+         }
+         else if (promptOnOverwrite_)
+         {
+            /* WARNING. showOverwritePrompt() MAY CAUSE accept() TO BE CALLED
+                DIRECTLY. ALL OTHER VALIDATION *MUST* BE COMPLETE BEFORE
+                CALLING showOverwritePrompt()!!! */
+            showOverwritePrompt();
+            return false;
+         }
+      }
+
+      return true;
+   }
+
+   private boolean navigateIfDirectory()
+   {
+      FileSystemItem item = context_.itemForName(browser_.getFilename(),
+                                                 true,
+                                                 false);
+      if (item != null && item.isDirectory())
+      {
+         // follow macOS Finder aliases / Windows shortcuts into their target;
+         // for regular directories this is the item itself, and its absolute
+         // path is equivalent to the name relative to the browsed directory
+         item = item.resolveAliasTarget();
+         browser_.setFilename("");
+         cd(item.getPath());
+         return true;
+      }
+      return false;
+   }
+
+   /**
+    * Gives subclasses an opportunity to change the filename before acceptance.
+    * This happens AFTER validation so it's imperative that no potentially
+    * illegal values be returned from this method.
+    */
+   protected String mungeFilename(String filename)
+   {
+      return filename;
+   }
+
+   protected boolean getAlwaysMungeFilename()
+   {
+      return false;
+   }
+
+   /**
+    * Navigates on behalf of an accept (see shouldAccept()); the dialog's
+    * initial listing and the browser's own navigations do not come through
+    * here.
+    */
+   protected void cd(String path)
+   {
+      browser_.setFilenameEnabled(false);
+      navigatingFromAccept_ = true;
+      browser_.cd(path);
+   }
+
+   /**
+    * The user choosing a folder (a list row or a crumb) while a cd() of ours
+    * is pending supersedes it: the listing or error that arrives next is
+    * theirs, so a typed `dir/name` must not be put back over what they did.
+    */
+   @Override
+   public void onSelectionCommit(SelectionCommitEvent<FileSystemItem> event)
+   {
+      FileSystemItem item = event.getSelectedItem();
+      if (item != null && item.isDirectory())
+      {
+         navigatingFromAccept_ = false;
+         splitPath_ = null;
+      }
+
+      super.onSelectionCommit(event);
+   }
+
+   @Override
+   protected void onBrowserNavigated()
+   {
+      super.onBrowserNavigated();
+
+      // re-enable before the deferred accept, which may cd() and disable again
+      browser_.setFilenameEnabled(true);
+
+      // for the deferred accept that may follow: whether the listing it
+      // waited for was one of ours
+      arrivedFromAccept_ = navigatingFromAccept_;
+      navigatingFromAccept_ = false;
+      splitPath_ = null;
+   }
+
+   @Override
+   public void onError(String errorMessage)
+   {
+      // a failed cd() does not reach onNavigated()
+      browser_.setFilenameEnabled(true);
+      navigatingFromAccept_ = false;
+
+      // the folder of a typed `dir/name` could not be entered: give the whole
+      // path back for correction, rather than leaving just `name` staged to
+      // be saved where the dialog still is
+      if (splitPath_ != null)
+      {
+         browser_.setFilename(splitPath_);
+         browser_.selectFilename();
+         splitPath_ = null;
+      }
+
+      super.onError(errorMessage);
+   }
+
+   @Override
+   protected void focusInitialControl()
+   {
+      browser_.setFilenameFocus(true);
+      browser_.selectFilename();
+   }
+
+   @Override
+   public void onSelection(SelectionEvent<FileSystemItem> event)
+   {
+      super.onSelection(event);
+
+      FileSystemItem item = event.getSelectedItem();
+      if (item != null && !item.isDirectory())
+         browser_.setFilename(item.getName());
+   }
+
+   protected boolean promptOnOverwrite_;
+   protected boolean allowNonexistentFile_;
+
+   // a cd() of ours is in flight / the last listing came from one
+   private boolean navigatingFromAccept_ = false;
+   private boolean arrivedFromAccept_ = false;
+
+   // the typed `dir/name` whose `dir` a cd() of ours is entering
+   private String splitPath_ = null;
+   private static final CoreClientConstants constants_ = GWT.create(CoreClientConstants.class);
+}

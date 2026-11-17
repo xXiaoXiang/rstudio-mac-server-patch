@@ -1,0 +1,148 @@
+/*
+ * UserPrefEnumPaletteEntry.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.palette.ui;
+
+
+import java.util.Set;
+
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.dom.DomUtils;
+import org.rstudio.studio.client.palette.UserPrefPaletteItem;
+import org.rstudio.studio.client.palette.model.CommandPaletteItem.InvocationSource;
+import org.rstudio.studio.client.workbench.prefs.model.Prefs.EnumValue;
+
+import com.google.gwt.aria.client.Id;
+import com.google.gwt.aria.client.Roles;
+import com.google.gwt.dom.client.Style.Unit;
+import com.google.gwt.user.client.ui.ListBox;
+import com.google.gwt.user.client.ui.Widget;
+
+public class UserPrefEnumPaletteEntry extends UserPrefPaletteEntry
+{
+   public UserPrefEnumPaletteEntry(EnumValue val, UserPrefPaletteItem item, Set<String> excludedValues)
+   {
+      super(val, item);
+      val_ = val;
+      prefItem_ = item;
+      excludedValues_ = excludedValues;
+
+      selector_ = new ListBox();
+      selector_.setVisibleItemCount(1);
+
+      // Create marginally more user friendly names for option values by
+      // removing common separators and adding some casing. Values excluded
+      // because they are unavailable in this build are skipped -- except the
+      // current value, which is kept selectable. If the current (stale) value
+      // were dropped, the ListBox would default to its first option while the
+      // preference still held the unavailable value, and the user could not
+      // correct it: selecting the already-shown first option fires no change
+      // event. Keeping it lets the user change away from it.
+      String currentValue = val_.getGlobalValue();
+      String[] values = val.getAllowedValues();
+      for (String value: values)
+      {
+         if (excludedValues.contains(value) && !StringUtil.equals(value, currentValue))
+            continue;
+         String option = value.replace("-", " ");
+         option = option.replace("_", " ");
+         option = StringUtil.capitalizeAllWords(option);
+         selector_.addItem(option, value);
+      }
+
+      // Show the currently selected value (indices reflect the filtered list)
+      for (int i = 0; i < selector_.getItemCount(); i++)
+      {
+         if (StringUtil.equals(selector_.getValue(i), currentValue))
+         {
+            selector_.setSelectedIndex(i);
+            break;
+         }
+      }
+      
+      // Adjust style for display
+      selector_.getElement().getStyle().setMarginBottom(0, Unit.PX);
+      selector_.getElement().getStyle().setMarginRight(5, Unit.PX);
+      
+      selector_.addChangeHandler((evt) ->
+      {
+         // Change the preference to the new value
+         String selected = selector_.getSelectedValue();
+         val_.setGlobalValue(selected);
+
+         // Save new state
+         prefItem_.nudgeWriter();
+
+         // The current value may be an unavailable provider that was kept
+         // selectable so it could be changed away from. Once the user has
+         // moved off it, drop such options so they cannot be re-selected while
+         // the palette is open.
+         removeExcludedOptions(selected);
+      });
+
+      initialize();
+
+      // Establish link between the selector and the name element for
+      // accessibility purposes
+      Roles.getOptionRole().setAriaLabelledbyProperty(selector_.getElement(),
+            Id.of(name_.getElement()));
+
+   }
+
+   @Override
+   public Widget getInvoker()
+   {
+      return selector_;
+   }
+   
+   @Override
+   public void invoke(InvocationSource source)
+   {
+      DomUtils.setActive(selector_.getElement());
+   }
+
+   // Remove options whose provider is unavailable, keeping the current value.
+   // Removing an option before the selected one shifts indices, so re-select
+   // the current value by value afterwards.
+   private void removeExcludedOptions(String keepValue)
+   {
+      boolean removed = false;
+      for (int i = selector_.getItemCount() - 1; i >= 0; i--)
+      {
+         String value = selector_.getValue(i);
+         if (excludedValues_.contains(value) && !StringUtil.equals(value, keepValue))
+         {
+            selector_.removeItem(i);
+            removed = true;
+         }
+      }
+
+      if (removed)
+      {
+         for (int i = 0; i < selector_.getItemCount(); i++)
+         {
+            if (StringUtil.equals(selector_.getValue(i), keepValue))
+            {
+               selector_.setSelectedIndex(i);
+               break;
+            }
+         }
+      }
+   }
+
+   private ListBox selector_;
+   private EnumValue val_;
+   private final UserPrefPaletteItem prefItem_;
+   private final Set<String> excludedValues_;
+}

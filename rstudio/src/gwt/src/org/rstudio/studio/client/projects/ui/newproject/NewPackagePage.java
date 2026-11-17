@@ -1,0 +1,122 @@
+/*
+ * NewDirectoryPage.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.projects.ui.newproject;
+
+import com.google.gwt.core.client.GWT;
+import org.rstudio.core.client.ElementIds;
+import org.rstudio.core.client.js.JsUtil;
+import org.rstudio.core.client.resources.ImageResource2x;
+import org.rstudio.core.client.widget.SelectWidget;
+import org.rstudio.studio.client.RStudioGinjector;
+import org.rstudio.studio.client.projects.StudioClientProjectConstants;
+import org.rstudio.studio.client.projects.model.NewPackageOptions;
+import org.rstudio.studio.client.projects.model.NewProjectInput;
+
+import com.google.gwt.dom.client.Style.Unit;
+import com.google.gwt.event.dom.client.ChangeEvent;
+import com.google.gwt.event.dom.client.ChangeHandler;
+import com.google.gwt.user.client.ui.HorizontalPanel;
+
+
+public class NewPackagePage extends NewDirectoryPage
+{
+   public NewPackagePage()
+   {
+      super(constants_.newPackageTitle(),
+            constants_.createNewPackageSubTitle(),
+            constants_.createRPackagePageCaption(),
+            new ImageResource2x(NewProjectResources.INSTANCE.packageIcon2x()),
+            new ImageResource2x(NewProjectResources.INSTANCE.packageIconLarge2x()));
+      
+      RStudioGinjector.INSTANCE.injectMembers(this);
+   }
+   
+   protected boolean getOptionsSideBySide()
+   {
+      return true;
+   }
+    
+   @Override 
+   protected void onAddTopPanelWidgets(HorizontalPanel panel)
+   {
+      String[] labels = {constants_.packageLabel()};
+      String[] values = {"package"};
+      listProjectType_ = new SelectWidget(constants_.typeLabel(),
+                                          labels,
+                                          values,
+                                          false);
+      ElementIds.assignElementId(listProjectType_, ElementIds.NEW_PROJECT_TYPE);
+      listProjectType_.addChangeHandler(new ChangeHandler() {
+         @Override
+         public void onChange(ChangeEvent event)
+         {
+            txtProjectName_.setFocus(true);
+         }
+      });
+      listProjectType_.getElement().getStyle().setMarginRight(6, Unit.PX);
+      panel.add(listProjectType_);
+   }
+
+   @Override
+   protected String getDirNameLabel()
+   {
+      return constants_.packageNameLabel();
+   }
+
+   @Override
+   protected void onAddTopWidgets()
+   {
+      // code files panel
+      listCodeFiles_ = new CodeFilesList();
+      ElementIds.assignElementId(listCodeFiles_, ElementIds.NEW_PROJECT_SOURCE_FILES);
+      addWidget(listCodeFiles_);
+   }
+   
+   @Override 
+   protected void initialize(NewProjectInput input)
+   {
+      super.initialize(input);
+      
+      if (input.getContext().isRcppAvailable())
+         listProjectType_.addChoice(constants_.rcppPackageOption(), "package-rcpp");
+   }
+
+   @Override
+   public void focus()
+   {
+      super.focus();
+   }
+   
+   @Override
+   protected NewPackageOptions getNewPackageOptions()
+   {
+      return NewPackageOptions.create(
+            getProjectName(),
+            listProjectType_.getValue() == "package-rcpp",  
+            JsUtil.toJsArrayString(listCodeFiles_.getCodeFiles()));
+   }
+   
+   @Override
+   protected boolean createsPackage()
+   {
+      return true;
+   }
+
+   private SelectWidget listProjectType_;
+   private CodeFilesList listCodeFiles_;
+   
+   // Injected ----
+   private static final StudioClientProjectConstants constants_ = GWT.create(StudioClientProjectConstants.class);
+}

@@ -1,0 +1,144 @@
+/*
+ * FileIcon.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.common.filetypes;
+
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.resources.client.ImageResource;
+import com.google.gwt.user.client.ui.Image;
+import org.rstudio.core.client.resources.ImageResource2x;
+import org.rstudio.studio.client.common.StudioClientCommonConstants;
+
+public class FileIcon
+{
+   private static final StudioClientCommonConstants constants_ = GWT.create(StudioClientCommonConstants.class);
+
+   private static final FileIconResources ICONS = FileIconResources.INSTANCE;
+
+   public static final FileIcon PUBLIC_FOLDER_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconPublicFolder2x()), constants_.publicFolderDesc());
+
+   public static final FileIcon FOLDER_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconFolder2x()), constants_.folderDesc());
+
+   public static final FileIcon TEXT_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconText2x()), constants_.textFileDesc());
+
+   public static final FileIcon CSV_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconCsv2x()), "CSV");
+
+   public static final FileIcon PDF_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconPdf2x()), "PDF");
+
+   public static final FileIcon IMAGE_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconPng2x()), constants_.imageFileDesc());
+
+   public static final FileIcon RDATA_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconRdata2x()), "RData");
+
+   public static final FileIcon RDS_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconRdata2x()), "RDS");
+
+   public static final FileIcon RPROJECT_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconRproject2x()), "RProject");
+
+   public static final FileIcon PARENT_FOLDER_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconUpFolder2x()), constants_.parentFolderDesc());
+
+   public static final FileIcon OBJECT_EXPLORER_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconObjectExplorer2x()), constants_.exploreObjectDesc());
+
+   public static final FileIcon CODE_BROWSER_ICON =
+         new FileIcon(new ImageResource2x(ICONS.iconSourceViewer2x()), constants_.rSourceViewerDesc());
+
+   public static final FileIcon PROFILER_ICON =
+         new FileIcon(new ImageResource2x(FileIconResources.INSTANCE.iconProfiler2x()), constants_.profilerDesc());
+
+   public FileIcon(ImageResource imageResource, String description)
+   {
+      this(imageResource, description, null, null, null);
+   }
+
+   private FileIcon(ImageResource imageResource,
+                    String description,
+                    ImageResource badgeResource,
+                    String badgeDescription,
+                    String tooltip)
+   {
+      imageResource_ = imageResource;
+      description_ = description;
+      badgeResource_ = badgeResource;
+      badgeDescription_ = badgeDescription;
+      tooltip_ = tooltip;
+   }
+
+   // Returns a COPY of this icon decorated with a small corner badge (e.g. the
+   // symlink/alias indicator, #9924) and a per-file tooltip. Deliberately
+   // creates a new FileIcon rather than mutating this one: FileTypeRegistry
+   // returns shared singleton icons, so mutating one would leak the badge and
+   // the per-file tooltip onto every other row using the same icon. The tooltip
+   // is only rendered alongside the badge (FileIconRenderer draws neither for a
+   // plain icon).
+   public FileIcon withLinkBadge(ImageResource badgeResource,
+                                 String badgeDescription,
+                                 String tooltip)
+   {
+      return new FileIcon(imageResource_,
+                          description_,
+                          badgeResource,
+                          badgeDescription,
+                          tooltip);
+   }
+
+   public ImageResource getImageResource()
+   {
+      return imageResource_;
+   }
+
+   public String getDescription()
+   {
+      return description_;
+   }
+
+   // Optional corner badge composited over the icon; null for an ordinary icon.
+   public ImageResource getBadgeResource()
+   {
+      return badgeResource_;
+   }
+
+   // Accessible description for the badge (e.g. "Symbolic link"); null when no badge.
+   public String getBadgeDescription()
+   {
+      return badgeDescription_;
+   }
+
+   // Optional hover tooltip for the whole icon (e.g. "name -> target"); null when none.
+   public String getTooltip()
+   {
+      return tooltip_;
+   }
+
+   public Image getImage()
+   {
+      Image icon = new Image(getImageResource());
+      icon.setAltText(getDescription());
+      return icon;
+   }
+   private final ImageResource imageResource_;
+   private final String description_;
+   private final ImageResource badgeResource_;
+   private final String badgeDescription_;
+   private final String tooltip_;
+}
+
