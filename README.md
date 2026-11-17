@@ -27,17 +27,29 @@ the workflow therefore watches tags. A tag's appearance is the automation's
 release signal; this does not independently check the Posit download website.
 
 It uses GitHub's standard `macos-15` **arm64** runner, installs the dependencies
-pinned by the selected source release, builds the full Server/UI, and publishes:
+pinned by the selected source release, and reuses a cached native dependency
+snapshot when the release and dependency hashes match. Each GitHub Release has
+one uploaded asset: RStudioServer-<version>-arm64.pkg (for example,
+RStudioServer-2026.11.0-203-arm64.pkg). Release tags use the upstream version,
+such as v2026.11.0+203, without a macOS patch suffix.
 
-- `RStudioServer-<version>-arm64-macos.<patch-revision>.pkg`
-- The matching patched RStudio source archive
-- `PROVENANCE.json` with upstream/patch commits and package/source hashes
-- `SHA256SUMS` and installation notes
+A new patch revision rebuilds and replaces the package on that same release.
+An explicit manual tag also rebuilds an existing release. Replacement happens
+only after a successful build and package verification. Patch conflicts or build
+failures prevent publication. Only the publishing job can write releases.
 
-Releases are named `v2026.11.0+203-macos.3`, for example. Existing published assets
-are not overwritten. Increment `revision` in `patches/series.json` when updating
-the patch series. Patch conflicts or build/package failures prevent publication.
-Only the separate publishing job has permission to write releases.
+GitHub automatically adds Source code (zip) and Source code (tar.gz). These are
+archives of this small patch repository at the release tag, **not** the full
+patched RStudio source. They cannot be replaced with custom source assets.
+To reconstruct the matching full source, fetch the upstream tag and apply the
+patch series using the Local build instructions below. The release tag is
+updated to the patch commit used by each successful replacement build.
+
+The full patched source archive, PROVENANCE.json, checksums and build logs stay
+in Actions artifacts for 90 days; they are not attached to the Release. The
+release body contains the package SHA256, upstream/patch commits, and a link to
+the build. The patches and exact upstream tag remain available after the Actions
+artifacts expire.
 
 The initial workflow produces an **ad hoc signed app in an unsigned PKG**.
 Developer ID signing and Apple notarization are not configured. R is installed
@@ -47,7 +59,7 @@ three optional PAM/account/service developer scripts are not run by CI.
 To start a specific build, open **Actions → Build and publish macOS Server → Run
 workflow**, enter `v2026.11.0+203`, and choose whether to publish. Leaving the tag
 blank processes pending versions. Unpublished test builds remain available as
-Actions artifacts for 14 days. GitHub can disable schedules on inactive public
+Actions artifacts for 90 days. GitHub can disable schedules on inactive public
 repositories; check the Actions page if scheduled runs stop.
 
 ## Install, upgrade and remove

@@ -42,10 +42,10 @@ class Release:
         return {
             "tag": self.tag,
             "version": self.version,
-            "release_tag": self.tag + "-macos." + str(revision),
-            "artifact": self.tag.replace("+", "-") + "-macos." + str(revision),
+            "release_tag": self.tag,
+            "artifact": self.tag.replace("+", "-"),
             "package": "RStudioServer-" + self.version.replace("+", "-")
-                       + "-arm64-macos." + str(revision) + ".pkg",
+                       + "-arm64.pkg",
         }
 
 
@@ -101,7 +101,9 @@ def plan(tags, existing, revision, minimum, requested="", limit=4):
         candidates = [selected]
     else:
         candidates = sorted(set(candidates), key=lambda release: release.parts)
-    published = {item["tag_name"] for item in existing if not item.get("draft", False)}
+    marker = "<!-- macos-patch-revision: " + str(revision) + " -->"
+    published = {item["tag_name"] for item in existing if not item.get("draft", False)
+                 and marker in item.get("body", "")}
     all_versions = [release.parts for release in candidates]
     for item in existing:
         try:
@@ -112,7 +114,7 @@ def plan(tags, existing, revision, minimum, requested="", limit=4):
     results = []
     for release in candidates:
         item = release.item(revision)
-        if item["release_tag"] not in published:
+        if requested or item["release_tag"] not in published:
             item["make_latest"] = release.parts == newest
             results.append(item)
     return results[:limit]
@@ -196,9 +198,16 @@ def provenance_command(args):
         "Install R separately. Quit active Server sessions and the control app before "
         "installing/upgrading. Open RStudioServer.app afterward and approve background "
         "startup in System Settings when requested. Existing user homes are preserved.\n\n"
-        "The matching patched source, checksums and build provenance are attached. "
+        "GitHub's automatic source ZIP/tar.gz contain the patch repository, not the full RStudio tree. "
+        "Reconstruct the matching source using the upstream tag and tools/release.py apply. "
+        "The full patched source and build records are also retained in the linked Actions run. "
         "Live account/PAM and service tests are optional developer tools and do not run in CI.\n"
     )
+    notes += ("\n\nUpstream: " + release.tag + " (" + record["upstream_commit"] + ").\n"
+              + "Patch repository commit: " + record["patch_repository_commit"] + ".\n"
+              + "Package SHA256: " + record["package_sha256"] + ".\n\n"
+              + "[Build and source artifacts](" + record["workflow_url"] + ").\n\n"
+              + "<!-- macos-patch-revision: " + str(data["revision"]) + " -->\n")
     (output / "RELEASE-NOTES.md").write_text(notes)
     assets = [package, source_archive, output / "PROVENANCE.json", output / "RELEASE-NOTES.md"]
     (output / "SHA256SUMS").write_text("".join(digest(path) + "  " + path.name + "\n" for path in assets))
@@ -229,13 +238,31 @@ def publish_command(args):
             raise RuntimeError(result.stderr)
         command(["gh", "release", "create", item["release_tag"], "--repo", args.repository,
                  "--target", args.commit, "--title", "RStudio Server " + release.version
-                 + " for macOS arm64 (patch " + str(data["revision"]) + ")",
+                 + " for macOS arm64",
                  "--notes-file", str(output / "RELEASE-NOTES.md"), "--draft"])
-    elif not json.loads(result.stdout)["draft"]:
-        raise ValueError("A published release already exists; increment the patch revision instead of replacing it")
+    # Check all build artifacts above, but attach only the completed installer.
     command(["gh", "release", "upload", item["release_tag"], "--repo", args.repository,
-             "--clobber", *assets, str(output / "SHA256SUMS")])
+             "--clobber", str(output / item["package"])])
+    uploaded = json.loads(subprocess.check_output(["gh", "api", "repos/" + args.repository
+        + "/releases/tags/" + quote(item["release_tag"], safe="")], text=True))
+    package_asset = next(asset for asset in uploaded["assets"] if asset["name"] == item["package"])
+    if package_asset.get("digest") != "sha256:" + digest(output / item["package"]):
+        raise ValueError("Uploaded package digest does not match the completed build")
+    # Keep the automatic patch-repository archives current on replacement builds.
+    reference = "repos/" + args.repository + "/git/ref/tags/" + quote(item["release_tag"], safe="")
+    result = subprocess.run(["gh", "api", reference], capture_output=True, text=True)
+    if result.returncode:
+        if "HTTP 404" not in result.stderr:
+            raise RuntimeError(result.stderr)
+        command(["gh", "api", "--method", "POST", "repos/" + args.repository + "/git/refs",
+                 "-f", "ref=refs/tags/" + item["release_tag"], "-f", "sha=" + args.commit])
+    else:
+        command(["gh", "api", "--method", "PATCH", "repos/" + args.repository
+                 + "/git/refs/tags/" + quote(item["release_tag"], safe=""),
+                 "-f", "sha=" + args.commit, "-F", "force=true"])
     command(["gh", "release", "edit", item["release_tag"], "--repo", args.repository,
+             "--title", "RStudio Server " + release.version + " for macOS arm64",
+             "--notes-file", str(output / "RELEASE-NOTES.md"),
              "--draft=false", "--latest=" + str(args.latest).lower()])
 
 

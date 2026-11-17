@@ -67,7 +67,7 @@ jobs:
         env:
           UPSTREAM_TAG: ${{ matrix.tag }}
         run: python3 patch-repo/tools/release.py apply --source upstream --tag "$UPSTREAM_TAG"
-      - name: Cache release-specific native dependencies
+      - name: Restore release-specific native dependency snapshot
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -75,6 +75,8 @@ jobs:
             upstream/dependencies/common/node
             upstream/dependencies/common/gwtproject
           key: macos-15-arm64-${{ matrix.artifact }}-${{ hashFiles('upstream/dependencies/tools/rstudio-tools.sh', 'upstream/dependencies/common/install-*', 'upstream/dependencies/osx/install-*') }}
+          restore-keys: |
+            macos-15-arm64-${{ matrix.artifact }}-macos.1-${{ hashFiles('upstream/dependencies/tools/rstudio-tools.sh', 'upstream/dependencies/common/install-*', 'upstream/dependencies/osx/install-*') }}
       - name: Install arm64 dependencies and build complete Server PKG
         env:
           UPSTREAM_TAG: ${{ matrix.tag }}
@@ -87,7 +89,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
       - name: Retain build logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -95,7 +97,7 @@ jobs:
           name: logs-${{ matrix.artifact }}
           path: upstream/build-macos-server/*.log
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 90
 
   publish:
     needs: [plan, build]
