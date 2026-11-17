@@ -1,0 +1,563 @@
+/*
+ * BranchToolbarButton.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.workbench.views.vcs;
+
+import com.google.gwt.aria.client.Roles;
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.core.client.JsArrayString;
+import com.google.gwt.json.client.JSONArray;
+import com.google.gwt.core.client.Scheduler;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.dom.client.Style.Unit;
+import com.google.gwt.event.logical.shared.AttachEvent;
+import com.google.gwt.event.logical.shared.HasValueChangeHandlers;
+import com.google.gwt.event.logical.shared.ValueChangeEvent;
+import com.google.gwt.event.logical.shared.ValueChangeHandler;
+import com.google.gwt.event.shared.HandlerRegistration;
+import com.google.gwt.safehtml.shared.SafeHtmlUtils;
+import com.google.gwt.user.client.Command;
+import com.google.gwt.user.client.ui.MenuItem;
+import com.google.inject.Inject;
+import com.google.inject.Provider;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.rstudio.core.client.JsVectorString;
+import org.rstudio.core.client.MapUtil;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.WidgetHandlerRegistration;
+import org.rstudio.core.client.command.AppCommand;
+import com.google.gwt.resources.client.ImageResource;
+import org.rstudio.core.client.resources.ImageResource2x;
+import org.rstudio.core.client.theme.res.ThemeResources;
+import org.rstudio.core.client.js.JsUtil;
+import org.rstudio.core.client.theme.res.ThemeStyles;
+import org.rstudio.core.client.widget.MenuSearchHeader;
+import org.rstudio.core.client.widget.ScrollableToolbarPopupMenu;
+import org.rstudio.core.client.widget.ToolbarButton;
+import org.rstudio.core.client.widget.ToolbarMenuButton;
+import org.rstudio.core.client.widget.ToolbarPopupMenu;
+import org.rstudio.studio.client.common.icons.StandardIcons;
+import org.rstudio.studio.client.common.vcs.BranchesInfo;
+import org.rstudio.studio.client.common.vcs.WorktreeInfo;
+import org.rstudio.studio.client.workbench.views.vcs.common.events.BranchCaptionChangedEvent;
+import org.rstudio.studio.client.workbench.views.vcs.common.events.VcsRefreshEvent;
+import org.rstudio.studio.client.workbench.views.vcs.git.model.GitState;
+
+public class BranchToolbarButton extends ToolbarMenuButton
+                                 implements HasValueChangeHandlers<String>,
+                                            VcsRefreshEvent.Handler
+{
+   private static final ViewVcsConstants constants_ = GWT.create(ViewVcsConstants.class);
+   protected class SwitchBranchCommand implements Command
+   {
+      public SwitchBranchCommand(String branchLabel, String branchValue)
+      {
+         branchLabel_ = branchLabel;
+         branchValue_ = branchValue;
+      }
+
+      @Override
+      public void execute()
+      {
+         setBranchCaption(branchLabel_);
+         ValueChangeEvent.fire(BranchToolbarButton.this, branchValue_);
+      }
+
+      private final String branchLabel_;
+      private final String branchValue_;
+   }
+
+   protected class SwitchWorktreeCommand implements Command
+   {
+      public SwitchWorktreeCommand(WorktreeInfo worktree)
+      {
+         worktree_ = worktree;
+      }
+
+      @Override
+      public void execute()
+      {
+         // the right-hand image is the "open in a new session" action
+         onWorktreeSelected(worktree_, menu_.wasRightImageClicked());
+      }
+
+      private final WorktreeInfo worktree_;
+   }
+
+   @Inject
+   public BranchToolbarButton(final Provider<GitState> pVcsState)
+   {
+      super(ToolbarButton.NoText,
+            constants_.switchBranch(),
+            StandardIcons.INSTANCE.empty_command(),
+            new ScrollableToolbarPopupMenu());
+
+      pVcsState_ = pVcsState;
+
+      new WidgetHandlerRegistration(this)
+      {
+         @Override
+         protected HandlerRegistration doRegister()
+         {
+            return pVcsState.get().addVcsRefreshHandler(
+                                                BranchToolbarButton.this, true);
+         }
+      };
+
+      menu_ = (ScrollableToolbarPopupMenu) getMenu();
+      menu_.setAutoHideRedundantSeparators(false);
+      search_ = new MenuSearchHeader(this,
+                                     menu_,
+                                     constants_.searchByBranchName(),
+                                     this::onSearch);
+
+      menu_.addAttachHandler(new AttachEvent.Handler()
+      {
+         @Override
+         public void onAttachOrDetach(AttachEvent event)
+         {
+            if (!event.isAttached())
+               return;
+
+            // each opening starts with every branch listed
+            search_.clear();
+            if (menuRebuildRequired_)
+               menuRebuildRequired_ = !rebuildMenu();
+            else
+               onSearch();
+
+            Scheduler.get().scheduleDeferred(() ->
+            {
+               Element tableEl = menu_.getMenuTableElement();
+               if (tableEl != null)
+                  menuWidth_ = tableEl.getOffsetWidth();
+            });
+         }
+      });
+   }
+
+   public void setBranchCaption(String caption)
+   {
+      if (StringUtil.isNullOrEmpty(caption))
+         caption = NO_BRANCH;
+
+      setText(caption);
+      fireEvent(new BranchCaptionChangedEvent(caption));
+   }
+
+   @Override
+   public HandlerRegistration addValueChangeHandler(ValueChangeHandler<String> handler)
+   {
+      return addHandler(handler, ValueChangeEvent.getType());
+   }
+
+   public HandlerRegistration addBranchCaptionChangedHandler(BranchCaptionChangedEvent.Handler handler) {
+      return addHandler(handler, BranchCaptionChangedEvent.TYPE);
+   }
+
+   @Override
+   public void onVcsRefresh(VcsRefreshEvent event)
+   {
+      JsVectorString branches = pVcsState_.get().getBranchInfo().getBranches().cast();
+      if (branches.length() != branches_.length())
+      {
+         branches_ = branches.slice().cast();
+         menuRebuildRequired_ = true;
+         return;
+      }
+
+      for (int i = 0; i < branches.length(); i++)
+      {
+         if (!StringUtil.equals(branches.get(i), branches_.get(i)))
+         {
+            branches_ = branches.slice();
+            menuRebuildRequired_ = true;
+            return;
+         }
+      }
+
+      // every field shows in the menu or steers what selecting an entry does
+      // (a prunable one is dropped, a project file is opened), so compare whole
+      String worktreeKey = new JSONArray(pVcsState_.get().getBranchInfo().getWorktrees()).toString();
+      if (!StringUtil.equals(worktreeKey, worktreeKey_))
+      {
+         worktreeKey_ = worktreeKey;
+         menuRebuildRequired_ = true;
+      }
+   }
+
+   // Subclasses that can activate a worktree override these.
+   protected boolean showWorktrees()
+   {
+      return false;
+   }
+
+   // The icon shown at the right of a worktree entry to open it in a new
+   // session, or null when that isn't available
+   protected ImageResource openWorktreeInNewSessionImage()
+   {
+      return null;
+   }
+
+   protected void onWorktreeSelected(WorktreeInfo worktree, boolean newSession)
+   {
+   }
+
+   // Whether the menu is filtered by a search
+   protected boolean isSearching()
+   {
+      return !search_.getQuery().isEmpty();
+   }
+
+   // Returns false when branch information isn't available yet (the menu was
+   // opened before the first status refresh completed), in which case the
+   // caller should try again on the next open.
+   private boolean rebuildMenu()
+   {
+      BranchesInfo branchInfo = pVcsState_.get().getBranchInfo();
+      if (branchInfo == null)
+      {
+         onBeforePopulateMenu(menu_);
+         populateEmptyMenu(menu_);
+         return false;
+      }
+
+      JsArrayString branches = branchInfo.getBranches();
+      if (branches.length() == 0)
+      {
+         onBeforePopulateMenu(menu_);
+         populateEmptyMenu(menu_);
+         return true;
+      }
+
+      // separate branches based on remote name
+      Map<String, List<String>> branchMap = new LinkedHashMap<>();
+      List<String> localBranches = new ArrayList<>();
+      branchMap.put(LOCAL_BRANCHES, localBranches);
+      for (String branch : JsUtil.asIterable(branches))
+      {
+         if (branch.startsWith("remotes/"))
+         {
+            JsArrayString parts = StringUtil.split(branch, "/");
+            if (parts.length() > 2)
+            {
+               String remote = parts.get(1);
+               if (!branchMap.containsKey(remote))
+                  branchMap.put(remote, new ArrayList<>());
+               List<String> remoteBranches = branchMap.get(remote);
+               remoteBranches.add(branch);
+            }
+         }
+         else
+         {
+            localBranches.add(branch);
+         }
+      }
+
+      // branches checked out in another worktree can't be checked out here;
+      // remember where they live so that selecting one opens that worktree
+      // (or, for a worktree whose directory is gone -- git holds its branch
+      // all the same -- says what is in the way)
+      worktrees_ = new ArrayList<>();
+      worktreeBranches_ = new HashMap<>();
+      if (showWorktrees())
+      {
+         for (WorktreeInfo worktree : JsUtil.asIterable(branchInfo.getWorktrees()))
+         {
+            if (worktree.isBare())
+               continue;
+
+            if (!worktree.isCurrent() && !StringUtil.isNullOrEmpty(worktree.getBranch()))
+               worktreeBranches_.put(worktree.getBranch(), worktree);
+
+            if (!worktree.isPrunable())
+               worktrees_.add(worktree);
+         }
+
+         // the main worktree alone isn't worth a section
+         if (worktrees_.size() < 2)
+            worktrees_.clear();
+      }
+
+      // record the branches used on first populate
+      initialBranchMap_ = branchMap;
+
+      onBeforePopulateMenu(menu_);
+      populateMenu(menu_, branchMap);
+      return true;
+   }
+
+   private void populateWorktrees(final ToolbarPopupMenu menu, final String query)
+   {
+      List<WorktreeInfo> worktrees = new ArrayList<>();
+      for (WorktreeInfo worktree : worktrees_)
+      {
+         if (query.isEmpty() ||
+             worktree.getDisplayName().toLowerCase().indexOf(query) != -1 ||
+             worktree.getPath().toLowerCase().indexOf(query) != -1)
+         {
+            worktrees.add(worktree);
+         }
+      }
+
+      if (worktrees.isEmpty())
+         return;
+
+      // worktrees nested inside the main worktree read better relative to it
+      String mainPath = null;
+      for (WorktreeInfo worktree : worktrees_)
+      {
+         if (worktree.isMain())
+            mainPath = worktree.getPath();
+      }
+
+      Element heading = menu.addSubheader(WORKTREES);
+      menu.addSeparator();
+
+      for (WorktreeInfo worktree : worktrees)
+      {
+         String name = worktree.getDisplayName();
+
+         // nested worktrees read relative to the main one; others keep only
+         // their last two path components, with the full path as a tooltip
+         String path = worktree.getPath();
+         if (mainPath != null && path.startsWith(mainPath + "/"))
+         {
+            path = path.substring(mainPath.length() + 1);
+         }
+         else
+         {
+            String[] parts = path.split("/");
+            if (parts.length > 3)
+               path = "\u2026/" + parts[parts.length - 2] + "/" + parts[parts.length - 1];
+         }
+
+         String label = SafeHtmlUtils.htmlEscape(name) +
+               " <span class=\"" + ThemeStyles.INSTANCE.menuItemSubtitle() + "\"" +
+               " title=\"" + SafeHtmlUtils.htmlEscape(worktree.getPath()) + "\">" +
+               SafeHtmlUtils.htmlEscape(path) + "</span>";
+
+         ImageResource2x check = worktree.isCurrent()
+               ? new ImageResource2x(ThemeResources.INSTANCE.menuCheck2x())
+               : null;
+
+         ImageResource newSession = worktree.isCurrent() ? null : openWorktreeInNewSessionImage();
+
+         String html = AppCommand.formatMenuLabel(
+               check,
+               label,
+               true,
+               null,
+               newSession,
+               constants_.openWorktreeInNewSession());
+
+         // the current worktree is shown for orientation only; selecting it
+         // just closes the menu
+         Command command = worktree.isCurrent()
+               ? () -> {}
+               : new SwitchWorktreeCommand(worktree);
+         // The check mark is hidden from screen readers, so the current
+         // worktree is the checked one of a radio group
+         MenuItem item = new MenuItem(html,
+                                      true,
+                                      Roles.getMenuitemradioRole(),
+                                      worktree.isCurrent(),
+                                      command);
+         if (worktree == worktrees.get(0))
+            ToolbarPopupMenu.nameWithSubheader(item, heading);
+         menu.addItem(item);
+      }
+   }
+
+   private void populateEmptyMenu(final ToolbarPopupMenu menu)
+   {
+      menu.addSubheader(NO_BRANCHES_AVAILABLE);
+   }
+
+   private void populateMenu(final ToolbarPopupMenu menu, final Map<String, List<String>> branchMap)
+   {
+      populateWorktrees(menu, search_.getQuery());
+
+      // a search can leave worktrees alone in the menu
+      if (branchMap.isEmpty())
+      {
+         if (menu.getItemCount() == 0)
+            populateEmptyMenu(menu);
+         else
+            onMenuPopulated(menu);
+         return;
+      }
+
+      MapUtil.forEach(branchMap, new MapUtil.ForEachCommand<String, List<String>>()
+      {
+         @Override
+         public void execute(final String caption, final List<String> branches)
+         {
+            // place commonly-used branches at the top
+            Collections.sort(branches, new Comparator<String>()
+            {
+               private final String[] specialBranches_ = new String[] {
+                     "master",
+                     "develop",
+                     "trunk"
+               };
+
+               @Override
+               public int compare(String o1, String o2)
+               {
+                  for (String specialBranch : specialBranches_)
+                  {
+                     if (o1.endsWith(specialBranch))
+                        return -1;
+                     else if (o2.endsWith(specialBranch))
+                        return 1;
+                  }
+
+                  return o1.compareToIgnoreCase(o2);
+               }
+            });
+
+            String heading = caption == LOCAL_BRANCHES
+                  ? LOCAL_BRANCHES
+                  : constants_.remoteBranchCaption(caption);
+            Element headingEl = menu.addSubheader(heading);
+            menu.addSeparator();
+
+            // truncate list when we have too many branches
+            int n = 0;
+            for (String branch : branches)
+            {
+               // skip detached branches
+               if (branch.contains("HEAD detached at"))
+                  continue;
+
+               // skip HEAD branches
+               if (branch.contains("HEAD ->"))
+                  continue;
+
+               // construct branch label without remotes prefix
+               final String branchLabel = branch.replaceAll("^remotes/" + caption + "/", "");
+               final String branchValue = branch.replaceAll("\\s+\\-\\>.*", "");
+
+               // a branch checked out in another worktree opens that worktree
+               WorktreeInfo worktree = worktreeBranches_.get(branchValue);
+               MenuItem item;
+               if (worktree != null && caption == LOCAL_BRANCHES)
+               {
+                  String label = worktree.isPrunable()
+                        ? constants_.worktreeMissingSuffix(branchLabel)
+                        : constants_.worktreeSuffix(branchLabel);
+                  item = new MenuItem(label, new SwitchWorktreeCommand(worktree));
+               }
+               else
+               {
+                  item = new MenuItem(
+                        branchLabel,
+                        new SwitchBranchCommand(branchLabel, branchValue));
+               }
+
+               if (n == 0)
+                  ToolbarPopupMenu.nameWithSubheader(item, headingEl);
+               menu.addItem(item);
+
+               // update branch count
+               if (n++ > MAX_BRANCHES)
+                  break;
+            }
+         }
+      });
+
+      onMenuPopulated(menu);
+   }
+
+   // Holds the width a search filter would otherwise shrink
+   private void onMenuPopulated(ToolbarPopupMenu menu)
+   {
+      if (menuWidth_ != 0)
+      {
+         Element tableEl = menu_.getMenuTableElement();
+         if (tableEl != null)
+            tableEl.getStyle().setWidth(menuWidth_, Unit.PX);
+      }
+   }
+
+   protected void onBeforePopulateMenu(ToolbarPopupMenu rootMenu)
+   {
+      menu_.clearItems();
+   }
+
+   private void onSearch()
+   {
+      // nothing to filter until branch information has arrived
+      if (initialBranchMap_ == null)
+         return;
+
+      // fast path -- no query to use
+      String query = search_.getQuery();
+      if (query.isEmpty())
+      {
+         onBeforePopulateMenu(menu_);
+         populateMenu(menu_, initialBranchMap_);
+         return;
+      }
+
+      // iterate through initial branch map and copy branches
+      // matching the current query. TODO: should we re-order
+      // based on how 'close' a match we have?
+      Map<String, List<String>> branchMap = new HashMap<>();
+      for (String key : initialBranchMap_.keySet())
+      {
+         List<String> filteredBranches = new ArrayList<>();
+         List<String> branches = initialBranchMap_.get(key);
+         for (String branch : branches)
+            if (branch.toLowerCase().indexOf(query) != -1)
+               filteredBranches.add(branch);
+
+         if (!filteredBranches.isEmpty())
+            branchMap.put(key, filteredBranches);
+      }
+
+      // re-populate
+      onBeforePopulateMenu(menu_);
+      populateMenu(menu_, branchMap);
+   }
+
+   protected final Provider<GitState> pVcsState_;
+
+   private final ScrollableToolbarPopupMenu menu_;
+   private final MenuSearchHeader search_;
+   private int menuWidth_ = 0;
+   private Map<String, List<String>> initialBranchMap_;
+
+   private boolean menuRebuildRequired_ = true;
+   private JsVectorString branches_ = JsVectorString.createVector();
+   private String worktreeKey_ = "";
+   private List<WorktreeInfo> worktrees_ = new ArrayList<>();
+   private Map<String, WorktreeInfo> worktreeBranches_ = new HashMap<>();
+
+   private static final int MAX_BRANCHES = 100;
+
+   private static final String NO_BRANCH = constants_.noBranchParentheses();
+   private static final String NO_BRANCHES_AVAILABLE = constants_.noBranchesAvailableParentheses();
+   private static final String LOCAL_BRANCHES = constants_.localBranchesParentheses();
+   private static final String WORKTREES = constants_.worktreesParentheses();
+}

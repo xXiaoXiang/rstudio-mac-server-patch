@@ -1,0 +1,465 @@
+/*
+ * XTermNative.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+package org.rstudio.studio.client.workbench.views.terminal.xterm;
+
+import org.rstudio.core.client.CommandWithArg;
+
+import com.google.gwt.core.client.JavaScriptObject;
+import com.google.gwt.core.client.JsArrayString;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.user.client.Command;
+
+/**
+ * <code>JavaScriptObject</code> wrapper for xterm.js
+ *
+ * Reliance on xterm.js implementation details is marked with XTERM_IMP.
+ * Be careful of these when updating to a newer xterm.js build.
+ * The rest uses documented APIs: https://xtermjs.org/docs/api/terminal/
+ */
+public class XTermNative extends JavaScriptObject
+{
+   // Required by JavaScriptObject subclasses
+   protected XTermNative()
+   {
+   }
+
+   /**
+    * Remove event handlers and detach from parent node.
+    */
+   public final native void dispose() /*-{
+      this.dispose();
+   }-*/;
+
+   /**
+    * Fit the terminal to available space.
+    */
+   public final native void fit() /*-{
+      this.rstudioFitAddon_.fit();
+   }-*/;
+
+   /**
+    * Write a line of output to the terminal, appending CR/LF.
+    * @param data String to write
+    */
+   public final native void writeln(String data) /*-{
+      this.writeln(data);
+   }-*/;
+
+   /**
+    * Write text to the terminal.
+    * @param data String to write
+    */
+   public final native void write(String data) /*-{
+      this.write(data);
+   }-*/;
+
+   /**
+    * Compute and return available dimensions for terminal.
+    * @return Visible number of columns and rows
+    */
+   public final native XTermDimensions proposeGeometry() /*-{
+      return this.rstudioFitAddon_.proposeDimensions();
+   }-*/;
+
+   public final native void focus() /*-{
+      this.focus();
+   }-*/;
+
+   public final native void blur() /*-{
+      this.blur();
+   }-*/;
+
+   public final native void scrollLines(int lineCount) /*-{
+      this.scrollLines(lineCount);
+   }-*/;
+
+   public final native void scrollToBottom() /*-{
+      this.scrollToBottom();
+   }-*/;
+
+   public final native void reset() /*-{
+      this.reset();
+   }-*/;
+
+   public final native void clear() /*-{
+      this.clear();
+   }-*/;
+
+   public final native void addClass(String classStr) /*-{
+      this.element.classList.add(classStr);
+   }-*/;
+
+   public final native void removeClass(String classStr) /*-{
+      this.element.classList.remove(classStr);
+   }-*/;
+
+   // XTERM_IMP
+   public final native int cursorX() /*-{
+      return this.buffer.x;
+   }-*/;
+
+   // XTERM_IMP
+   public final native int cursorY() /*-{
+      return this.buffer.y;
+   }-*/;
+
+   // XTERM_IMP
+   public final native boolean altBufferActive() /*-{
+      return this._core.buffers.active == this._core.buffers.alt;
+   }-*/;
+
+   public final native void showPrimaryBuffer() /*-{
+      this.write("\x1b[?1047l"); // show primary buffer
+      this.write("\x1b[m"); // reset all visual attributes
+      this.write("\x1b[?9l"); // reset mouse mode
+   }-*/;
+
+   public final native void showAltBuffer() /*-{
+      this.write("\x1b[?1047h"); // show alt buffer
+   }-*/;
+
+   // XTERM_IMP
+   public final native String currentLine() /*-{
+      var lineBuf = this._core.buffer.lines.get(this.y + this.ybase);
+      if (!lineBuf) // resize may be in progress
+         return null;
+      return lineBuf.translateToString();
+   }-*/;
+
+   /**
+    * Install a handler for user input (typing). Only one handler at a
+    * time may be installed. Previous handler will be overwritten.
+    * @param command handler for data typed by the user
+    */
+   public final native void onTerminalData(CommandWithArg<String> command) /*-{
+      this.dataHandler = this.onData(
+         $entry(function(data) {
+            command.@org.rstudio.core.client.CommandWithArg::execute(Ljava/lang/Object;)(data);
+         }));
+   }-*/;
+
+   /**
+    * Install a handler for title events (via escape sequence).
+    * @param command handler for title text
+    */
+   public final native void onTitleData(CommandWithArg<String> command) /*-{
+      this.handleTitle = this.onTitleChange(
+         $entry(function(title) {
+            command.@org.rstudio.core.client.CommandWithArg::execute(Ljava/lang/Object;)(title);
+         }));
+   }-*/;
+
+   /**
+    * Install a handler for bell events (BEL character received).
+    * @param command handler to execute when bell sounds
+    */
+   public final native void onBellEvent(Command command) /*-{
+      this.bellHandler = this.onBell(
+         $entry(function() {
+            command.@com.google.gwt.user.client.Command::execute()();
+         }));
+   }-*/;
+
+   public final native void updateTheme(XTermTheme theme) /*-{
+      this.options.theme = theme;
+   }-*/;
+
+   public final native void updateBooleanOption(String option, boolean value) /*-{
+      this.options[option] = value;
+   }-*/;
+
+   public final native void updateStringOption(String option, String value) /*-{
+      this.options[option] = value;
+   }-*/;
+
+   public final native void updateDoubleOption(String option, double value) /*-{
+      this.options[option] = value;
+   }-*/;
+
+   public final native void refresh() /*-{
+      this.refresh(0, this.rows - 1);
+   }-*/;
+
+   public final native void setTabMovesFocus(boolean movesFocus) /*-{
+      this.tabMovesFocus = movesFocus;
+   }-*/;
+
+   /**
+    * Register the link provider that makes file paths in terminal output
+    * clickable (with the platform's open-link modifier held). Candidate
+    * validation, opening, and the hover hint are delegated to the widget.
+    * @param widget owning widget, called back on the UI thread
+    * @param isMac use Cmd rather than Ctrl as the activation modifier
+    */
+   public final native void registerFileLinkProvider(XTermWidget widget, boolean isMac) /*-{
+      if (this.rstudioFileLinks_ || !$wnd.RStudioFileLinks)
+         return;
+
+      var host = {
+         isMac: isMac,
+         resolve: $entry(function(candidates, callback) {
+            widget.@org.rstudio.studio.client.workbench.views.terminal.xterm.XTermWidget::resolveFileLinksNative(Lcom/google/gwt/core/client/JsArrayString;Lcom/google/gwt/core/client/JavaScriptObject;)(candidates, callback);
+         }),
+         open: $entry(function(path, line, column) {
+            widget.@org.rstudio.studio.client.workbench.views.terminal.xterm.XTermWidget::openFileLink(Ljava/lang/String;II)(path, line, column);
+         }),
+         hover: $entry(function(path) {
+            widget.@org.rstudio.studio.client.workbench.views.terminal.xterm.XTermWidget::showFileLinkHint(Ljava/lang/String;)(path);
+         }),
+         leave: $entry(function() {
+            widget.@org.rstudio.studio.client.workbench.views.terminal.xterm.XTermWidget::hideFileLinkHint()();
+         })
+      };
+
+      try {
+         var provider = new $wnd.RStudioFileLinks.FileLinkProvider(this, host);
+         this.rstudioFileLinks_ = provider;
+         this.rstudioFileLinksRegistration_ = this.registerLinkProvider(provider);
+      } catch (error) {
+         console.error("Error registering file link provider: " + error);
+      }
+   }-*/;
+
+   /**
+    * Forget cached file link resolutions; used when the terminal's working
+    * directory changes, since relative paths then resolve differently.
+    */
+   public final native void clearFileLinkCache() /*-{
+      if (this.rstudioFileLinks_)
+         this.rstudioFileLinks_.clearCache();
+   }-*/;
+
+   /**
+    * Release any link the file link provider is still showing; used when
+    * the terminal is torn down, since xterm does not tell a hovered link that
+    * the mouse has left when its linkifier is disposed.
+    */
+   public final native void disposeFileLinkProvider() /*-{
+      if (this.rstudioFileLinks_)
+         this.rstudioFileLinks_.dispose();
+   }-*/;
+
+   /**
+    * Invoke a JavaScript callback with an array of strings.
+    */
+   public static native void invokeCallback(JavaScriptObject callback, JsArrayString result) /*-{
+      callback(result);
+   }-*/;
+
+   /**
+    * Load the WebGL addon for GPU-accelerated rendering.
+    * @return true if WebGL addon was loaded successfully, false otherwise
+    */
+   public final native boolean loadWebGLAddon() /*-{
+      if (this.rstudioWebGLAddon_) {
+         return true; // Already loaded
+      }
+      try {
+         if ($wnd.WebglAddon && $wnd.WebglAddon.WebglAddon) {
+            this.rstudioWebGLAddon_ = new $wnd.WebglAddon.WebglAddon();
+            this.loadAddon(this.rstudioWebGLAddon_);
+            return true;
+         }
+      } catch (error) {
+         console.error("Error loading WebglAddon: " + error);
+         this.rstudioWebGLAddon_ = null;
+      }
+      return false;
+   }-*/;
+
+   /**
+    * Install a handler for WebGL context loss on the loaded WebGL addon.
+    * The handler fires once the addon has given up waiting for the browser
+    * to restore a lost context (browser-restored losses recover silently
+    * inside the addon); it is expected to dispose the addon, reverting to
+    * the DOM renderer. At most one handler is installed per loaded addon;
+    * the registration is disposed along with the addon.
+    * @param command handler to execute when the WebGL context is lost
+    */
+   public final native void onWebGLContextLoss(Command command) /*-{
+      if (this.rstudioWebGLAddon_ && !this.rstudioWebGLContextLossHandler_) {
+         this.rstudioWebGLContextLossHandler_ = this.rstudioWebGLAddon_.onContextLoss(
+            $entry(function() {
+               command.@com.google.gwt.user.client.Command::execute()();
+            }));
+      }
+   }-*/;
+
+   /**
+    * Unload the WebGL addon, reverting to DOM rendering.
+    */
+   public final native void unloadWebGLAddon() /*-{
+      if (this.rstudioWebGLAddon_) {
+         try {
+            this.rstudioWebGLAddon_.dispose();
+         } catch (error) {
+            console.error("Error disposing WebglAddon: " + error);
+         }
+         this.rstudioWebGLAddon_ = null;
+         this.rstudioWebGLContextLossHandler_ = null;
+      }
+   }-*/;
+
+   /**
+    * Check if WebGL addon is currently loaded.
+    * @return true if WebGL addon is active
+    */
+   public final native boolean isWebGLAddonLoaded() /*-{
+      return !!this.rstudioWebGLAddon_;
+   }-*/;
+
+   /**
+    * Factory to create a native Javascript terminal object.
+    *
+    * @param container HTML element to attach to
+    * @param options xterm.js settings
+    *
+    * @return Native Javascript Terminal object wrapped in a <code>JavaScriptObject</code>.
+    */
+   public static native XTermNative createTerminal(Element container,
+                                                   XTermOptions options,
+                                                   boolean clickableLinks,
+                                                   boolean tabMovesFocus) /*-{
+      try {
+         var nativeTerm_ = new $wnd.Terminal(options);
+         try {
+            nativeTerm_.rstudioFitAddon_ = new $wnd.FitAddon.FitAddon();
+            nativeTerm_.loadAddon(nativeTerm_.rstudioFitAddon_);
+         } catch (error) {
+            console.error("Error loading FitAddon: " + error);
+         }
+         if (clickableLinks) {
+            try {
+               // Custom handler to open URLs in the system browser
+               var linkHandler = function(event, uri) {
+                  // Use desktop bridge if available (RStudio Desktop),
+                  // otherwise fall back to window.open (RStudio Server)
+                  if ($wnd.desktop && $wnd.desktop.browseUrl) {
+                     $wnd.desktop.browseUrl(uri);
+                  } else {
+                     $wnd.open(uri, '_blank');
+                  }
+               };
+               nativeTerm_.rstudioLinksAddon_ = new $wnd.WebLinksAddon.WebLinksAddon(linkHandler);
+               nativeTerm_.loadAddon(nativeTerm_.rstudioLinksAddon_);
+            } catch (error) {
+               console.error("Error loading WebLinksAddon: " + error);
+            }
+         }
+         nativeTerm_.open(container);
+         nativeTerm_.focus();
+         nativeTerm_.tabMovesFocus = tabMovesFocus;
+
+         // Select All in the desktop right-click menu sends this event to the
+         // focused helper textarea: the browser's own select-all would select
+         // only the textarea's text, not the terminal's buffer.
+         nativeTerm_.textarea.addEventListener('rstudio-terminal-select-all', function() {
+            nativeTerm_.selectAll();
+         });
+
+         // Copy through the browser's copy command: it reaches xterm's own
+         // copy handler (the path Ctrl+Insert and the context menu take) and,
+         // unlike the async clipboard API, works over plain http, which is
+         // how RStudio Server is often reached.
+         var copySelection = function() {
+            var copied = false;
+            try {
+               copied = $doc.execCommand('copy');
+            } catch (error) {
+               console.warn('Terminal copy failed: ' + error);
+            }
+
+            var clipboard = $wnd.navigator.clipboard;
+            if (!copied && clipboard && clipboard.writeText) {
+               clipboard.writeText(nativeTerm_.getSelection())["catch"](function(error) {
+                  console.warn('Terminal copy failed: ' + error);
+               });
+            }
+         };
+
+         var pasteFromClipboard = function() {
+            if ($wnd.desktop && $wnd.desktop.getClipboardText) {
+               $wnd.desktop.getClipboardText(function(text) {
+                  if (text)
+                     nativeTerm_.paste(text);
+               });
+               return;
+            }
+
+            var clipboard = $wnd.navigator.clipboard;
+            if (clipboard && clipboard.readText) {
+               clipboard.readText().then(function(text) {
+                  if (text)
+                     nativeTerm_.paste(text);
+               })["catch"](function(error) {
+                  console.warn('Terminal paste failed: ' + error);
+               });
+            }
+         };
+
+         // Chromium's plain-text paste (Ctrl+Shift+V on Windows and Linux)
+         // dispatches a paste event that xterm already handles; remember when
+         // one arrives so the fallback below doesn't paste a second time.
+         var pasteEventSeen = false;
+         container.addEventListener('paste', function() {
+            pasteEventSeen = true;
+         }, true);
+
+         nativeTerm_.attachCustomKeyEventHandler(function (event) {
+            if (event.keyCode === 9 && nativeTerm_.tabMovesFocus)
+               return false;
+
+            // Ctrl+Shift+C / Ctrl+Shift+V copy and paste, as in most terminal
+            // emulators (#1687). xterm sends nothing to the shell for either
+            // combination, so no key sequence is lost to this.
+            var copyOrPaste = event.type === 'keydown' &&
+                  event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey;
+            if (!copyOrPaste)
+               return true;
+
+            if (event.keyCode === 67) {
+               if (nativeTerm_.hasSelection())
+                  copySelection();
+
+               // Consume the key even with nothing selected: left to the
+               // browser it opens the developer tools, and on Windows and
+               // Linux desktop it would fall through to the Comment/Uncomment
+               // menu accelerator bound to the same keys.
+               event.preventDefault();
+               return false;
+            }
+
+            if (event.keyCode === 86) {
+               // Let the browser's own paste run first, and read the clipboard
+               // ourselves only when it produced no paste event (Firefox has
+               // no plain-text paste key for text areas; macOS uses Cmd).
+               pasteEventSeen = false;
+               $wnd.setTimeout(function() {
+                  if (!pasteEventSeen)
+                     pasteFromClipboard();
+               }, 0);
+            }
+
+            return true;
+         });
+
+         return nativeTerm_;
+      } catch (error) {
+         console.error('Error loading xterm.js: ' + error);
+      }
+      return undefined;
+   }-*/;
+}

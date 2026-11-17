@@ -1,0 +1,98 @@
+@external rstudio-themes-dark;
+@external rstudio-themes-default, rstudio-themes-dark-grey, rstudio-themes-alternate;
+
+@external editor_dark, ace_editor_theme;
+
+@eval THEME_DEFAULT_BACKGROUND org.rstudio.core.client.theme.ThemeColors.defaultBackground;
+@eval THEME_DARKGREY_BACKGROUND org.rstudio.core.client.theme.ThemeColors.darkGreyBackground;
+@eval THEME_ALTERNATE_BACKGROUND org.rstudio.core.client.theme.ThemeColors.alternateBackground;
+@eval THEME_DEFAULT_BORDER org.rstudio.core.client.theme.ThemeColors.defaultBorder;
+@eval THEME_DARKGREY_BORDER org.rstudio.core.client.theme.ThemeColors.darkGreyBorder;
+@eval THEME_ALTERNATE_BORDER org.rstudio.core.client.theme.ThemeColors.alternateBorder;
+
+@eval THEME_DARK_ROW_SELECTED org.rstudio.core.client.theme.ThemeColors.darkRowSelected;
+@eval THEME_DARK_ROW_HOVERED org.rstudio.core.client.theme.ThemeColors.darkRowHovered;
+
+span.status {
+   white-space: nowrap;
+}
+span.status img:first-child {
+   margin-right: 6px;
+}
+
+.cellTableCell:first-child img {
+   position: relative;
+   top: 3px;
+}
+.cellTableCell:first-child+.cellTableCell img {
+   position: relative;
+   top: 1px;
+}
+
+.cellTableCell input[type=checkbox] {
+   margin-top: 0;
+   margin-bottom: 0;
+}
+
+/* Every header follows the theme, sortable or not (the go-to-change column's
+   isn't; see GitChangelistTable); the sort arrow's rules stay with the
+   sortable ones. */
+.rstudio-themes-dark .cellTableHeader {
+   color: white;
+}
+
+.cellTableSortableHeader img {
+   background-size: 7px 4px !important;
+   background-position: 2px 1px !important;
+}
+
+.cellTableSortableHeader > [role="button"] > div {
+   padding-left: 13px !important;
+}
+
+.cellTableHeader {
+   border-top: none;
+   border-left: none;
+}
+
+.cellTableHeader:last-child {
+   border-right: none;
+}
+
+.rstudio-themes-default .cellTableHeader {
+   background: THEME_DEFAULT_BACKGROUND;
+   border-color: THEME_DEFAULT_BORDER;
+}
+
+.rstudio-themes-dark-grey .cellTableHeader {
+   background: THEME_DARKGREY_BACKGROUND;
+   border-color: THEME_DARKGREY_BORDER;
+}
+
+.rstudio-themes-alternate .cellTableHeader {
+   background: THEME_ALTERNATE_BACKGROUND;
+   border-color: THEME_ALTERNATE_BORDER;
+}
+
+/* The table follows its ace_editor_theme container for every editor theme, not
+   just dark ones: the base paints it white unconditionally, so a light-but-not-
+   white theme (say Solarized Light) would otherwise leave a white table inside
+   a cream pane. (Under a dark theme this duplicates .editor_dark
+   .cellTableWidget in RStudioCellTableStyle.css -- same declaration, same
+   specificity; the light themes are what it is here for.) Row colors below stay
+   dark-only -- the light defaults already suit a light theme. */
+.ace_editor_theme .cellTableWidget {
+   background-color: inherit;
+}
+
+.editor_dark .ace_editor_theme .cellTableSelectedRow {
+   background-color: THEME_DARK_ROW_SELECTED;
+}
+
+.editor_dark .ace_editor_theme .cellTableHoveredRow {
+   background-color: THEME_DARK_ROW_HOVERED;
+}
+
+.editor_dark .ace_editor_theme .cellTableSelectedRow.cellTableHoveredRow {
+   background-color: THEME_DARK_ROW_SELECTED;
+}
