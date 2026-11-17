@@ -1,0 +1,2857 @@
+/*
+ * VirtualConsoleTests.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.core.client;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+
+import org.rstudio.core.client.dom.DomUtils;
+import org.rstudio.studio.client.workbench.prefs.model.UserPrefs;
+
+import com.google.gwt.dom.client.Document;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.dom.client.Node;
+import com.google.gwt.dom.client.NodeList;
+import com.google.gwt.dom.client.PreElement;
+import com.google.gwt.junit.client.GWTTestCase;
+
+import junit.framework.Assert;
+
+// Note on test coverage: the VirtualConsole has two side effects; it operates on a
+// DOM, if supplied, and also maintains an internal string with the output results.
+// The "consolify" tests are testing the internal string only, and most of the other
+// tests are only testing the DOM. Ideally these should all be extended to do both.
+
+public class VirtualConsoleTests extends GWTTestCase
+{
+   @Override
+   public String getModuleName()
+   {
+      return "org.rstudio.studio.RStudioTests";
+   }
+
+   private static class FakePrefs implements VirtualConsole.Preferences
+   {
+      @Override
+      public int truncateLongLinesInConsoleHistory()
+      {
+         return truncateLines_;
+      }
+
+      @Override
+      public String consoleAnsiMode()
+      {
+         return ansiMode_;
+      }
+
+      @Override
+      public boolean screenReaderEnabled()
+      {
+         return screenReaderEnabled_;
+      }
+
+      public int truncateLines_ = 1000;
+      public String ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_ON;
+      public boolean screenReaderEnabled_ = false;
+   }
+
+   private static String consolify(String text)
+   {
+      VirtualConsole console = new VirtualConsole(null, new FakePrefs());
+      console.submit(text);
+      return console.toString();
+   }
+
+   private VirtualConsole getVC(Element ele)
+   {
+      return new VirtualConsole(ele, new FakePrefs());
+   }
+
+   private static final String[] ANSI_MODES = {
+         UserPrefs.ANSI_CONSOLE_MODE_ON,
+         UserPrefs.ANSI_CONSOLE_MODE_STRIP,
+         UserPrefs.ANSI_CONSOLE_MODE_OFF};
+
+   private VirtualConsole createConsole(Element ele, String ansiMode)
+   {
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = ansiMode;
+      return new VirtualConsole(ele, prefs);
+   }
+
+   private static String setCsiCode(int code)
+   {
+      return setCsiCode(String.valueOf(code));
+   }
+
+   private static String setCsiCode(String code)
+   {
+      return AnsiCode.CSI + code + AnsiCode.SGR;
+   }
+
+   private static String setForegroundIndex(int color)
+   {
+      return setCsiCode(AnsiCode.FOREGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + color);
+   }
+
+   private static String setBackgroundIndex(int color)
+   {
+      return setCsiCode(AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + color);
+   }
+
+   private static String inverseOn()
+   {
+      return setCsiCode(AnsiCode.INVERSE);
+   }
+
+   private static String inverseOff()
+   {
+      return setCsiCode(AnsiCode.INVERSE_OFF);
+   }
+
+   // ---- tests start here ----
+
+   public void testSimpleText()
+   {
+      String simple = consolify("foo");
+      Assert.assertEquals("foo", simple);
+   }
+
+   public void testEmbeddedBackspace()
+   {
+      String backspace = consolify("bool\bk");
+      Assert.assertEquals("book", backspace);
+   }
+
+   public void testTrailingBackspace()
+   {
+      String backspace = consolify("bool\bk");
+      Assert.assertEquals("book", backspace);
+   }
+
+   public void testCarriageReturn()
+   {
+      String cr = consolify("hello\rj");
+      Assert.assertEquals("jello", cr);
+   }
+
+   public void testNewlineCarriageReturn()
+   {
+      String cr = consolify("L1\nL2\rL3");
+      Assert.assertEquals("L1\nL3", cr);
+   }
+
+   public void testSimpleColor()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Error", "error");
+      Assert.assertEquals(
+            "<span class=\"error\">Error</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testTwoColors()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Output 1", "one");
+      vc.submit("Output 2", "two");
+      Assert.assertEquals(
+            "<span class=\"one\">Output 1</span>" +
+            "<span class=\"two\">Output 2</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testColorOverwrite()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("XXXX\r", "X");
+      vc.submit("YY", "Y");
+      Assert.assertEquals(
+            "<span class=\"Y\">YY</span>" +
+            "<span class=\"X\">XX</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testColorSplit()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("123456");
+      vc.submit("\b\b\b\bXX", "X");
+      Assert.assertEquals(
+            "<span>12</span>" +
+            "<span class=\"X\">XX</span>" +
+            "<span>56</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testColorOverlap()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("123", "A");
+      vc.submit("456", "B");
+      vc.submit("\b\b\b\bXX", "X");
+      Assert.assertEquals(
+            "<span class=\"A\">12</span>" +
+            "<span class=\"X\">XX</span>" +
+            "<span class=\"B\">56</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testFormFeed()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Sample1\n");
+      vc.submit("Sample2\n");
+      vc.submit("Sample3\f");
+      vc.submit("Sample4");
+      Assert.assertEquals("<span>Sample4</span>", ele.getInnerHTML());
+   }
+
+   public void testCarriageReturnWithStyleChange()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      vc.submit("World", "a");
+
+      // replace first character of line with green 'X', then change
+      // second character to red 'Y'
+      vc.submit("\r\033[32mX\033[31mY\033[0m", "a");
+      Assert.assertEquals(
+            "<span class=\"a xtermColor2\">X</span>" +
+            "<span class=\"a xtermColor1\">Y</span>" +
+            "<span class=\"a\">rld</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testCarriageReturnWithStyleChange2()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      vc.submit("Hello\nWorld", "a");
+
+      // replace first character of current line with green 'X', then change
+      // second character to red 'Y'
+      vc.submit("\r\033[32mX\033[31mY\033[0m", "a");
+      Assert.assertEquals(
+            "<span class=\"a\">Hello\n</span>" +
+            "<span class=\"a xtermColor2\">X</span>" +
+            "<span class=\"a xtermColor1\">Y</span>" +
+            "<span class=\"a\">rld</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testCarriageReturnWithStyleChange3()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      vc.submit("Hello\nWorld", "a");
+
+      vc.submit("\r\033[32m123\033[31m45\033[0m", "a");
+      Assert.assertEquals(
+            "<span class=\"a\">Hello\n</span>" +
+            "<span class=\"a xtermColor2\">123</span>" +
+            "<span class=\"a\"></span>" +
+            "<span class=\"a xtermColor1\">45</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testSgrOnlyFormatting()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      // false: assigns to innerHTML instead of innerText
+      vc.setPreserveHTML(false);
+      // true: strip all ANSI formatting beyond color and newlines
+      vc.setSgrOnly(true);
+
+      vc.submit("\033[31m<b>red</b>\033[0m");
+      Assert.assertEquals(
+            "<span class=\"xtermColor1\">&lt;b&gt;red&lt;/b&gt;</span>",
+            ele.getInnerHTML());
+   }
+
+   public void testSgrOnlyStripping()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.setPreserveHTML(false);
+      vc.setSgrOnly(true);
+
+      vc.submit("pre\rpost\n\033]8;;ide:run:test()\7link\033]8;;\7");
+      Assert.assertTrue(ele.getInnerText().contains("pre"));
+      Assert.assertTrue(ele.getInnerText().contains("post"));
+      Assert.assertFalse(ele.getInnerHTML().contains("<a"));
+
+      // the hyperlink's content is preserved, but not the escape sequence
+      Assert.assertTrue(ele.getInnerText().contains("link"));
+      Assert.assertFalse(ele.getInnerText().contains("ide:run"));
+      Assert.assertFalse(ele.getInnerText().contains("]8;;"));
+
+      // CRLF is a line break, not a stray control character
+      PreElement crlf = Document.get().createPreElement();
+      VirtualConsole vcCrlf = getVC(crlf);
+      vcCrlf.setPreserveHTML(false);
+      vcCrlf.setSgrOnly(true);
+
+      vcCrlf.submit("one\r\ntwo");
+      Assert.assertEquals("one\ntwo", crlf.getInnerText());
+   }
+
+   public void testSgrOnlyBackspace()
+   {
+      assertSgrOnlyText("expected foo\bbar", "expected foobar");
+   }
+
+   public void testSgrOnlyFormFeed()
+   {
+      assertSgrOnlyText("line 1 is fine\fline 2 is not", "line 1 is fineline 2 is not");
+   }
+
+   public void testSgrOnlyNewlinesAndEscapes()
+   {
+      assertSgrOnlyText("one\r\ntwo\rthree\n\033[31mred\033[0m\007", "one\ntwo\nthree\nred");
+   }
+
+   public void testSgrOnlyIgnoreModeAppliesNoColor()
+   {
+      // stripping a control character can join a stray 8-bit CSI to the
+      // text after it, forming an SGR the console must not act on
+      for (String control : new String[] {"\b", "\f", "\007"})
+      {
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = createConsole(ele, UserPrefs.ANSI_CONSOLE_MODE_OFF);
+         vc.setSgrOnly(true);
+         vc.submit("\u009b" + control + "31mred");
+         Assert.assertFalse(ele.getInnerHTML(), ele.getInnerHTML().contains("xtermColor"));
+      }
+   }
+
+   private void assertSgrOnlyText(String input, String expected)
+   {
+      for (String mode : ANSI_MODES)
+      {
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = createConsole(ele, mode);
+         vc.setSgrOnly(true);
+         vc.submit(input);
+         Assert.assertEquals(mode, expected, ele.getInnerText());
+         Assert.assertEquals(mode, expected, vc.toString());
+      }
+   }
+
+   public void testDynamicControlsInAllAnsiModes()
+   {
+      for (String mode : ANSI_MODES)
+      {
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = createConsole(ele, mode);
+         vc.submit("foo\bbar");
+         Assert.assertEquals(mode, "fobar", ele.getInnerText());
+         Assert.assertEquals(mode, "fobar", vc.toString());
+
+         vc.submit("\rreplace");
+         Assert.assertEquals(mode, "replace", ele.getInnerText());
+         Assert.assertEquals(mode, "replace", vc.toString());
+
+         vc.submit("\fnext");
+         Assert.assertEquals(mode, "next", ele.getInnerText());
+         Assert.assertEquals(mode, "next", vc.toString());
+      }
+   }
+
+   public void testAnsiColorStyleHelper()
+   {
+      Assert.assertEquals("xtermColor0",
+            AnsiCode.clazzForColor(AnsiCode.FOREGROUND_MIN));
+      Assert.assertEquals("xtermColor7",
+            AnsiCode.clazzForColor(AnsiCode.FOREGROUND_MAX));
+      Assert.assertEquals("xtermBgColor0",
+            AnsiCode.clazzForBgColor(AnsiCode.BACKGROUND_MIN));
+      Assert.assertEquals("xtermBgColor7",
+            AnsiCode.clazzForBgColor(AnsiCode.BACKGROUND_MAX));
+   }
+
+   public void testAnsiIntenseColorStyleHelper()
+   {
+      Assert.assertEquals("xtermColor8",
+            AnsiCode.clazzForColor(AnsiCode.FOREGROUND_INTENSE_MIN));
+      Assert.assertEquals("xtermColor15",
+            AnsiCode.clazzForColor(AnsiCode.FOREGROUND_INTENSE_MAX));
+      Assert.assertEquals("xtermBgColor8",
+            AnsiCode.clazzForBgColor(AnsiCode.BACKGROUND_INTENSE_MIN));
+      Assert.assertEquals("xtermBgColor15",
+            AnsiCode.clazzForBgColor(AnsiCode.BACKGROUND_INTENSE_MAX));
+   }
+
+   public void testMinAnsiForegroundColor()
+   {
+      int color = AnsiCode.FOREGROUND_MIN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "Hello");
+      String expected ="<span class=\"xtermColor0\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMaxAnsiForegroundColor()
+   {
+      int color = AnsiCode.FOREGROUND_MAX;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "Hello World");
+      String expected ="<span class=\"xtermColor7\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMinAnsiBgColor()
+   {
+      int color = AnsiCode.BACKGROUND_MIN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "pretty");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForBgColor(color) + "\">pretty</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMaxAnsiBgColor()
+   {
+      int color = AnsiCode.BACKGROUND_MAX;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "colors");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForBgColor(color) + "\">colors</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testResetAnsiForegroundColor()
+   {
+      int color = AnsiCode.ForeColorNum.RED;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            setCsiCode(color) + "Hello " +
+            setCsiCode(AnsiCode.RESET_FOREGROUND) + "World");
+      String expected =
+            "<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello </span>" +
+            "<span>World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testResetAnsiBgColor()
+   {
+      int color = AnsiCode.BackColorNum.GREEN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            setCsiCode(color) + "Sunny " +
+            setCsiCode(AnsiCode.RESET_BACKGROUND) + "Days");
+      String expected = "<span class=\"" + AnsiCode.clazzForBgColor(color) +
+            "\">Sunny </span><span>Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiForegroundAndBgColor()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      int bgColor = AnsiCode.BackColorNum.GREEN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + setCsiCode(bgColor) + "Hello");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + " " +
+            AnsiCode.clazzForBgColor(bgColor) + "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testResetAnsiColors()
+   {
+      int color = AnsiCode.ForeColorNum.YELLOW;
+      int bgColor = AnsiCode.BackColorNum.CYAN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            setCsiCode(color) +
+            setCsiCode(bgColor) + "Colorful " +
+            setCsiCode(AnsiCode.RESET) + "Bland");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + " " +
+            AnsiCode.clazzForBgColor(bgColor) +
+            "\">Colorful </span><span>Bland</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMinAnsiIntenseForegroundColor()
+   {
+      int color = AnsiCode.FOREGROUND_INTENSE_MIN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "Hello");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) +
+            "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMaxAnsiIntenseForegroundColor()
+   {
+      int color = AnsiCode.FOREGROUND_INTENSE_MAX;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "Hello World");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMinAnsiIntenseBgColor()
+   {
+      int color = AnsiCode.BACKGROUND_INTENSE_MIN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setCsiCode(color) + "pretty");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForBgColor(color) + "\">pretty</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMaxAnsiIntenseBgColor()
+   {
+      int color = AnsiCode.BACKGROUND_INTENSE_MAX;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color + AnsiCode.SGR + "colors");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForBgColor(color) + "\">colors</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testResetAnsiIntenseForegroundColor()
+   {
+      int color = AnsiCode.FOREGROUND_INTENSE_MIN + 1;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            AnsiCode.CSI + color + AnsiCode.SGR + "Hello " +
+            AnsiCode.CSI + AnsiCode.RESET_FOREGROUND + AnsiCode.SGR + "World");
+      String expected =
+            "<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello </span>" +
+            "<span>World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testResetAnsiIntenseBgColor()
+   {
+      int color = AnsiCode.BACKGROUND_INTENSE_MIN + 1;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            AnsiCode.CSI + color + AnsiCode.SGR + "Sunny " +
+            AnsiCode.CSI + AnsiCode.RESET_BACKGROUND + AnsiCode.SGR + "Days");
+      String expected = "<span class=\"" + AnsiCode.clazzForBgColor(color) +
+            "\">Sunny </span><span>Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvertDefaultColors()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(inverseOn() + "Sunny Days");
+      String expected = "<span class=\"xtermInvertColor xtermInvertBgColor\"" +
+            ">Sunny Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvertRevertDefaultColors()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            inverseOn() + "Sunny " +
+            inverseOff() + "Days");
+      String expected = "<span class=\"xtermInvertColor xtermInvertBgColor\"" +
+            ">Sunny </span><span>Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvertCustomBgColor()
+   {
+      int bgColor = AnsiCode.BackColorNum.GREEN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            AnsiCode.CSI + bgColor + AnsiCode.SGR +
+            inverseOn() + "Sunny Days");
+      String expected = "<span class=\"xtermColor2 xtermInvertBgColor\"" +
+            ">Sunny Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvertCustomFgColor()
+   {
+      int fgColor = AnsiCode.ForeColorNum.BLUE;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+            AnsiCode.CSI + fgColor + AnsiCode.SGR +
+            inverseOn() + "Sunny Days");
+      String expected = "<span class=\"xtermInvertColor xtermBgColor4\"" +
+            ">Sunny Days</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiForeground256Color()
+   {
+      int color = 120;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setForegroundIndex(color) + "Hello World");
+      String expected ="<span class=\"xtermColor120\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiBackground256Color()
+   {
+      int color = 213;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setBackgroundIndex(color) + "Hello World");
+      String expected ="<span class=\"xtermBgColor213\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsi256Color()
+   {
+      int color = 65;
+      int bgColor = 252;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setForegroundIndex(color) + setBackgroundIndex(bgColor) + "Hello World");
+      String expected ="<span class=\"xtermColor65 xtermBgColor252\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvert256Color()
+   {
+      int color = 61;
+      int bgColor = 129;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(setForegroundIndex(color) + setBackgroundIndex(bgColor) +
+            inverseOn() + "Hello World");
+      String expected ="<span class=\"xtermColor129 xtermBgColor61\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvert256FgColor()
+   {
+      int color = 77;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + AnsiCode.FOREGROUND_EXT + ";" +
+            AnsiCode.EXT_BY_INDEX + ";" + color + AnsiCode.SGR +
+            inverseOn() + "Hello World");
+      String expected ="<span class=\"xtermInvertColor xtermBgColor77\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiInvert256BgColor()
+   {
+      int bgColor = 234;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + AnsiCode.BACKGROUND_EXT + ";" +
+            AnsiCode.EXT_BY_INDEX + ";" + bgColor + AnsiCode.SGR +
+            inverseOn() + "Hello World");
+      String expected ="<span class=\"xtermColor234 xtermInvertBgColor\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiComplexSequence1()
+   {
+      int fgColor = AnsiCode.ForeColorNum.GREEN;
+      int bgColor = 230;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+         AnsiCode.CSI + fgColor + ";" +
+         AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + bgColor + ";" +
+         AnsiCode.BOLD + ";" + AnsiCode.UNDERLINE + ";" + AnsiCode.BOLD_BLURRED_OFF + ";" +
+         AnsiCode.INVERSE_OFF + AnsiCode.SGR + "Hello World");
+      String expected ="<span class=\"xtermColor2 xtermBgColor230 xtermUnderline\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiComplexSequence2()
+   {
+      int fgColor = AnsiCode.ForeColorNum.GREEN;
+      int bgColor = 230;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+         AnsiCode.CSI + fgColor + ";" +
+         AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + bgColor + ";" +
+         AnsiCode.BOLD + ";" + AnsiCode.UNDERLINE + ";" + AnsiCode.BOLD_BLURRED_OFF + ";" +
+         AnsiCode.INVERSE_OFF + AnsiCode.SGR + "Hello World",
+         "existingStyle moreExisting");
+      String expected ="<span class=\"existingStyle moreExisting xtermColor2 xtermBgColor230 xtermUnderline\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiUnsupportedRGBExtendedColorScheme()
+   {
+      // don't currently support specifying color via RGB, which is
+      // ESC[38;2;r;g;bm or ESC[48;2;r;g;bm
+      // in those cases want to ignore the RGB sequence and carry on
+      // processing following codes
+      int red = 123;
+      int green = 231;
+      int blue = 121;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+         AnsiCode.CSI + AnsiCode.FOREGROUND_EXT + ";" + AnsiCode.EXT_BY_RGB + ";" +
+         red + ";" + green + ";" + blue + ";" + AnsiCode.BOLD + AnsiCode.SGR +
+         "Hello World");
+      String expected ="<span class=\"xtermBold\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiMultiUnsupportedRGBExtendedColorScheme()
+   {
+      int red = 123;
+      int green = 231;
+      int blue = 121;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(
+         AnsiCode.CSI + AnsiCode.BOLD + ";" +
+         AnsiCode.FOREGROUND_EXT + ";" + AnsiCode.EXT_BY_RGB + ";" +
+         red + ";" + green + ";" + blue + ";" +
+         AnsiCode.UNDERLINE + ";" +
+         AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_RGB + ";" +
+         red + ";" + green + ";" + blue + ";" +
+         AnsiCode.FOREGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + 255 +
+         AnsiCode.SGR +
+         "Hello World");
+      String expected ="<span class=\"xtermBold xtermUnderline xtermColor255\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiCodeSplitAcrossSubmits()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color);
+      vc.submit(AnsiCode.SGR + "Hello");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiCodeSplitAcrossSubmitsWithParentStyle()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color, "myStyle");
+      vc.submit(AnsiCode.SGR + "Hello", "myStyle");
+      String expected ="<span class=\"myStyle " +
+            AnsiCode.clazzForColor(color) + "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testMultipleAnsiCodesSplitsAcrossSubmits()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      int bgColor = AnsiCode.BackColorNum.GREEN;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color);
+      vc.submit(AnsiCode.SGR + AnsiCode.CSI);
+      vc.submit(Integer.toString(bgColor));
+      vc.submit(AnsiCode.SGR + "Hello");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + " " +
+            AnsiCode.clazzForBgColor(bgColor) + "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiCodeAtEndOfSubmitCall()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color);
+      vc.submit(AnsiCode.SGR);
+      vc.submit("Hello");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testSplitAnsiCodeFollowedByMoreTextSubmits()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color);
+      vc.submit(AnsiCode.SGR);
+      vc.submit("Hello");
+      vc.submit(" World");
+      String expected ="<span class=\"" +
+            AnsiCode.clazzForColor(color) + "\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiCodeFollowedByMoreTextSubmits()
+   {
+      int color = AnsiCode.ForeColorNum.RED;
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + color + AnsiCode.SGR, "someClazz");
+      vc.submit("Hello World", "someClazz");
+      String expected ="<span class=\"someClazz " +
+            AnsiCode.clazzForColor(color) + "\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiComplexSequence1WithStripping()
+   {
+      int fgColor = AnsiCode.ForeColorNum.GREEN;
+      int bgColor = 230;
+      PreElement ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_STRIP;
+      VirtualConsole vc = new VirtualConsole(ele, prefs);
+      vc.submit(
+         AnsiCode.CSI + fgColor + ";" +
+         AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + bgColor + ";" +
+         AnsiCode.BOLD + ";" + AnsiCode.UNDERLINE + ";" + AnsiCode.BOLD_BLURRED_OFF + ";" +
+         AnsiCode.INVERSE_OFF + AnsiCode.SGR + "Hello World", "myOriginalStyle");
+      String expected ="<span class=\"myOriginalStyle\">Hello World</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiComplexSequence1WithPassThrough()
+   {
+      int fgColor = AnsiCode.ForeColorNum.GREEN;
+      int bgColor = 230;
+      PreElement ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_OFF;
+      VirtualConsole vc = new VirtualConsole(ele, prefs);
+      vc.submit(
+         AnsiCode.CSI + fgColor + ";" +
+         AnsiCode.BACKGROUND_EXT + ";" + AnsiCode.EXT_BY_INDEX + ";" + bgColor + ";" +
+         AnsiCode.BOLD + ";" + AnsiCode.UNDERLINE + ";" + AnsiCode.BOLD_BLURRED_OFF + ";" +
+         AnsiCode.INVERSE_OFF + AnsiCode.SGR + "Hello World", "myOriginalStyle");
+      String expected ="<span class=\"myOriginalStyle\"><ESC>[32;48;5;230;1;4;22;27mHello World</span>";
+      Assert.assertEquals(expected, AnsiCode.prettyPrint(ele.getInnerHTML()));
+   }
+
+   public void testMultipleAnsiCodesSplitsAcrossSubmitsWithStripping()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      int bgColor = AnsiCode.BackColorNum.GREEN;
+      PreElement ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_STRIP;
+      VirtualConsole vc = new VirtualConsole(ele, prefs);
+      vc.submit(AnsiCode.CSI + color);
+      vc.submit(AnsiCode.SGR + AnsiCode.CSI);
+      vc.submit(Integer.toString(bgColor));
+      vc.submit(AnsiCode.SGR + "Hello");
+      String expected ="<span>Hello</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testAnsiCodeSplitAcrossSubmitsWithParentStyleWithPassthrough()
+   {
+      int color = AnsiCode.ForeColorNum.MAGENTA;
+      PreElement ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_OFF;
+      VirtualConsole vc = new VirtualConsole(ele, prefs);
+      vc.submit(AnsiCode.CSI + color, "myStyle");
+      vc.submit(AnsiCode.SGR + "Hello", "myStyle");
+      String expected ="<span class=\"myStyle\"><ESC>[35mHello</span>";
+      Assert.assertEquals(expected, AnsiCode.prettyPrint(ele.getInnerHTML()));
+   }
+
+   public void testMultipleCarriageReturn()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("hello world\r           \rgoodbye");
+      Assert.assertEquals("<span>goodbye    </span>", ele.getInnerHTML());
+      Assert.assertEquals("goodbye    ", vc.toString());
+   }
+
+   public void testNonDestructiveBackspace()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("hello world\b\b\b\b\b");
+      Assert.assertEquals("<span>hello world</span>", ele.getInnerHTML());
+      Assert.assertEquals("hello world", vc.toString());
+   }
+
+   public void testSingleSupportedANSICodes()
+   {
+      // https://github.com/rstudio/rstudio/issues/2248
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(AnsiCode.CSI + "?25lBuilding sites \342\200\246 " +
+                AnsiCode.CSI + "?25h" + AnsiCode.CSI + "K");
+      Assert.assertEquals("<span>Building sites \342\200\246 </span>", ele.getInnerHTML());
+      Assert.assertEquals("Building sites \342\200\246 ", vc.toString());
+   }
+
+   public void testMultipleUnknownANSICodes()
+   {
+      // https://github.com/rstudio/rstudio/issues/2248
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("We are " + AnsiCode.CSI + "?25lbuilding sites \342\200\246" +
+                AnsiCode.CSI + "?25h" + AnsiCode.CSI + "K");
+      Assert.assertEquals("<span>We are building sites \342\200\246</span>", ele.getInnerHTML());
+      Assert.assertEquals("We are building sites \342\200\246", vc.toString());
+   }
+
+   public void testMultiCarriageReturnsWithoutColorsMultiSubmits()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("123");
+      vc.submit("x \r");
+      vc.submit("456");
+      vc.submit("x \r");
+      vc.submit("789");
+      Assert.assertEquals("<span>789x </span>", ele.getInnerHTML());
+      Assert.assertEquals("789x ", vc.toString());
+   }
+
+   public void testMultiCarriageReturnWithoutColors()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("123" + "x \r" + "456" + "x \r" + "789");
+      Assert.assertEquals("<span>789x </span>", ele.getInnerHTML());
+      Assert.assertEquals("789x ", vc.toString());
+   }
+
+   public void testMultiCarriageReturnWithColors()
+   {
+      // https://github.com/rstudio/rstudio/issues/2387
+      // cat(c(crayon::red("123"), "x \r", crayon::red("456"), "x \r", crayon::red("789\n")), sep = "")
+      String red = AnsiCode.CSI + AnsiCode.ForeColorNum.RED + AnsiCode.SGR;
+      String reset = AnsiCode.CSI + AnsiCode.RESET_FOREGROUND + AnsiCode.SGR;
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(red + "123" + reset + "x \r" +
+                red + "456" + reset + "x \r" +
+                red + "789");
+
+      String expected =
+            "<span class=\"" + AnsiCode.clazzForColor(AnsiCode.ForeColorNum.RED) +
+            "\">789</span><span>x </span>";
+
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("789x ", vc.toString());
+   }
+
+
+   public void testCRNoColorsIssue2665Part1()
+   {
+      // https://github.com/rstudio/rstudio/issues/2665
+      // this checks the output without colors involved
+      // cat("✔ xxx", "yyy", "xxx")
+      // cat("\r")
+      // cat("✔xxx", "yyy", "zzz")
+      // cat("\n")
+
+      // test writing over a previously written line (via \r) with
+      // no colors involved, the second line shorter than the first,
+      // ending with a \n
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("✔ xxx yyy xxx");
+      vc.submit("\r");
+      vc.submit("✔xxx yyy zzz");
+      vc.submit("\n");
+
+      String expected = "<span>✔xxx yyy zzzx\n</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("✔xxx yyy zzzx\n", vc.toString());
+   }
+
+   public void testCRNoColorsIssue2665Part2()
+   {
+      // https://github.com/rstudio/rstudio/issues/2665
+      // this checks the output without colors involved
+      // cat("✔ xxx", "yyy", "xxx")
+      // cat("\r")
+      // cat("✔ xxx", "yyy", "zzz")
+      // cat("\n")
+
+      // test writing over a previously written line (via \r) with
+      // no colors involved, and the second line the same length as
+      // the first, ending with a \n
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("✔ xxx yyy xxx");
+      vc.submit("\r");
+      vc.submit("✔ xxx yyy zzz");
+      vc.submit("\n");
+
+      String expected = "<span>✔ xxx yyy zzz\n</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("✔ xxx yyy zzz\n", vc.toString());
+   }
+
+   public void testCRColorsIssue2665Part1()
+   {
+      // https://github.com/rstudio/rstudio/issues/2665
+      // cat("✔ xxx", crayon::blue("yyy"), "xxx")
+      // cat("\r")
+      // cat("✔xxx", crayon::red("yyy"), "zzz")
+      // cat("\n")
+
+      // test writing over a previously written line (via \r) with
+      // colors involved, and the second line shorter than the first line,
+      // ending with \n
+      String red = AnsiCode.CSI + AnsiCode.ForeColorNum.RED + AnsiCode.SGR;
+      String redCode = "\"" + AnsiCode.clazzForColor(AnsiCode.ForeColorNum.RED) + "\"";
+      String blue = AnsiCode.CSI + AnsiCode.ForeColorNum.BLUE + AnsiCode.SGR;
+      String blueCode = "\"" + AnsiCode.clazzForColor(AnsiCode.ForeColorNum.BLUE) + "\"";
+      String reset = AnsiCode.CSI + AnsiCode.RESET_FOREGROUND + AnsiCode.SGR;
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("✔ xxx " + blue + "yyy" + reset + " xxx");
+      vc.submit("\r");
+      vc.submit("✔xxx " + red + "yyy" + reset + " zzz");
+      vc.submit("\n");
+
+      String expected =
+            "<span>✔xxx </span>" +
+            "<span class=" + redCode + ">yyy</span>" +
+            "<span class=" + blueCode + "></span>" +
+            "<span></span><span> zzzx\n</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("✔xxx yyy zzzx\n", vc.toString());
+   }
+
+   public void testProgressBar4777Part1()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      vc.submit("=>---------- 1.11 kB/s");
+      vc.submit("\r");
+      vc.submit("==>--------- 1.12 kB/s");
+      vc.submit("\r");
+      vc.submit("==>--------- 1.13 kB/s");
+      vc.submit("\r");
+      vc.submit("===>-------- 1.14 kB/s");
+      vc.submit("\r");
+      vc.submit("====>------- 1.15 kB/s");
+      vc.submit("\r");
+      vc.submit("====>-------- 1.2 kB/s");
+      vc.submit("\r");
+      vc.submit("======>----- 1.21 kB/s");
+      vc.submit("\r");
+      vc.submit("=======>---- 1.22 kB/s");
+      vc.submit("\r");
+      vc.submit("========>--- 1.23 kB/s");
+      vc.submit("\r");
+      vc.submit("=========>--- 1.3 kB/s");
+      vc.submit("\r");
+      vc.submit("==========>- 1.32 kB/s");
+      vc.submit("\r");
+      String lastLine = "===========> 1.33 kB/s";
+      vc.submit(lastLine);
+
+      String expected = "<span>===========&gt; 1.33 kB/s</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals(lastLine, vc.toString());
+   }
+
+   public void testProgressBar4777Part2()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String color = "\033[32m";
+      String restore = "\033[39m";
+
+      vc.submit("=>---------- " + color + "1.11 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("==>--------- " + color + "1.12 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("==>--------- " + color + "1.13 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("===>-------- " + color + "1.14 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("====>------- " + color + "1.15 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("====>------- " + color + "1.20 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("======>----- " + color + "1.21 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("=======>---- " + color + "1.22 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("========>--- " + color + "1.23 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("=========>-- " + color + "1.30 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("==========>- " + color + "1.32 kB/s " + restore);
+      vc.submit("\r");
+      vc.submit("===========> " + color + "1.33 kB/s " + restore);
+
+      Assert.assertTrue(true);
+      String expected = "<span>===========&gt; </span><span class=\"xtermColor2\">1.33 kB/s </span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("===========> 1.33 kB/s " , vc.toString());
+   }
+
+   public void testProgressBar4777Part3()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String color = "\033[32m";
+      String restore = "\033[39m";
+
+      vc.submit("aa " + color + "11 " + restore);
+      vc.submit("\r");
+      vc.submit("bbb " + color + "2 " + restore);
+      vc.submit("\r");
+      vc.submit("cc " + color + "33 " + restore);
+
+      String expected = "<span>cc </span><span class=\"xtermColor2\"></span><span class=\"xtermColor2\">33 </span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("cc 33 ", vc.toString());
+   }
+
+   public void testScreenReaderOffNoTextNotCaptured()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World", "someclass", false, true);
+      Assert.assertEquals(vc.getNewText(), "");
+   }
+
+   public void testScreenReaderOnTextCaptured()
+   {
+      PreElement ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.screenReaderEnabled_ = true;
+      VirtualConsole vc = new VirtualConsole(ele, prefs);
+      String text = "Hello World\nHow are you?";
+      vc.submit(text, "someclass", false, true);
+      String newText = vc.getNewText();
+      Assert.assertEquals(newText, text);
+   }
+
+   public void testBackground255Carryover6092()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput =
+            setForegroundIndex(232) + setBackgroundIndex(255) + "one" +
+            setCsiCode(AnsiCode.RESET_BACKGROUND) + setCsiCode(AnsiCode.RESET_FOREGROUND) + " two";
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermColor232 xtermBgColor255\">one</span><span> two</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("one two", vc.toString());
+   }
+
+   public void testForeground255Carryover6092()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput =
+            setForegroundIndex(255) + setBackgroundIndex(232) + "one" +
+                  setCsiCode(AnsiCode.RESET_BACKGROUND) + setCsiCode(AnsiCode.RESET_FOREGROUND) + " two";
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermColor255 xtermBgColor232\">one</span><span> two</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("one two", vc.toString());
+   }
+
+   public void testInverseFgHandling()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = inverseOn() + setCsiCode(AnsiCode.ForeColorNum.RED) +
+         "This is visible in both " + setCsiCode(AnsiCode.RESET_FOREGROUND) +
+         "This is visible only in the terminal" + inverseOff();
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermInvertColor xtermBgColor1\">This is visible in both </span>" +
+                        "<span class=\"xtermInvertColor xtermInvertBgColor\">This is visible only in the terminal</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("This is visible in both This is visible only in the terminal", vc.toString());
+   }
+
+   public void testInverseBgHandling()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = inverseOn() + setCsiCode(103 /*bright yellow background*/) +
+         "Part One " + setCsiCode(AnsiCode.RESET_BACKGROUND) +
+         "Other Part" + inverseOff();
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermInvertBgColor xtermColor11\">Part One </span>" +
+         "<span class=\"xtermInvertBgColor xtermInvertColor\">Other Part</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("Part One Other Part", vc.toString());
+   }
+
+   public void testInverseFgBgHandling()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = inverseOn() + setCsiCode(103 /*bright yellow background*/) + setCsiCode(AnsiCode.ForeColorNum.RED) +
+         "Part One " + setCsiCode(AnsiCode.RESET_BACKGROUND) + setCsiCode(AnsiCode.RESET_FOREGROUND) +
+         "Other Part" + inverseOff();
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermColor11 xtermBgColor1\">Part One </span>" +
+         "<span class=\"xtermInvertColor xtermInvertBgColor\">Other Part</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("Part One Other Part", vc.toString());
+   }
+
+   public void testInverse256FgHandling()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = inverseOn() + setForegroundIndex(196 /*red*/) +
+         "Inverted with red background " + setCsiCode(AnsiCode.RESET_FOREGROUND) +
+         "Inverted with default background" + inverseOff();
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermInvertColor xtermBgColor196\">Inverted with red background </span>" +
+         "<span class=\"xtermInvertColor xtermInvertBgColor\">Inverted with default background</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("Inverted with red background Inverted with default background", vc.toString());
+   }
+
+   public void testInverse256FgBgHandling()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = inverseOn() + setForegroundIndex(196 /*red*/) + setBackgroundIndex(228 /*yellow*/) +
+         "Inverted with red background yellow foreground " + setCsiCode(AnsiCode.RESET_FOREGROUND) +
+         setCsiCode(AnsiCode.RESET_BACKGROUND) + "Inverted with default colors" + inverseOff();
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermBgColor196 xtermColor228\">Inverted with red background yellow foreground </span>" +
+         "<span class=\"xtermInvertBgColor xtermInvertColor\">Inverted with default colors</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("Inverted with red background yellow foreground Inverted with default colors", vc.toString());
+   }
+
+   public void testCarriageReturnPartialEndOverwrite()
+   {
+      // Case where a span is partially overwritten after a carriage-return
+      // and thus must be moved to a new position; it was being moved to an incorrect location
+      // causing output to be lost.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+
+      String testInput = "⠹ [ \033[32mPASS\033[39m x632 \033[31mFAIL\033[39m x16 \033[35mWARN\033[39m x4" +
+         "\r" +
+         "\033[32m✓\033[39m |   4       | reporter-zzz\033[36m [\033[0m";
+
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermColor2\">✓</span><span> |   4       | reporter-zzz</span>" +
+         "<span></span><span class=\"xtermColor6\"> [</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+      Assert.assertEquals("✓ |   4       | reporter-zzz [", vc.toString());
+   }
+
+   public void testBlurred()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String testInput = "\033[2mtext\033[22m";
+      vc.submit(testInput);
+      String expected = "<span class=\"xtermBlur\">text</span>";
+      Assert.assertEquals(expected, ele.getInnerHTML());
+   }
+
+   public void testHyperlinkNoParams()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String testInput = "\u001b]8;;http://www.example.com\7text\u001b]8;;\7";
+      vc.submit(testInput);
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\".*\">text</a>"));
+   }
+
+   public void testHyperlinkNoParamsColorOutside()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String testInput = "\033[31m\u001b]8;;http://www.example.com\7text\u001b]8;;\7\033[39m";
+      vc.submit(testInput);
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\".*xtermColor1.*\">text</a>"));
+   }
+
+   public void testHyperlinkNoParamsColorInside()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String testInput = "\u001b]8;;http://www.example.com\7\033[31mtext\033[39m\u001b]8;;\7";
+      vc.submit(testInput);
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\".*xtermColor1.*\">text</a>"));
+   }
+
+   public void testHyperlinkWithParams()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String testInput = "\u001b]8;name1=value1:name2=value2;http://www.example.com\7text\u001b]8;;\7";
+      vc.submit(testInput);
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\".*\">text</a>"));
+   }
+
+   public void testHyperlinkStringTerminator()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\\n");
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\"[^\"]*\">link</a><span>\n</span>$"));
+   }
+
+   public void testHyperlinkStringTerminatorSplitAcrossSubmits()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u001b]8;;https://example.com\u001b");
+      vc.submit("\\link\u001b]8;;\u001b\\\n");
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\"[^\"]*\">link</a><span>\n</span>$"));
+   }
+
+   public void testHyperlinkEndedByOtherEscape()
+   {
+      // ESC ')' is not ST, but still ends the string; the ESC ')' is then
+      // parsed (and discarded) as an escape sequence of its own
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b)\n");
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\"[^\"]*\">link</a><span>\n</span>$"));
+
+      // here, ESC ')' 'l' is a character set designation, consuming the 'l'
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\u001b]8;;https://example.com\u001b)link\u001b]8;;\u001b)\n");
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\"[^\"]*\">ink</a><span>\n</span>$"));
+   }
+
+   public void testEmptySgrParameterResets()
+   {
+      // CSI m, as emitted by git and grep
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033[31mred\033[mplain");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span><span>plain</span>", ele.getInnerHTML());
+
+      // tput sgr0
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\033[31mred\033(B\033[mplain");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span><span>plain</span>", ele.getInnerHTML());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\033[31mred\033[;1mbold");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span><span class=\"xtermBold\">bold</span>", ele.getInnerHTML());
+   }
+
+   public void testUnknownExtendedColorFormat()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033[31mred\033[38;3mplain");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span><span>plain</span>", ele.getInnerHTML());
+   }
+
+   public void testUnsupportedCsiDoesNotHoldBackOutput()
+   {
+      String[] sequences = {
+         "\033[4:3m",              // sub-parameters (curly underline)
+         "\033[38:2::255:0:0m",    // sub-parameters (RGB color)
+         "\033[12345m",            // long parameter
+         "\033[2 q",               // intermediate byte (cursor style)
+      };
+
+      for (String sequence : sequences)
+      {
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = getVC(ele);
+         vc.submit("a" + sequence + "b\n");
+         vc.submit("next\n");
+         Assert.assertEquals(AnsiCode.prettyPrint(sequence), "ab\nnext\n", ele.getInnerText());
+      }
+   }
+
+   public void testPartialEscapeSplitAcrossSubmits()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033[4:3");
+      vc.submit("mb\033(");
+      vc.submit("Bc");
+      Assert.assertEquals("abc", ele.getInnerText());
+   }
+
+   public void testCsiWithBracketFinalByte()
+   {
+      // as in xterm, ESC '[' '[' is a CSI sequence ending in '[', whether or
+      // not the input is split after it
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033[[Ab");
+      Assert.assertEquals("aAb", ele.getInnerText());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033[[");
+      vc.submit("Ab");
+      Assert.assertEquals("aAb", ele.getInnerText());
+   }
+
+   public void testSgrWithSubParameters()
+   {
+      // the supported parameters still apply when one has sub-parameters
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033[1;31;4:3mtext");
+      Assert.assertEquals("<span class=\"xtermBold xtermColor1\">text</span>", ele.getInnerHTML());
+   }
+
+   public void testDanglingCsiDoesNotSwallowPrompt()
+   {
+      // the prompts are made of CSI parameter and intermediate bytes, so a
+      // dangling ESC '[' must not hold them back waiting for a final byte
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033[");
+      vc.submit("> ");
+      vc.submit("hello\n");
+      Assert.assertEquals("> hello\n", ele.getInnerText());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\033[");
+      vc.submit("+ ");
+      Assert.assertEquals("+ ", ele.getInnerText());
+
+      // whereas a split private mode sequence is completed
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033[?2");
+      vc.submit("5lb");
+      Assert.assertEquals("ab", ele.getInnerText());
+   }
+
+   public void testPartialCsiWithIntermediateOrPrivateMarker()
+   {
+      // split after an intermediate byte
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033[2 ");
+      vc.submit("qb");
+      Assert.assertEquals("ab", ele.getInnerText());
+
+      // split after a private marker and its parameters
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033[>4");
+      vc.submit(";2mb");
+      Assert.assertEquals("ab", ele.getInnerText());
+
+      // split right after the private marker
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033[>");
+      vc.submit("4;2mb");
+      Assert.assertEquals("ab", ele.getInnerText());
+   }
+
+   public void testSplitEightBitCsi()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u009b3");
+      vc.submit("1mred");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span>", ele.getInnerHTML());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\u009b");
+      vc.submit("31mred");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span>", ele.getInnerHTML());
+   }
+
+   public void testLongUnterminatedOscNotHeldBack()
+   {
+      // an unterminated OSC longer than the hold-back limit is shown at once
+      StringBuilder payload = new StringBuilder();
+      for (int i = 0; i <= VirtualConsole.MAX_PARTIAL_STRING_LENGTH; i++)
+         payload.append('x');
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]" + payload);
+      Assert.assertEquals(payload.toString(), ele.getInnerText());
+   }
+
+   public void testUnterminatedOscAcrossSubmits()
+   {
+      // an unterminated string is held back until a console control
+      // character shows it to be malformed; then only its introducer is lost
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]oops");
+      Assert.assertEquals("", ele.getInnerText());
+      vc.submit(" more");
+      Assert.assertEquals("", ele.getInnerText());
+      vc.submit("\nnext\n");
+      Assert.assertEquals("oops more\nnext\n", ele.getInnerText());
+   }
+
+   public void testOscSplitAcrossManySubmits()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;;https://a");
+      vc.submit("bcd");
+      vc.submit("\033\\link\033]8;;\033\\\n");
+      Assert.assertEquals("link\n", ele.getInnerText());
+      Assert.assertEquals("link", anchorText(ele));
+
+      // a long payload arriving in many pieces is discarded whole
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033]1337;File=inline=1:");
+      for (int i = 0; i < 200; i++)
+         vc.submit("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=");
+      Assert.assertEquals("a", ele.getInnerText());
+      vc.submit("\007b\n");
+      Assert.assertEquals("ab\n", ele.getInnerText());
+   }
+
+   public void testFlushPartialAnsiCode()
+   {
+      // a held-back string is shown as malformed
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033]oops");
+      vc.flushPartialAnsiCode();
+      Assert.assertEquals("aoops", ele.getInnerText());
+      vc.submit("b");
+      Assert.assertEquals("aoopsb", ele.getInnerText());
+
+      // so is a held-back CSI sequence, while a lone ESC is dropped
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("a\033[3");
+      vc.flushPartialAnsiCode();
+      Assert.assertEquals("a3", ele.getInnerText());
+      vc.submit("\033");
+      vc.flushPartialAnsiCode();
+      Assert.assertEquals("a3", ele.getInnerText());
+
+      // nothing held back, nothing to do
+      vc.flushPartialAnsiCode();
+      Assert.assertEquals("a3", ele.getInnerText());
+   }
+
+   public void testHeldBackStringShownOnClassChange()
+   {
+      // output of another class can't complete the string, and the held-back
+      // text keeps its own class
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]oops", "one");
+      vc.submit("x", "two");
+      Assert.assertEquals(
+            "<span class=\"one\">oops</span><span class=\"two\">x</span>",
+            ele.getInnerHTML());
+
+      // whereas the same class continues the string
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("\033]8;;https://example.com", "one");
+      vc.submit("\007link\033]8;;\007", "one");
+      Assert.assertEquals("link", anchorText(ele));
+   }
+
+   public void testEscapeBeforeControlCharacter()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033\nb\033(\rc");
+      Assert.assertEquals("a\nc", ele.getInnerText());
+   }
+
+   public void testEightBitCsi()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u009b31mred\u009b?25l");
+      Assert.assertEquals("<span class=\"xtermColor1\">red</span>", ele.getInnerHTML());
+   }
+
+   public void testBelDiscarded()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\007b");
+      Assert.assertEquals("ab", ele.getInnerText());
+      Assert.assertEquals("ab", vc.toString());
+
+      // also when ANSI escapes are ignored
+      ele = Document.get().createPreElement();
+      FakePrefs prefs = new FakePrefs();
+      prefs.ansiMode_ = UserPrefs.ANSI_CONSOLE_MODE_OFF;
+      vc = new VirtualConsole(ele, prefs);
+      vc.submit("a\007b");
+      Assert.assertEquals("ab", ele.getInnerText());
+   }
+
+   public void testOtherOscDiscarded()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]0;title\007a\033]7;file://host/home\033\\b");
+      Assert.assertEquals("ab", ele.getInnerText());
+   }
+
+   public void testOtherStringSequencesDiscarded()
+   {
+      // DCS, SOS, PM, APC, and the screen window title carry payloads, like OSC
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033P1$r\033\\b\033Xsos\033\\c\033^pm\007d\033_apc\033\\e\033ktitle\033\\f");
+      Assert.assertEquals("abcdef", ele.getInnerText());
+   }
+
+   public void testOscSplitAcrossSubmits()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;;https://exa");
+      vc.submit("mple.com\007link\033]");
+      vc.submit("8;;\007\n");
+      Assert.assertTrue(ele.getInnerHTML().matches("^<a class=\"[^\"]*\">link</a><span>\n</span>$"));
+   }
+
+   public void testOscAfterHeldBackEscape()
+   {
+      // a lone ESC held back from the previous submit starts the string
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("a\033");
+      vc.submit("]8;;https://example.com");
+      vc.submit("\007link\033]8;;\007\n");
+      Assert.assertEquals("alink\n", ele.getInnerText());
+      Assert.assertEquals("link", anchorText(ele));
+   }
+
+   public void testHyperlinkTextSplitAcrossSubmits()
+   {
+      // the two halves of the link text share one anchor
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;;https://example.com\007li");
+      vc.submit("nk\033]8;;\007\n");
+
+      NodeList<Element> anchors = ele.getElementsByTagName("a");
+      Assert.assertEquals(1, anchors.getLength());
+      Assert.assertEquals("link", anchors.getItem(0).getInnerText());
+      Assert.assertEquals("link\n", ele.getInnerText());
+   }
+
+   public void testHyperlinkParamWithoutValue()
+   {
+      // a parameter without '=' is skipped rather than failing the submit
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;id;https://example.com\007link\033]8;;\007 after\n");
+      Assert.assertEquals("link after\n", ele.getInnerText());
+      Assert.assertEquals("link", anchorText(ele));
+   }
+
+   public void testUnterminatedOscShown()
+   {
+      // no output is lost to an OSC string that never ends
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]0;title\nnext");
+      Assert.assertEquals("0;title\nnext", ele.getInnerText());
+   }
+
+   public void testPlainTextOverwritesHyperlink()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;;https://example.com\007link\033]8;;\007\r");
+      vc.submit("text");
+      Assert.assertEquals("text", ele.getInnerText());
+      Assert.assertEquals("", anchorText(ele));
+   }
+
+   public void testHyperlinkOverwritesPlainText()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abcdef\r");
+      vc.submit("\033]8;;https://example.com\007ab\033]8;;\007");
+      Assert.assertEquals("abcdef", ele.getInnerText());
+      Assert.assertEquals("ab", anchorText(ele));
+   }
+
+   public void testHyperlinkOverwritesHyperlink()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033]8;;https://a.com\007aaaa\033]8;;\007 tail\r");
+      vc.submit("\033]8;;https://b.com\007bb\033]8;;\007");
+      Assert.assertEquals("bbaa tail", ele.getInnerText());
+
+      NodeList<Element> anchors = ele.getElementsByTagName("a");
+      Assert.assertEquals(2, anchors.getLength());
+      Assert.assertEquals("bb", anchors.getItem(0).getInnerText());
+      Assert.assertEquals("aa", anchors.getItem(1).getInnerText());
+   }
+
+   private static String anchorText(Element ele)
+   {
+      StringBuilder text = new StringBuilder();
+      NodeList<Element> anchors = ele.getElementsByTagName("a");
+      for (int i = 0; i < anchors.getLength(); i++)
+         text.append(anchors.getItem(i).getInnerText());
+      return text.toString();
+   }
+
+   public void testIssue9846()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("i Some intermediate step with a \033[32mfield\033[39m-----------------------\r+++++++++++++++++++++++++++++++++++++\r\033[33m!\033[39m An alert message which is long enough\ni Some intermediate step with a \033[32mfield\033[39m\n");
+      Assert.assertEquals("<span class=\"xtermColor3\">!</span><span> An alert message which is long enough</span><span>---------------------\ni Some intermediate step with a </span><span class=\"xtermColor2\">field</span><span>\n</span>", ele.getInnerHTML());
+   }
+
+   public void testCsiCursorMovement()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello world!\033[10DLL\033[4CRL");
+      Assert.assertEquals(ele.getInnerText(), "HeLLo woRLd!");
+   }
+
+   public void testEraseInLineMode0Default()
+   {
+      // \033[K with no param defaults to mode 0 (erase from cursor to end of line)
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[5D\033[K");
+      Assert.assertEquals("Hello ", vc.toString());
+      Assert.assertEquals("<span>Hello </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode0Explicit()
+   {
+      // \033[0K is the same as \033[K
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[5D\033[0K");
+      Assert.assertEquals("Hello ", vc.toString());
+      Assert.assertEquals("<span>Hello </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode0WithColors()
+   {
+      // Erase colored text from cursor to end of line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String red = AnsiCode.CSI + AnsiCode.ForeColorNum.RED + AnsiCode.SGR;
+      String reset = AnsiCode.CSI + AnsiCode.RESET_FOREGROUND + AnsiCode.SGR;
+      vc.submit("Hello " + red + "World" + reset + "\033[5D\033[K");
+      Assert.assertEquals("Hello ", vc.toString());
+      Assert.assertEquals("<span>Hello </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode0StraddlingColorRange()
+   {
+      // Erase from the middle of a colored range (optimization path)
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String red = AnsiCode.CSI + AnsiCode.ForeColorNum.RED + AnsiCode.SGR;
+      String reset = AnsiCode.CSI + AnsiCode.RESET_FOREGROUND + AnsiCode.SGR;
+      // "He" plain, "llo World" red -- cursor back 5 lands inside the red range
+      vc.submit("He" + red + "llo World" + reset + "\033[5D\033[K");
+      Assert.assertEquals("He" + "llo ", vc.toString());
+      Assert.assertEquals(
+         "<span>He</span>" +
+         "<span class=\"xtermColor1\">llo </span>",
+         ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode1()
+   {
+      // \033[1K erases from beginning of line to cursor (inclusive)
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[5D\033[1K");
+      Assert.assertEquals("       orld", vc.toString());
+      Assert.assertEquals("<span>       orld</span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode2()
+   {
+      // \033[2K erases the entire line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[5D\033[2K");
+      Assert.assertEquals("           ", vc.toString());
+      Assert.assertEquals("<span>           </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMultiLine()
+   {
+      // EL should not cross newline boundaries
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Line1\nHello World\033[5D\033[K");
+      Assert.assertEquals("Line1\nHello ", vc.toString());
+      Assert.assertEquals("<span>Line1\nHello </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode0MiddleLine()
+   {
+      // Mode 0 on a non-trailing line erases via the space-overwrite path.
+      // Cursor up (CSI A) reaches line 2, landing on the space before "World"
+      // (column preserved from "Line3"); erase-to-EOL then clears " World".
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Line1\nHello World\nLine3\033[1A\033[K");
+      Assert.assertEquals("Line1\nHello      \nLine3", vc.toString());
+      Assert.assertEquals("<span>Line1\nHello      \nLine3</span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode1AtEnd()
+   {
+      // Mode 1 with cursor at end of line erases the entire line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[1K");
+      Assert.assertEquals("           ", vc.toString());
+      Assert.assertEquals("<span>           </span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineMode2MultiLine()
+   {
+      // Mode 2 on a middle line of a multi-line buffer. Cursor up (CSI A)
+      // lands on line 2; mode 2 erases the whole line regardless of column.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Line1\nHello World\nLine3\033[1A\033[2K");
+      Assert.assertEquals("Line1\n           \nLine3", vc.toString());
+      Assert.assertEquals("<span>Line1\n           \nLine3</span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineThenWrite()
+   {
+      // Verify cursor is not corrupted after erase -- writing resumes at correct position
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[5D\033[K");
+      vc.submit("Earth");
+      Assert.assertEquals("Hello Earth", vc.toString());
+      Assert.assertEquals("<span>Hello Earth</span>", ele.getInnerHTML());
+   }
+
+   public void testEraseInLineProgressBar()
+   {
+      // Realistic progress bar pattern: \r + text + \033[K
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Progress: 50% done!!!");
+      vc.submit("\rProgress: 100%\033[K");
+      Assert.assertEquals("Progress: 100%", vc.toString());
+      Assert.assertEquals("<span>Progress: 100%</span>", ele.getInnerHTML());
+   }
+
+   public void testCsiCursorUpRewritesPreviousLine()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line1\nline2\u001b[1A\rLINE1");
+      Assert.assertEquals("LINE1\nline2", vc.toString());
+   }
+
+   public void testCsiCursorUpPreservesColumn()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abcdef\nghijkl\u001b[3D\u001b[1AXY");
+      Assert.assertEquals("abcXYf\nghijkl", vc.toString());
+   }
+
+   public void testCsiCursorUpClampsAtTop()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("only line\u001b[5A\rOVER");
+      Assert.assertEquals("OVER line", vc.toString());
+   }
+
+   public void testCsiCursorUpDefaultCount()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line1\nline2\u001b[A\rLINE1");
+      Assert.assertEquals("LINE1\nline2", vc.toString());
+   }
+
+   public void testCsiCursorDownMovesToNextLine()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line1\nline2\nline3\u001b[2A\u001b[1B\rLINE2");
+      Assert.assertEquals("line1\nLINE2\nline3", vc.toString());
+   }
+
+   public void testCsiCursorDownClampsAtBottom()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("only line\u001b[5B!");
+      Assert.assertEquals("only line!", vc.toString());
+   }
+
+   public void testCsiMultiProgressBarUpdate()
+   {
+      // Mirrors the output cli emits when rendering two progress bars on
+      // separate lines: each update moves up with \033[1A, redraws bar 1,
+      // moves down via \n, then redraws bar 2. Without CSI A support the
+      // second bar would clobber the first.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\rDownloads  10%\u001b[K\n\rProcessing 10%\u001b[K\r");
+      vc.submit("\u001b[1A\rDownloads  50%\u001b[K\n\rProcessing 50%\u001b[K\r");
+      Assert.assertEquals("Downloads  50%\nProcessing 50%", vc.toString());
+   }
+
+   public void testCsiCursorUpWriteLongerThanLinePreservesNewline()
+   {
+      // Regression guard: a write that begins on an earlier line via CSI A
+      // and is longer than that line's existing content must not run past
+      // the trailing newline and corrupt the line below it. The buffer
+      // newline stays where the writer expects, with the upper line
+      // extended to fit the new content.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Downloads 10%\nProcessing 10%");
+      vc.submit("\u001b[1A\rDownloads NEW 50%\u001b[K\n\rProcessing 50%\u001b[K\r");
+      Assert.assertEquals("Downloads NEW 50%\nProcessing 50%", vc.toString());
+   }
+
+   public void testCsiCursorUpOntoEmptyLinePreservesNewline()
+   {
+      // Regression guard for the cursor-on-newline case: CSI A from a
+      // following line can land the cursor directly on an empty line's
+      // terminating newline (lineStart == lineEnd). A subsequent non-newline
+      // write must not consume that newline and merge the lines below.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Header\n\nFooter");
+      vc.submit("\u001b[1AX");
+      Assert.assertEquals("Header\nX\nFooter", vc.toString());
+   }
+
+   public void testCsiCursorDownDefaultCount()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line1\nline2\nline3\u001b[2A\u001b[B\rLINE2");
+      Assert.assertEquals("line1\nLINE2\nline3", vc.toString());
+   }
+
+   public void testCsiCursorUpClampsColumnToLineLength()
+   {
+      // Pin the absolute-position behavior without a \r chaser: when the
+      // source column exceeds the target line's length, the cursor lands
+      // on the line's last character (not past it) so subsequent ops like
+      // \r and eraseInLine stay on the intended line. See maxCursorColumn.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("short\nlongerline\u001b[1AX");
+      Assert.assertEquals("shorX\nlongerline", vc.toString());
+   }
+
+   public void testCsiCursorUpPreservesColorWhenRewriting()
+   {
+      // Verifies extendLineBefore keeps the DOM in sync: a CSI A overwrite
+      // that extends a colored line must produce HTML whose color span
+      // still covers the original characters and is followed by a new,
+      // uncolored span for the appended content.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\u001b[32mbar1\u001b[39m\nbar2");
+      vc.submit("\u001b[1A\rbar1 EXTRA\u001b[K");
+      Assert.assertEquals("bar1 EXTRA\nbar2", vc.toString());
+      // The DOM must still contain the colored span (the green bar1 prefix)
+      // and the \n separator must survive intact.
+      String html = ele.getInnerHTML();
+      Assert.assertTrue("expected xtermColor2 span, got: " + html,
+         html.indexOf("xtermColor2") != -1);
+      Assert.assertTrue("expected newline preserved in DOM, got: " + html,
+         html.indexOf("\n") != -1);
+   }
+
+   public void testIncompleteAnsiCodes()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      String text = "\u001b[34mhello\u001b[0m";
+      for (int i = 0, n = text.length(); i < n; i++)
+         vc.submit(text.substring(i, i + 1));
+
+      Assert.assertEquals(ele.getInnerText(), "hello");
+   }
+
+   public void testCsiCursorToColumnDefault()
+   {
+      // \033[G with no param defaults to column 1 (start of line)
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\033[GX");
+      Assert.assertEquals("Xbc", vc.toString());
+   }
+
+   public void testCsiCursorToColumnExplicit()
+   {
+      // \033[7G moves to column 7 (1-based), i.e. the 'W' in "Hello World"
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Hello World\033[7GXYZ");
+      Assert.assertEquals("Hello XYZld", vc.toString());
+   }
+
+   public void testCsiCursorToColumnClampsBeyondLine()
+   {
+      // A column past the end of the (unterminated) line clamps to the end
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\033[99GX");
+      Assert.assertEquals("abcX", vc.toString());
+   }
+
+   public void testCsiCursorToColumnMultiLine()
+   {
+      // CHA operates on the line the cursor is currently on
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line1\nline2\033[3GX");
+      Assert.assertEquals("line1\nliXe2", vc.toString());
+   }
+
+   public void testCsiCursorToColumnEndOfNonFinalLine()
+   {
+      // CHA must be able to address the column just past the content of a
+      // terminated (non-final) line. After moving up to "abc", \033[4G lands
+      // after 'c' (not on it), so the write appends instead of clobbering
+      // 'c' or merging into the line below.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[1A\033[4GZ");
+      Assert.assertEquals("abcZ\ndef", vc.toString());
+   }
+
+   public void testCsiCursorToColumnEndOfLineThenCarriageReturn()
+   {
+      // A cursor left on a terminated line's '\n' by CHA must still belong to
+      // that line: \r returns to the start of "abc", not down to "def".
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[1A\033[4G\rX");
+      Assert.assertEquals("Xbc\ndef", vc.toString());
+   }
+
+   public void testCsiCursorToColumnEndOfLineThenEraseLine()
+   {
+      // Likewise CSI K must operate on the line whose '\n' the cursor sits on.
+      // \033[2K erases "abc" (leaving spaces), not "def".
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[1A\033[4G\033[2K");
+      Assert.assertEquals("   \ndef", vc.toString());
+   }
+
+   public void testCsiCursorBackClampsAtLineStart()
+   {
+      // CUB must not cross the preceding '\n': moving left 4 from the end of
+      // "def" stops at the start of "def", so the write overwrites 'd'.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[4DX");
+      Assert.assertEquals("abc\nXef", vc.toString());
+   }
+
+   public void testCsiCursorBackThenCarriageReturn()
+   {
+      // After CUB clamps at the start of "def", \r stays on "def" (it does not
+      // resolve to the previous line). Regression guard for cursor-backward
+      // interacting with the newline-resolution in carriageReturn().
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[4D\rX");
+      Assert.assertEquals("abc\nXef", vc.toString());
+   }
+
+   public void testCsiCursorBackThenEraseLine()
+   {
+      // Same for CSI K: it erases "def" (the line CUB stayed on), not "abc".
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[4D\033[2K");
+      Assert.assertEquals("abc\n   ", vc.toString());
+   }
+
+   public void testBackspaceClampsAtLineStart()
+   {
+      // Plain backspace must also stay within the current line.
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\b\b\b\bX");
+      Assert.assertEquals("abc\nXef", vc.toString());
+   }
+
+   public void testCsiCursorForwardClampsAtLineEnd()
+   {
+      // CUF must not cross into the next line: moving right past the end of
+      // "abc" stops at its end, so the write appends to "abc".
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[1A\033[9CX");
+      Assert.assertEquals("abcX\ndef", vc.toString());
+   }
+
+   public void testCsiCursorMovementDefaultsToOne()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\r\033[Cx\033[Dy");
+      Assert.assertEquals("ayc", vc.toString());
+   }
+
+   public void testCsiCursorMovementZeroCountMeansOne()
+   {
+      // as in xterm, an explicit count of 0 moves by 1
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\r\033[0Cx\033[0Dy");
+      Assert.assertEquals("ayc", vc.toString());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("abc\033[0Gx");
+      Assert.assertEquals("xbc", vc.toString());
+
+      ele = Document.get().createPreElement();
+      vc = getVC(ele);
+      vc.submit("abc\ndef\033[0A\rx");
+      Assert.assertEquals("xbc\ndef", vc.toString());
+   }
+
+   public void testCsiCursorForwardHugeCount()
+   {
+      // a count of Integer.MAX_VALUE, from a cursor past column 0, still stops
+      // at the end of the line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\ndef\033[1A\033[2147483647CX");
+      Assert.assertEquals("abcX\ndef", vc.toString());
+   }
+
+   public void testCsiCursorToColumnProgressBar()
+   {
+      // Realistic progress pattern: redraw the line via CHA + erase-to-EOL
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Downloading 45%");
+      vc.submit("\033[GDownloading 100%\033[K");
+      Assert.assertEquals("Downloading 100%", vc.toString());
+      Assert.assertEquals("<span>Downloading 100%</span>", ele.getInnerHTML());
+   }
+
+   public void testCsiCursorNextLine()
+   {
+      // \033[2A up to the first line, then \033[1E to the start of line 2
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("aaa\nbbb\nccc\033[2A\033[1EX");
+      Assert.assertEquals("aaa\nXbb\nccc", vc.toString());
+   }
+
+   public void testCsiCursorNextLineDefaultCount()
+   {
+      // \033[E with no param defaults to moving down one line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("aaa\nbbb\nccc\033[2A\033[EX");
+      Assert.assertEquals("aaa\nXbb\nccc", vc.toString());
+   }
+
+   public void testCsiCursorNextLineClampsAtBottom()
+   {
+      // CNL on the last line cannot move down but still resets to column 0
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\033[3EX");
+      Assert.assertEquals("Xbc", vc.toString());
+   }
+
+   public void testCsiCursorPreviousLine()
+   {
+      // \033[1F moves to the start of the line above
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("aaa\nbbb\nccc\033[1FX");
+      Assert.assertEquals("aaa\nXbb\nccc", vc.toString());
+   }
+
+   public void testCsiCursorPreviousLineDefaultCount()
+   {
+      // \033[F with no param defaults to moving up one line
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("aaa\nbbb\nccc\033[FX");
+      Assert.assertEquals("aaa\nXbb\nccc", vc.toString());
+   }
+
+   public void testCsiCursorPreviousLineClampsAtTop()
+   {
+      // CPL on the first line cannot move up but still resets to column 0
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abc\033[3FX");
+      Assert.assertEquals("Xbc", vc.toString());
+   }
+
+   public void testCsiCursorPreviousLineResetsColumn()
+   {
+      // Unlike CSI A (which preserves the column), CPL snaps to column 0
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("abcdef\nghijkl\033[1FX");
+      Assert.assertEquals("Xbcdef\nghijkl", vc.toString());
+   }
+
+   // ---- DOM write batching and newline accounting ----
+
+   private static int textNodeCount(Element el)
+   {
+      int count = 0;
+      for (Node node = el.getFirstChild(); node != null; node = node.getNextSibling())
+      {
+         if (node.getNodeType() == Node.TEXT_NODE)
+            count++;
+      }
+      return count;
+   }
+
+   private static void assertNewlinesMatchDom(PreElement ele, VirtualConsole vc)
+   {
+      Assert.assertEquals(DomUtils.countLines(ele, true), vc.getNewlinesWritten());
+   }
+
+   public void testAppendsWithinSubmitAreWrittenAsOneTextNode()
+   {
+      // each line is two appends (text, then newline), but the DOM is only
+      // touched once per submit
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("one\ntwo\nthree\n");
+
+      Element span = ele.getFirstChildElement();
+      Assert.assertEquals("one\ntwo\nthree\n", span.getInnerText());
+      Assert.assertEquals(1, textNodeCount(span));
+      Assert.assertEquals(1, ele.getChildCount());
+   }
+
+   public void testAppendsAcrossSubmitsExtendTheTrailingTextNode()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("one\n");
+      vc.submit("two\n");
+      vc.submit("three\n");
+
+      Element span = ele.getFirstChildElement();
+      Assert.assertEquals("one\ntwo\nthree\n", span.getInnerText());
+      Assert.assertEquals(1, textNodeCount(span));
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testLargeAppendsStartNewTextNodes()
+   {
+      // the trailing text node is only extended while it is small, so that
+      // edits near the end never have to copy a whole command's output
+      StringBuilder big = new StringBuilder();
+      for (int i = 0; i < 70000; i++)
+         big.append('x');
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(big.toString());
+      vc.submit("tail\n");
+
+      Element span = ele.getFirstChildElement();
+      Assert.assertEquals(2, textNodeCount(span));
+      Assert.assertEquals(big.toString() + "tail\n", span.getInnerText());
+      Assert.assertEquals(1, vc.getNewlinesWritten());
+   }
+
+   public void testNewlinesWrittenCountsAppendedLines()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      Assert.assertEquals(0, vc.getNewlinesWritten());
+
+      vc.submit("one\ntwo");
+      Assert.assertEquals(1, vc.getNewlinesWritten());
+
+      vc.submit("\nthree\n");
+      Assert.assertEquals(3, vc.getNewlinesWritten());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenAfterCarriageReturnOverwrite()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("line\nline\n");
+      for (int i = 0; i < 20; i++)
+         vc.submit("\rprogress " + i);
+      vc.submit("\n");
+
+      Assert.assertEquals("line\nline\nprogress 19\n", vc.toString());
+      Assert.assertEquals("line\nline\nprogress 19\n", ele.getInnerText());
+      Assert.assertEquals(3, vc.getNewlinesWritten());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenAfterOverwriteAcrossColorRanges()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("aaa\n" + setCsiCode(31) + "bbb\nccc\n" + setCsiCode(0) + "ddd\n");
+      vc.submit("\033[3A\rXXXXX\nYYYYY");
+
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenAfterEraseInLine()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("one\ntwo\nthree\033[2K\033[1A\033[K");
+
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenAfterFormFeed()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("one\ntwo\n");
+      vc.submit("\fthree\n");
+
+      Assert.assertEquals("three\n", ele.getInnerText());
+      Assert.assertEquals(1, vc.getNewlinesWritten());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenAccountsForGroupTrimming()
+   {
+      // a condition group's leading and trailing newlines are dropped from
+      // the DOM when the next output starts; the count must follow the DOM
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("before\n");
+      vc.submit("\033G3;\n\nmessage one\n\n\033g", "stderr");
+      vc.submit("between\n");
+      vc.submit("\033G2;\nwarning\n\033g", "stderr");
+      vc.submit("after\n");
+      vc.normalizePreviousOutput();
+
+      Assert.assertTrue(vc.getNewlinesWritten() < StringUtil.newlineCount(vc.toString()));
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenWhenGroupStartsMidLine()
+   {
+      // starting a group after a carriage return discards the rest of the
+      // current line from the DOM
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("one\ntwo\nthree\r");
+      vc.submit("\033G3;msg\n\033g", "stderr");
+      vc.submit("four\n");
+
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testNewlinesWrittenWithHyperlinks()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("see \033]8;;https://example.com\033\\the docs\033]8;;\033\\\nnext\n");
+      vc.submit("\033[2A\rXX");
+
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testOverwriteFallsBackWhenTrailingTextNodeIsShort()
+   {
+      // the trailing text node holds only the last submit; an overwrite that
+      // reaches back past it must rewrite the whole range correctly
+      StringBuilder big = new StringBuilder();
+      for (int i = 0; i < 70000; i++)
+         big.append('x');
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit(big.toString() + "\nlong line of text\n");
+      vc.submit("end");
+      vc.submit("\033[1A\rREPLACED\n");
+
+      Element span = ele.getFirstChildElement();
+      Assert.assertEquals(2, textNodeCount(span));
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      Assert.assertTrue(vc.toString().endsWith("\nREPLACEDe of text\nend"));
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testGroupStartedMidLineThenOverwrittenInAnotherStyle()
+   {
+      // a progress line interrupted by a message, then redrawn in a new
+      // color: starting the group drops the rest of the line, and the redraw
+      // must not find a range whose element is no longer in the DOM
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Downloading 10%\r");
+      vc.submit("\033G3;note\033g");
+      vc.submit("\r" + setCsiCode(31) + "Downloading 20%" + setCsiCode(0) + "\n");
+
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testGroupStartedMidLineThenOverwrittenInSameStyle()
+   {
+      // same, without a color change: the redraw used to be written into
+      // the detached element and vanish from the console
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("Downloading 10%\r");
+      vc.submit("\033G3;note\033g");
+      vc.submit("\rDownloading 20%\n");
+
+      Assert.assertEquals("Downloading 20%\n", vc.toString());
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testGroupStartedMidLineDropsTheRestOfTheLineEverywhere()
+   {
+      // the discarded text must leave the buffer as well as the DOM, across
+      // more than one range
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("keep " + setCsiCode(31) + "red" + setCsiCode(0) + " plain\033[9D");
+      vc.submit("\033G3;note\033g\n");
+
+      Assert.assertEquals("keep note\n", vc.toString());
+      Assert.assertEquals(vc.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testGroupOpenedInItsOwnSubmitStillCollectsTheMessage()
+   {
+      // the request to start a new range for the group used to be consumed
+      // by a submit holding only the message's newline, so the text that
+      // followed was written outside the group span
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;");
+      vc.submit("\n");
+      vc.submit("message\n");
+      vc.submit("\033g");
+      vc.submit("after\n");
+
+      Element group = Element.as(ele.getChild(1));
+      Assert.assertTrue(group.hasClassName(VirtualConsole.RES.styles().group()));
+      Assert.assertEquals("message", group.getInnerText());
+      Assert.assertEquals("\nmessage\nafter\n", vc.toString());
+      Assert.assertEquals("\nmessageafter\n", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   // ---- chunking invariance and random streams ----
+
+   // Streams exercising every path that touches the DOM: plain appends,
+   // colors, carriage return, backspace, cursor movement, erase in line,
+   // hyperlinks, condition groups, a form feed, and escapes that get split
+   // across submits. Each ends cleanly so nothing is held back.
+   private static final String[] STREAMS = {
+      "plain\ntext\n",
+      "progress 1\rprogress 2\rprogress 3\n",
+      "abc\b\bXY\n",
+      setCsiCode(31) + "red\n" + setCsiCode(32) + "green" + setCsiCode(0) + "\nplain\n",
+      "aaa\nbbb\nccc\n\033[2AXX\033[1BYY\n",
+      "one\ntwo\nthree\033[2K\033[1A\033[K\n",
+      "aaa\n" + setCsiCode(31) + "bbb\nccc\n" + setCsiCode(0) + "ddd\n\033[3A\rXXXXX\nYYYYY\n",
+      "see \033]8;;https://example.com\033\\the docs\033]8;;\033\\\nnext\n\033[2A\rXX\n",
+      "before\n\033G3;\n\nmessage\n\n\033gbetween\n\033G2;\nwarning\n\033gafter\n",
+      "one\ntwo\nthree\r\033G3;msg\n\033gfour\n",
+      "one\ntwo\n\fthree\nfour\n",
+      setCsiCode(1) + "bold" + setCsiCode(22) + " \033[5Gcol\n",
+      "x\033[31mred\033[0m\033]8;;https://a.b\033\\link\033]8;;\033\\\n",
+   };
+
+   private static String render(String[] chunks)
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = new VirtualConsole(ele, new FakePrefs());
+      for (String chunk : chunks)
+         vc.submit(chunk);
+      vc.normalizePreviousOutput();
+      assertNewlinesMatchDom(ele, vc);
+
+      // the span structure legitimately depends on where the submits fall;
+      // the text, and the line count, must not
+      return ele.getInnerText() + "\n--\n" + vc.toString() + "\n--\n" + vc.getNewlinesWritten();
+   }
+
+   // RStudio's own group and highlight escapes (ESC G n ; ...) are not
+   // recognized as incomplete when cut off by the end of a submit, unlike
+   // CSI sequences, so a cut inside one renders its tail as text. The
+   // session writes them atomically, so only the test needs to avoid it.
+   private static boolean insideRStudioEscape(String stream, int cut)
+   {
+      for (int i = cut - 1; i >= 0 && cut - i <= 8; i--)
+      {
+         if (stream.charAt(i) != '\033')
+            continue;
+         if (i + 1 >= stream.length() || (stream.charAt(i + 1) != 'G' && stream.charAt(i + 1) != 'H'))
+            return false;
+
+         int end = i + 2;
+         while (end < stream.length() && Character.isDigit(stream.charAt(end)))
+            end++;
+         return end < stream.length() && stream.charAt(end) == ';' && cut <= end;
+      }
+      return false;
+   }
+
+   private static String[] split(String stream, int[] cuts)
+   {
+      List<String> chunks = new ArrayList<>();
+      int last = 0;
+      for (int cut : cuts)
+      {
+         if (cut <= last || cut >= stream.length() || insideRStudioEscape(stream, cut))
+            continue;
+         chunks.add(stream.substring(last, cut));
+         last = cut;
+      }
+      chunks.add(stream.substring(last));
+      return chunks.toArray(new String[0]);
+   }
+
+   public void testOutputDoesNotDependOnChunking()
+   {
+      // appends are written to the DOM once per submit, so the result must be
+      // the same however the stream is cut up, including one byte at a time
+      Random random = new Random(19082);
+      for (String stream : STREAMS)
+      {
+         String whole = render(new String[] { stream });
+
+         int[] everyByte = new int[stream.length()];
+         for (int i = 0; i < everyByte.length; i++)
+            everyByte[i] = i;
+         Assert.assertEquals(stream, whole, render(split(stream, everyByte)));
+
+         for (int trial = 0; trial < 20; trial++)
+         {
+            int[] cuts = new int[1 + random.nextInt(4)];
+            for (int i = 0; i < cuts.length; i++)
+               cuts[i] = random.nextInt(stream.length());
+            java.util.Arrays.sort(cuts);
+            Assert.assertEquals(stream, whole, render(split(stream, cuts)));
+         }
+      }
+   }
+
+   private static final String[] FRAGMENTS = {
+      "a", "bc", "def\n", "\n", "\r", "\b", "\f",
+      "\033[1A", "\033[2B", "\033[3C", "\033[1D", "\033[K", "\033[1K", "\033[2K", "\033[4G", "\033[1E", "\033[1F",
+      "\033[31m", "\033[42m", "\033[1m", "\033[0m", "\033[7m",
+      "\033]8;;https://x.y\033\\", "\033]8;;\033\\",
+      "\033G1;", "\033G3;", "\033g",
+      "long line with several words in it\n", "  spaces  ",
+   };
+
+   public void testRandomStreamsKeepNewlineCountExact()
+   {
+      // random mixes of everything the console understands, delivered in
+      // random chunks; the newline count must always match the DOM
+      Random random = new Random(1234);
+      for (int trial = 0; trial < 150; trial++)
+      {
+         StringBuilder stream = new StringBuilder();
+         int fragments = 1 + random.nextInt(25);
+         for (int i = 0; i < fragments; i++)
+            stream.append(FRAGMENTS[random.nextInt(FRAGMENTS.length)]);
+         stream.append("\033g\n");
+
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = getVC(ele);
+         int pos = 0;
+         while (pos < stream.length())
+         {
+            int next = Math.min(stream.length(), pos + 1 + random.nextInt(12));
+            try
+            {
+               vc.submit(stream.substring(pos, next));
+            }
+            catch (RuntimeException e)
+            {
+               Assert.fail("submit threw on " + stream + " at " + pos + ": " + e);
+            }
+            Assert.assertEquals(stream.toString(), DomUtils.countLines(ele, true), vc.getNewlinesWritten());
+            pos = next;
+         }
+         vc.normalizePreviousOutput();
+         Assert.assertEquals(stream.toString(), DomUtils.countLines(ele, true), vc.getNewlinesWritten());
+      }
+   }
+
+   public void testRandomStreamsWithoutGroupsRenderTheBuffer()
+   {
+      // without groups (whose newline trimming is DOM-only), the DOM text is
+      // exactly the console's text buffer after every submit
+      Random random = new Random(5678);
+      for (int trial = 0; trial < 150; trial++)
+      {
+         StringBuilder stream = new StringBuilder();
+         int fragments = 1 + random.nextInt(25);
+         for (int i = 0; i < fragments; i++)
+         {
+            String fragment = FRAGMENTS[random.nextInt(FRAGMENTS.length)];
+            if (fragment.startsWith("\033G") || fragment.equals("\033g"))
+               continue;
+            stream.append(fragment);
+         }
+         stream.append("\n");
+
+         PreElement ele = Document.get().createPreElement();
+         VirtualConsole vc = getVC(ele);
+         int pos = 0;
+         while (pos < stream.length())
+         {
+            int next = Math.min(stream.length(), pos + 1 + random.nextInt(12));
+            try
+            {
+               vc.submit(stream.substring(pos, next));
+            }
+            catch (RuntimeException e)
+            {
+               Assert.fail("submit threw on " + stream + " at " + pos + ": " + e);
+            }
+            pos = next;
+         }
+         vc.flushPartialAnsiCode();
+         Assert.assertEquals(stream.toString(), vc.toString(), ele.getInnerText());
+         Assert.assertEquals(stream.toString(), DomUtils.countLines(ele, true), vc.getNewlinesWritten());
+      }
+   }
+
+   public void testNewlinesWrittenExcludesDiscardedGroups()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;one\ntwo\n\033g");
+      vc.submit("\033[2A\033G2;\nwarn\n\033g");
+
+      // Replacing the message group must account for removed ranges and any
+      // buffered newlines before writing the warning group.
+      assertNewlinesMatchDom(ele, vc);
+
+      vc.submit("next\nlast\n");
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testOverwriteAfterTrimmingGroupNewlines()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;abcdef\n\033g");
+      vc.submit("tail");
+      vc.submit("\033[A\033[3GX");
+
+      Assert.assertEquals("abXdeftail", ele.getInnerText());
+      vc.submit("Y");
+      Assert.assertEquals("abXYeftail", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testOverwriteAfterTrimmingBothEndsOfGroup()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;first\nabcdef\n\033g");
+      vc.submit("tail");
+      Assert.assertEquals(1, DomUtils.trimLines(ele, 1));
+      vc.submit("\033[A\033[3GX");
+
+      Assert.assertEquals("abXdeftail", ele.getInnerText());
+      // Scrollback trimming is accounted for by the caller, not the console.
+      Assert.assertEquals(DomUtils.countLines(ele, true), vc.getNewlinesWritten() - 1);
+   }
+
+   public void testStyledOverwriteAfterTrimmingGroupNewlines()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;abcdef\n\033g");
+      vc.submit("tail");
+      vc.submit("\033[A\033[3G\033[31mX");
+
+      Assert.assertEquals("abXdeftail", ele.getInnerText());
+      vc.submit("\033[0mY");
+      Assert.assertEquals("abXYeftail", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testWriteRestoresOmittedGroupNewline()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;abcdef\n\033g");
+      vc.submit("tail");
+      vc.submit("\033[A\033[999G\n");
+
+      Assert.assertEquals("abcdef\ntail", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testClearDetachedGroupDoesNotChangeNewlineCount()
+   {
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;one\n");
+      int before = vc.getNewlinesWritten();
+      vc.getParent().removeFromParent();
+      vc.submit("two\n");
+      Assert.assertEquals(before, vc.getNewlinesWritten());
+      vc.clear();
+
+      // The caller accounts for removing the group; clearing its detached
+      // contents must not subtract the same newline a second time.
+      Assert.assertEquals(before, vc.getNewlinesWritten());
+   }
+
+   public void testGroupTrailingNewlinesAcrossTextNodes()
+   {
+      StringBuilder text = new StringBuilder();
+      for (int i = 0; i < 65535; i++)
+         text.append('x');
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      vc.submit("\033G3;" + text + "\n");
+      vc.submit("\n\033g");
+      vc.normalizePreviousOutput();
+      vc.normalizePreviousOutput();
+
+      Assert.assertEquals(text.toString(), ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+
+      vc.submit("after\n");
+      Assert.assertEquals(text + "after\n", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+
+   public void testGroupLeadingNewlinesAcrossTextNodes()
+   {
+      StringBuilder newlines = new StringBuilder();
+      for (int i = 0; i < 65536; i++)
+         newlines.append('\n');
+
+      PreElement ele = Document.get().createPreElement();
+      VirtualConsole vc = getVC(ele);
+      // Start a range inside the group, then erase it so that subsequent
+      // leading newlines are written inside that group as well.
+      vc.submit("\033G3;x\r\033[K");
+      vc.submit(newlines.toString());
+      vc.submit("\nbody\033g");
+      vc.normalizePreviousOutput();
+
+      Assert.assertEquals("body", ele.getInnerText());
+      assertNewlinesMatchDom(ele, vc);
+   }
+}

@@ -1,0 +1,245 @@
+/*
+ * GitChangelistTable.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.workbench.views.vcs.git;
+
+import com.google.gwt.cell.client.AbstractCell;
+import com.google.gwt.cell.client.FieldUpdater;
+import com.google.gwt.cell.client.ValueUpdater;
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.dom.client.Element;
+import com.google.gwt.dom.client.EventTarget;
+import com.google.gwt.dom.client.NativeEvent;
+import com.google.gwt.event.shared.HandlerRegistration;
+import com.google.gwt.safehtml.shared.SafeHtmlBuilder;
+import com.google.gwt.text.shared.SafeHtmlRenderer;
+import com.google.gwt.user.cellview.client.Column;
+import org.rstudio.core.client.CommandWithArg;
+import org.rstudio.core.client.SafeHtmlUtil;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.cellview.TriStateCheckboxCell;
+import org.rstudio.core.client.resources.ImageResource2x;
+import org.rstudio.core.client.theme.res.ThemeStyles;
+import org.rstudio.studio.client.common.vcs.StatusAndPath;
+import org.rstudio.studio.client.workbench.codesearch.ui.CodeSearchResources;
+import org.rstudio.studio.client.workbench.views.vcs.ViewVcsConstants;
+import org.rstudio.studio.client.workbench.views.vcs.common.ChangelistTable;
+import org.rstudio.studio.client.workbench.views.vcs.common.events.StageUnstageEvent;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+
+public class GitChangelistTable extends ChangelistTable
+{
+   public void toggleStaged(boolean moveSelection)
+   {
+      ArrayList<StatusAndPath> items = getSelectedItems();
+      if (items.size() > 0)
+      {
+         boolean unstage = StringUtil.isCharAt(items.get(0).getStatus(), ' ', 1);
+         fireEvent(new StageUnstageEvent(unstage, items));
+
+         if (moveSelection)
+         {
+            moveSelectionDown();
+         }
+      }
+   }
+
+   @Override
+   protected SafeHtmlRenderer<String> getStatusRenderer()
+   {
+      return new GitStatusRenderer();
+   }
+
+   @Override
+   protected void configureTable()
+   {
+      final Column<StatusAndPath, Boolean> stagedColumn = new Column<StatusAndPath, Boolean>(
+            new TriStateCheckboxCell<>(selectionModel_,
+                  item -> constants_.stageFile(item.getPath())))
+      {
+         @Override
+         public Boolean getValue(StatusAndPath object)
+         {
+            return "??".equals(object.getStatus()) ? Boolean.FALSE :
+                   StringUtil.isCharAt(object.getStatus(), ' ', 1) ? Boolean.TRUE :
+                   StringUtil.isCharAt(object.getStatus(), ' ', 0) ? Boolean.FALSE :
+                   null;
+         }
+      };
+
+      stagedColumn.setHorizontalAlignment(Column.ALIGN_CENTER);
+      stagedColumn.setFieldUpdater(new FieldUpdater<StatusAndPath, Boolean>()
+      {
+         @Override
+         public void update(final int index,
+                            final StatusAndPath object,
+                            Boolean value)
+         {
+            fireEvent(new StageUnstageEvent(!value, getSelectedItems()));
+         }
+      });
+      stagedColumn.setSortable(true);
+      sortHandler_.setComparator(stagedColumn, new Comparator<StatusAndPath>()
+      {
+         @Override
+         public int compare(StatusAndPath a, StatusAndPath b)
+         {
+            Boolean a1 = stagedColumn.getValue(a);
+            Boolean b1 = stagedColumn.getValue(b);
+            int a2 = a1 == null ? 0 : a1 ? -1 : 1;
+            int b2 = b1 == null ? 0 : b1 ? -1 : 1;
+            return a2 - b2;
+         }
+      });
+      table_.addColumn(stagedColumn, constants_.stagedCapitalized());
+      table_.setColumnWidth(stagedColumn, "46px");
+
+      super.configureTable();
+   }
+
+   public HandlerRegistration addStageUnstageHandler(StageUnstageEvent.Handler handler)
+   {
+      return addHandler(handler, StageUnstageEvent.TYPE);
+   }
+
+   // Adds a last column with a button per file that runs the handler, to
+   // open the file at its first change. Not every table that lists changes
+   // can open files where they are, so it is added on request.
+   public void setGoToChangeHandler(CommandWithArg<StatusAndPath> handler)
+   {
+      if (goToChangeHandler_ == null)
+      {
+         Column<StatusAndPath, StatusAndPath> column =
+               new Column<StatusAndPath, StatusAndPath>(new GoToChangeCell())
+         {
+            @Override
+            public StatusAndPath getValue(StatusAndPath object)
+            {
+               return object;
+            }
+         };
+         column.setHorizontalAlignment(Column.ALIGN_CENTER);
+
+         // the header names the column for assistive technology; on screen
+         // the icons speak for themselves
+         SafeHtmlBuilder header = new SafeHtmlBuilder();
+         header.append(SafeHtmlUtil.createOpenTag("span",
+               "class", ThemeStyles.INSTANCE.visuallyHidden()));
+         header.appendEscaped(constants_.goToFirstChangeColumn());
+         header.appendHtmlConstant("</span>");
+
+         table_.addColumn(column, header.toSafeHtml());
+         table_.setColumnWidth(column, "28px");
+      }
+
+      goToChangeHandler_ = handler;
+   }
+
+   // Whether the selected file can be opened at its first change, as its
+   // row's button would: one file selected, with a handler and a change.
+   public boolean canGoToSelectedChange()
+   {
+      ArrayList<StatusAndPath> items = getSelectedItems();
+      return goToChangeHandler_ != null && items.size() == 1 && canGoToChange(items.get(0));
+   }
+
+   // Opens the selected file at its first change, as its row's button does;
+   // false when it cannot (see canGoToSelectedChange).
+   public boolean goToSelectedChange()
+   {
+      if (!canGoToSelectedChange())
+         return false;
+
+      goToChangeHandler_.execute(getSelectedItems().get(0));
+      return true;
+   }
+
+   // Whether an event came from a row's go-to-change button, which the
+   // table's own key and mouse handling (staging) should leave alone.
+   public static boolean isGoToChangeEvent(NativeEvent event)
+   {
+      EventTarget target = event.getEventTarget();
+      if (!Element.is(target))
+         return false;
+
+      Element el = Element.as(target);
+      while (el != null)
+      {
+         if (el.hasClassName(GO_TO_CHANGE_CLASS))
+            return true;
+         el = el.getParentElement();
+      }
+      return false;
+   }
+
+   // A file that no longer exists in the working tree (deleted) has nothing
+   // to open, nor does a directory (an untracked one, listed whole).
+   private static boolean canGoToChange(StatusAndPath item)
+   {
+      return !item.isDirectory() && !item.getStatus().contains("D");
+   }
+
+   private class GoToChangeCell extends AbstractCell<StatusAndPath>
+   {
+      GoToChangeCell()
+      {
+         super("click");
+      }
+
+      @Override
+      public void render(Context context, StatusAndPath value, SafeHtmlBuilder sb)
+      {
+         if (value == null || !canGoToChange(value))
+            return;
+
+         // Out of the Tab order, as the staging checkboxes are: the table is
+         // one Tab stop, its rows reached with the arrow keys (and the
+         // selected row's change with Shift+Enter; see goToSelectedChange).
+         ImageResource2x icon = new ImageResource2x(CodeSearchResources.INSTANCE.gotoFunction2x());
+         sb.append(SafeHtmlUtil.createOpenTag("button",
+               "type", "button",
+               "tabindex", "-1",
+               "class", GO_TO_CHANGE_CLASS,
+               "title", constants_.goToFirstChangeTitle(),
+               "aria-label", constants_.goToFirstChange(value.getPath())));
+         sb.append(SafeHtmlUtil.createOpenTag("img",
+               "src", icon.getSafeUri().asString(),
+               "width", Integer.toString(icon.getWidth()),
+               "height", Integer.toString(icon.getHeight()),
+               "alt", ""));
+         sb.appendHtmlConstant("</button>");
+      }
+
+      @Override
+      public void onBrowserEvent(Context context,
+                                 Element parent,
+                                 StatusAndPath value,
+                                 NativeEvent event,
+                                 ValueUpdater<StatusAndPath> valueUpdater)
+      {
+         if (value == null || goToChangeHandler_ == null || !isGoToChangeEvent(event))
+            return;
+
+         event.preventDefault();
+         goToChangeHandler_.execute(value);
+      }
+   }
+
+   private CommandWithArg<StatusAndPath> goToChangeHandler_;
+
+   private static final String GO_TO_CHANGE_CLASS = "rstudio-vcs-go-to-change";
+   private static final ViewVcsConstants constants_ = GWT.create(ViewVcsConstants.class);
+}
