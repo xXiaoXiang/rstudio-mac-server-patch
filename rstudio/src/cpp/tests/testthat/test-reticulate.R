@@ -1,0 +1,375 @@
+#
+# test-reticulate.R
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+context("reticulate")
+
+test_that("startup resolves explicit Python configuration without discovery", {
+   withr::local_envvar(c(RETICULATE_PYTHON = "/opt/testthat/python"))
+   expect_identical(.rs.inferReticulatePython(discover = FALSE), "/opt/testthat/python")
+})
+
+test_that("startup preserves an explicitly empty Python configuration", {
+   # Setting an environment variable to "" on Windows removes it, so an
+   # explicitly empty RETICULATE_PYTHON can't be represented there.
+   skip_on_os("windows")
+   withr::local_envvar(c(RETICULATE_PYTHON = ""))
+   expect_identical(.rs.inferReticulatePython(discover = FALSE), "")
+})
+
+test_that("startup leaves automatic Python discovery pending", {
+   skip_if_not_installed("reticulate")
+   withr::local_envvar(c(RETICULATE_PYTHON = NA, RETICULATE_PYTHON_FALLBACK = NA))
+   skip_if(nzchar(.rs.readUiPref("python_path")))
+   skip_if("reticulate" %in% loadedNamespaces() && reticulate::py_available(initialize = FALSE))
+   expect_null(.rs.inferReticulatePython(discover = FALSE))
+})
+
+test_that("startup respects the Python fallback without discovery", {
+   withr::local_envvar(c(RETICULATE_PYTHON = NA, RETICULATE_PYTHON_FALLBACK = "/opt/testthat/fallback"))
+   skip_if(nzchar(.rs.readUiPref("python_path")))
+   skip_if("reticulate" %in% loadedNamespaces() && reticulate::py_available(initialize = FALSE))
+   expect_identical(.rs.inferReticulatePython(discover = FALSE), "/opt/testthat/fallback")
+})
+
+test_that("RETICULATE_PYTHON environment variable is respected", {
+   # save old value and set a dummy value
+   oldPython <- Sys.getenv("RETICULATE_PYTHON")
+   Sys.setenv(RETICULATE_PYTHON = "/opt/testthat/python")
+   on.exit({
+      # restore old value
+      Sys.setenv(RETICULATE_PYTHON = oldPython)
+   }, add = TRUE)
+
+   # perform autodiscovery
+   python <- .rs.inferReticulatePython()
+
+   # we expect that since we set a custom value it'll be reflected
+   expect_equal(python, Sys.getenv("RETICULATE_PYTHON"))
+})
+
+test_that("Python help topics accept only plain dotted names", {
+
+   # legitimate help topics resolve to valid qualified names
+   expect_true(.rs.python.isHelpTopicValid("numpy"))
+   expect_true(.rs.python.isHelpTopicValid("os.path"))
+   expect_true(.rs.python.isHelpTopicValid("pandas.DataFrame"))
+   expect_true(.rs.python.isHelpTopicValid("_private.member"))
+
+})
+
+test_that("Python help topics reject code injection payloads", {
+
+   # these would otherwise be evaluated as Python expressions
+   expect_false(.rs.python.isHelpTopicValid("open('pwned.txt','w').write('RCE')"))
+   expect_false(.rs.python.isHelpTopicValid("__import__('os').system('id')"))
+   expect_false(.rs.python.isHelpTopicValid("os.system('id')"))
+   expect_false(.rs.python.isHelpTopicValid("numpy.array(1)"))
+   expect_false(.rs.python.isHelpTopicValid("a;b"))
+   expect_false(.rs.python.isHelpTopicValid("a b"))
+   expect_false(.rs.python.isHelpTopicValid("1abc"))
+   expect_false(.rs.python.isHelpTopicValid(".leadingdot"))
+   expect_false(.rs.python.isHelpTopicValid(""))
+
+})
+
+# initializing Python with no interpreter configured can make reticulate
+# provision one over the network, so only run when one was requested
+skipIfPythonUnavailable <- function()
+{
+   skip_if_not_installed("reticulate")
+   skip_if(!nzchar(Sys.getenv("RETICULATE_PYTHON")), "RETICULATE_PYTHON is not set")
+
+   available <- tryCatch(
+      reticulate::py_available(initialize = TRUE),
+      error = function(e) FALSE
+   )
+
+   skip_if_not(available, "Python is not available")
+}
+
+test_that("reticulate's error hint is cached when Python is initialized", {
+
+   skipIfPythonUnavailable()
+
+   # computing the hint while formatting a later error is what could re-enter
+   # reticulate (rstudio/reticulate#1935), so a later error must not call it
+   ns <- asNamespace("reticulate")
+   hint <- get(".py_last_error_hint", envir = ns)
+   calls <- 0L
+   counting <- function() {
+      calls <<- calls + 1L
+      hint()
+   }
+
+   unlockBinding(".py_last_error_hint", ns)
+   assign(".py_last_error_hint", counting, envir = ns)
+   on.exit({
+      assign(".py_last_error_hint", hint, envir = ns)
+      lockBinding(".py_last_error_hint", ns)
+   }, add = TRUE)
+
+   message <- tryCatch(reticulate::py_eval("None.missing"), error = conditionMessage)
+   expect_match(message, "AttributeError")
+   expect_identical(calls, 0L)
+})
+
+test_that("errors caching reticulate's error hint are logged, not raised", {
+
+   # the implementation reaches into reticulate internals, which may change
+   rsEnv <- as.environment("tools:rstudio")
+   impl <- get(".rs.reticulate.cacheErrorHintImpl", envir = rsEnv)
+   emit <- get(".rs.logMessageEmit", envir = rsEnv)
+   on.exit({
+      assign(".rs.reticulate.cacheErrorHintImpl", impl, envir = rsEnv)
+      assign(".rs.logMessageEmit", emit, envir = rsEnv)
+   }, add = TRUE)
+
+   logged <- character()
+   assign(".rs.reticulate.cacheErrorHintImpl", function(builtins) stop("boom"), envir = rsEnv)
+   assign(".rs.logMessageEmit", function(method, message) {
+      logged <<- c(logged, message)
+   }, envir = rsEnv)
+
+   expect_false(.rs.reticulate.cacheErrorHint(NULL))
+   expect_identical(logged, "Error caching reticulate's error hint: boom")
+})
+
+test_that("Python function arguments are discovered with inspect.signature()", {
+
+   skipIfPythonUnavailable()
+
+   reticulate::py_run_string('
+def _rs_test_function(a, b: int, c=1, *args, d, e=2, **kwargs):
+    pass
+
+class _rs_test_class:
+    def __init__(self, x, y=1, *, z=2):
+        pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_function, _rs_test_class"), add = TRUE)
+
+   # variadic parameters can't be supplied as 'name=value'
+   object <- reticulate::py_eval("_rs_test_function", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), c("a", "b", "c", "d", "e"))
+
+   # classes report their constructor's arguments, without 'self'
+   object <- reticulate::py_eval("_rs_test_class", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), c("x", "y", "z"))
+
+})
+
+test_that("Python function arguments tolerate unresolvable lazy annotations", {
+
+   skipIfPythonUnavailable()
+   skip_if(reticulate::py_version() < "3.14", "lazy annotations require Python 3.14")
+
+   # '_RsTestMissing' is never bound, as with imports guarded by TYPE_CHECKING
+   reticulate::py_run_string('
+def _rs_test_function(a, b: _RsTestMissing = None):
+    pass
+
+class _rs_test_class:
+    def __init__(self, x: _RsTestMissing, *, y=1):
+        pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_function, _rs_test_class"), add = TRUE)
+
+   object <- reticulate::py_eval("_rs_test_function", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), c("a", "b"))
+
+   object <- reticulate::py_eval("_rs_test_class", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), c("x", "y"))
+
+})
+
+test_that("Python positional-only arguments are not offered", {
+
+   skipIfPythonUnavailable()
+   skip_if(reticulate::py_version() < "3.8", "positional-only syntax requires Python 3.8")
+
+   reticulate::py_run_string('
+def _rs_test_function(a, /, b):
+    pass
+
+def _rs_test_positional(x, /):
+    """_rs_test_positional(x)"""
+    pass
+
+def _rs_test_varargs(x, /, *args):
+    """_rs_test_varargs(x)"""
+    pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_function, _rs_test_positional, _rs_test_varargs"), add = TRUE)
+
+   object <- reticulate::py_eval("_rs_test_function", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), "b")
+
+   # functions that accept no keywords at all are complete; don't consult
+   # the docstring for names that can't be passed as 'name=value'
+   object <- reticulate::py_eval("_rs_test_positional", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), character())
+
+   object <- reticulate::py_eval("_rs_test_varargs", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), character())
+
+})
+
+test_that("Python function arguments fall back to the docstring only for opaque signatures", {
+
+   skipIfPythonUnavailable()
+
+   reticulate::py_run_string('
+def _rs_test_function(*args, **kwargs):
+    """_rs_test_function(x, y=1)"""
+    pass
+
+def _rs_test_empty():
+    """Same as _rs_test_function(x, y=1)"""
+    pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_function, _rs_test_empty"), add = TRUE)
+
+   object <- reticulate::py_eval("_rs_test_function", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), c("x", "y"))
+
+   # a function that genuinely takes no arguments shouldn't borrow any
+   object <- reticulate::py_eval("_rs_test_empty", convert = FALSE)
+   expect_equal(.rs.python.getFunctionArguments(object), character())
+
+})
+
+test_that("Python argument completions are empty when there are no arguments", {
+
+   skipIfPythonUnavailable()
+
+   # the docstring fallback finds no arguments in '_rs_test_wrapper()'
+   reticulate::py_run_string('
+def _rs_test_empty():
+    pass
+
+def _rs_test_wrapper(*args, **kwargs):
+    """_rs_test_wrapper()"""
+    pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_empty, _rs_test_wrapper"), add = TRUE)
+
+   expect_length(.rs.python.getCompletionsArguments("_rs_test_empty", ""), 0)
+   expect_length(.rs.python.getCompletionsArguments("_rs_test_wrapper", ""), 0)
+
+})
+
+test_that("Python parameter help includes each parameter's description", {
+
+   skipIfPythonUnavailable()
+
+   # the docstring ends with the last parameter's description
+   reticulate::py_run_string('
+def _rs_test_function(alpha, *, beta=1):
+    """Test function.
+
+    Parameters
+    ----------
+    alpha : int
+        The first parameter.
+    beta : int
+        The second parameter."""
+    pass
+')
+   on.exit(reticulate::py_run_string("del _rs_test_function"), add = TRUE)
+
+   help <- .rs.python.getParameterHelp("_rs_test_function")
+   expect_equal(help$args, c("alpha", "beta"))
+   expect_equal(
+      help$arg_descriptions,
+      c("int\nThe first parameter.", "int\nThe second parameter.")
+   )
+
+})
+
+test_that("the REPL hook runs buffered code before an unindented quit", {
+
+   skipIfPythonUnavailable()
+
+   # reticulate only honors 'quit' / 'exit' when its buffer is empty; scripted
+   # input can ask to leave the REPL right after a block, without the blank
+   # line that would close it
+   buffer <- reticulate:::stack(mode = "character")
+   buffer$push("def rstudio_hook_test():", "    return 1", "    ")
+
+   expect_false(.rs.reticulate.replHook(buffer, "quit", "quit"))
+   expect_true(buffer$empty())
+   expect_equal(reticulate::py_eval("rstudio_hook_test()"), 1L)
+
+   # an error raised by the buffered code still clears the buffer so the quit goes through
+   buffer$push("for i in range(1):", "    1 / 0")
+   expect_message(expect_false(.rs.reticulate.replHook(buffer, "exit", "exit")))
+   expect_true(buffer$empty())
+
+   # the call spellings reticulate accepts are exit requests too
+   buffer$push("def rstudio_hook_test_2():", "    return 2")
+   expect_false(.rs.reticulate.replHook(buffer, "exit()", "exit()"))
+   expect_true(buffer$empty())
+   expect_equal(reticulate::py_eval("rstudio_hook_test_2()"), 2L)
+
+   # an indented quit inside a block is left to reticulate as before
+   buffer$push("def g():")
+   expect_false(.rs.reticulate.replHook(buffer, "    quit", "quit"))
+   expect_false(buffer$empty())
+   buffer$clear()
+
+   # inside an open string or bracket the line is content, not an exit request
+   buffer$push("msg = \"\"\"")
+   expect_false(.rs.reticulate.replHook(buffer, "exit", "exit"))
+   expect_false(buffer$empty())
+   buffer$clear()
+
+   buffer$push("x = (1 +")
+   expect_false(.rs.reticulate.replHook(buffer, "quit", "quit"))
+   expect_false(buffer$empty())
+
+})
+
+test_that("the matplotlib load hook forces the agg backend", {
+
+   skipIfPythonUnavailable()
+   skip_if_not_installed("png")
+
+   # the hook only reaches matplotlib.use() when matplotlib is imported with a
+   # backend configured explicitly (e.g. MPLBACKEND), before pyplot resolves one;
+   # matplotlib >= 3.9 loads 'matplotlib.backends' on import, so there the hook
+   # goes through pyplot instead and only the second half below is exercised
+   sys <- reticulate::import("sys", convert = TRUE)
+   skip_if("matplotlib" %in% names(sys$modules), "matplotlib is already loaded")
+
+   importlib <- reticulate::import("importlib.util", convert = TRUE)
+   skip_if(is.null(importlib$find_spec("matplotlib")), "matplotlib is not available")
+
+   os <- reticulate::import("os", convert = TRUE)
+   os$environ["MPLBACKEND"] <- "pdf"
+   on.exit(reticulate::py_del_item(os$environ, "MPLBACKEND"), add = TRUE)
+
+   # importing matplotlib fires the load hook, which switches the backend via
+   # matplotlib.use() (whose 'warn' parameter was removed in matplotlib 3.3.0);
+   # the explicit call covers the same path if the hook did not run
+   matplotlib <- reticulate::import("matplotlib", convert = TRUE)
+   expect_no_error(.rs.reticulate.matplotlib.onLoaded())
+   expect_equal(tolower(matplotlib$get_backend()), "agg")
+
+   # once pyplot is loaded, the hook switches the backend through pyplot instead
+   matplotlib$rcParams["backend"] <- "pdf"
+   expect_no_error(.rs.reticulate.matplotlib.onLoaded())
+   expect_equal(tolower(matplotlib$get_backend()), "agg")
+
+})

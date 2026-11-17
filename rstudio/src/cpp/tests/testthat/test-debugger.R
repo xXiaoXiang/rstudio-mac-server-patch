@@ -1,0 +1,557 @@
+#
+# test-debugger.R
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+library(testthat)
+
+context("debugger")
+
+test_that("deparsing large calls is not overly expensive", {
+   
+   # call including large data.frame
+   big <- data.frame(x = as.numeric(1:1E5))
+   cl <- call("dummy", big)
+   summary <- .rs.callSummary(cl)
+   expect_true(nchar(summary) < 1000)
+   
+   # call including large vector
+   data <- as.list(0:200)
+   data[[1L]] <- as.name("c")
+   cl <- as.call(data)
+   summary <- .rs.callSummary(cl)
+   expect_equal(summary, "c(...)")
+   
+   # call including large data.frame should be described quickly
+   big <- mtcars[rep.int(1, 1E5)]
+   bigcall <- call("dummy", x = big)
+   time <- system.time(.rs.describeObject("bigcall", environment()))
+   expect_true(time[1] < 1)
+   
+})
+
+test_that("we successfully parse the function name from different calls", {
+   
+   # regular old call
+   cl <- call("eval", quote(1 + 1))
+   expect_equal(.rs.functionNameFromCall(cl), "eval")
+   
+   # function directly in call object
+   cl <- quote(c(1, 2, 3))
+   cl[[1L]] <- c
+   expect_equal(.rs.functionNameFromCall(cl), "[Anonymous function]")
+   
+})
+
+test_that("function calls are not mangled into something un-printable", {
+
+   cl <- call("function", pairlist(a = 1, b = 2, c = 3), quote({}))
+   sanitized <- .rs.sanitizeCall(cl)
+   expect_equal(cl, sanitized)
+
+})
+
+test_that("breakpoints in S7 methods for S7 generics preserve the method class", {
+
+   skip_if_not_installed("S7")
+   loadNamespace("S7")
+
+   # define an S7 class, generic, and method in the global environment,
+   # as .rs.setBreakpointImpl resolves its function names there
+   code <- '
+      s7bpclass <- S7::new_class("s7bpclass")
+      s7bpgeneric <- S7::new_generic("s7bpgeneric", "x")
+      S7::method(s7bpgeneric, s7bpclass) <- function(x, ...) {
+         a <- 1
+         b <- 2
+         a + b
+      }
+   '
+   eval(parse(text = code, keep.source = TRUE), envir = globalenv())
+   on.exit(rm(list = c("s7bpclass", "s7bpgeneric"), envir = globalenv()), add = TRUE)
+
+   functionName <- "S7::method(s7bpgeneric, s7bpclass)"
+   methodEnvir <- attr(globalenv()$s7bpgeneric, "methods", exact = TRUE)
+   original <- methodEnvir$s7bpclass
+
+   # set a breakpoint; the method should be traced, but still look like an
+   # S7 method so that the generic remains printable (#18531)
+   result <- .rs.setBreakpointImpl(functionName, "", "", "2")
+   expect_false(identical(result, FALSE))
+
+   method <- methodEnvir$s7bpclass
+   expect_true(.rs.isTraced(method))
+   expect_true(inherits(method, "S7_method"))
+   expect_true(grepl(".doTrace", paste(deparse(body(method)), collapse = ""), fixed = TRUE))
+   expect_error(capture.output(print(globalenv()$s7bpgeneric)), NA)
+
+   # the untraced copy should be a well-formed S7 method
+   expect_identical(class(attr(method, "original", exact = TRUE)), class(original))
+
+   # move the breakpoint; the method should be re-traced, not doubly traced
+   result <- .rs.setBreakpointImpl(functionName, "", "", "3")
+   expect_false(identical(result, FALSE))
+
+   method <- methodEnvir$s7bpclass
+   expect_true(.rs.isTraced(method))
+   bodyText <- paste(deparse(body(method)), collapse = "")
+   matches <- gregexpr(".doTrace", bodyText, fixed = TRUE)[[1L]]
+   expect_identical(sum(matches > 0L), 1L)
+   expect_error(capture.output(print(globalenv()$s7bpgeneric)), NA)
+
+   # clear the breakpoint; the method should be restored exactly
+   result <- .rs.setBreakpointImpl(functionName, "", "", "")
+   expect_false(identical(result, FALSE))
+   expect_identical(methodEnvir$s7bpclass, original)
+
+   # a trace() failure should leave the method untouched
+   expect_error(.rs.setBreakpointImpl(functionName, "", "", "99"))
+   expect_identical(methodEnvir$s7bpclass, original)
+
+})
+
+test_that("the browser environment can be read before it is first set", {
+
+   # The environment is held in a file-scope PreservedSEXP, built before R
+   # starts. Until a console prompt sets it, reading it must give R's NULL,
+   # not a null pointer that .Call() warns about converting. The test harness
+   # runs as a script and never reaches a console prompt, so it is still unset
+   # here.
+   env <- expect_no_warning(.Call("rs_getBrowserEnv", PACKAGE = "(embedding)"))
+   expect_null(env)
+
+})
+
+test_that("frames whose inner call is built internally keep their call site", {
+
+   # lapply() constructs the call to FUN itself, so that call carries no
+   # source reference and the lapply() frame has no location of its own.
+   # It falls back to the source reference of the lapply() call, which is
+   # what keeps the frame navigable from the traceback.
+   file <- tempfile(pattern = "frames-", fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+
+   writeLines(c(
+      "outer_fn <- function() {",
+      "   lapply(1, function(i) inner_fn())",
+      "}",
+      "inner_fn <- function() {",
+      "   .rs.callFrames(targetDepth = 1L)",
+      "}"
+   ), file)
+
+   env <- new.env(parent = globalenv())
+   source(file, local = env, keep.source = TRUE)
+
+   # lapply() wraps its result, so unwrap before reading the frame list.
+   # expect_no_warning() rather than expect_silent(): the Jenkins runners see
+   # a warning here that nothing local reproduces, and only the former puts
+   # the warning's text in the test report.
+   frames <- expect_no_warning(env$outer_fn())[[1L]]$frames
+   names <- vapply(frames, function(frame) as.character(frame$function_name), "")
+
+   # Frames run innermost first, and the test harness has lapply() frames of
+   # its own further out, so ours is the first match. The file name assertion
+   # below confirms we picked it.
+   index <- which(names == "lapply")[1L]
+   expect_false(is.na(index))
+   expect_true(as.logical(frames[[index]]$real_sourceref))
+   expect_match(as.character(frames[[index]]$file_name), basename(file), fixed = TRUE)
+
+})
+
+test_that("the frame being browsed keeps its own file location", {
+
+   # The runtime srcref can come back empty for a function that carries its
+   # own source, and no inner call need be mapped to the frame either. Such a
+   # frame still has a real position to fall back on, and dropping it would
+   # navigate to a deparsed copy of the function rather than to the file.
+   # #18754 is about functions with no source of their own, not these.
+   #
+   # The fallback has to be the function's own definition rather than the call
+   # that created the frame: the call site belongs to the caller, so with the
+   # two functions in separate files it names the wrong file entirely.
+   locatedFile <- tempfile(pattern = "located-", fileext = ".R")
+   outerFile <- tempfile(pattern = "outer-", fileext = ".R")
+   on.exit(unlink(c(locatedFile, outerFile)), add = TRUE)
+
+   writeLines(c(
+      "# padding so the definition line differs from the call site",
+      "# padding",
+      "located_fn <- function() {",
+      "   .rs.callFrames(targetDepth = 1L)",
+      "}"
+   ), locatedFile)
+
+   writeLines(c(
+      "outer_fn <- function() {",
+      "   located_fn()",
+      "}"
+   ), outerFile)
+
+   env <- new.env(parent = globalenv())
+   source(locatedFile, local = env, keep.source = TRUE)
+   source(outerFile, local = env, keep.source = TRUE)
+
+   # The test harness never reaches a console prompt, so no browser
+   # environment has been set, and the innermost frame stands in for the one
+   # the browser would be halted in.
+   frame <- expect_no_warning(env$outer_fn())$frames[[1L]]
+
+   expect_identical(as.character(frame$function_name), "located_fn")
+   expect_true(as.logical(frame$real_sourceref))
+   expect_match(as.character(frame$file_name), basename(locatedFile), fixed = TRUE)
+   expect_identical(as.integer(frame$line_number), 3L)
+   expect_identical(as.integer(frame$end_line_number), 5L)
+
+})
+
+test_that("debugSourceRef only trusts the runtime srcref for located functions", {
+
+   runtimeRef <- c(10L, 1L, 10L, 20L, 1L, 20L)
+
+   # A function carrying its own source may use the evaluator's position.
+   located <- eval(parse(
+      text = "function(ref) .rs.debugSourceRef(1L, ref, NULL)",
+      keep.source = TRUE
+   ))
+
+   expect_equal(located(runtimeRef)$srcref, runtimeRef)
+
+   # R_GetCurrentSrcref would hand a function without source references its
+   # caller's location instead (#18754). With nothing left to simulate from,
+   # the location is reported as unknown so that the client can leave the
+   # debug highlight alone, rather than moving it to line zero.
+   unlocated <- eval(parse(
+      text = "function(ref) .rs.debugSourceRef(1L, ref, NULL)",
+      keep.source = FALSE
+   ))
+
+   expect_null(unlocated(runtimeRef))
+
+   # Depths past the end of the call stack resolve to nothing.
+   expect_null(.rs.debugSourceRef(1000L, runtimeRef, NULL))
+
+})
+
+test_that("debugSource keeps source references when keep.source is off", {
+
+   op <- options(keep.source = FALSE)
+   on.exit(options(op), add = TRUE)
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "answer <- 42",
+      "double_it <- function(x) {",
+      "   x * 2",
+      "}"
+   ), file)
+
+   # With options(keep.source = FALSE), parse() would attach no srcrefs to the
+   # file's expressions (#12375). Breakpoints are mapped through srcrefs, and
+   # debugSource() exists to debug, so the file is parsed with them anyway.
+   envir <- new.env()
+   fun <- expect_silent(.rs.makeSourceEquivFunction(file, "unknown", envir))
+   expect_s3_class(attr(fun, "srcref"), "srcref")
+   expect_false(getOption("keep.source"))
+
+   # ... so a breakpoint on line 1 maps onto a step of the function.
+   steps <- .rs.getFunctionSteps(fun, "fun", 1L)
+   expect_length(steps, 1L)
+   expect_true(nzchar(steps[[1L]]$at))
+
+   expect_silent(fun())
+   expect_equal(envir$answer, 42)
+
+   # Functions defined by the file carry srcrefs too, so the client can set
+   # breakpoints on them after the file has run.
+   expect_s3_class(attr(envir$double_it, "srcref"), "srcref")
+
+   # The global option is left as the user set it.
+   expect_silent(
+      .rs.executeDebugSource(file, "unknown", breaklines = integer(), local = envir)
+   )
+   expect_false(getOption("keep.source"))
+
+})
+
+test_that("debugSource runs files with no expressions", {
+
+   op <- options(keep.source = TRUE)
+   on.exit(options(op), add = TRUE)
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+
+   for (keepSource in c(TRUE, FALSE))
+   {
+      options(keep.source = keepSource)
+
+      for (contents in list(character(), "# just a comment"))
+      {
+         writeLines(contents, file)
+
+         fun <- expect_silent(.rs.makeSourceEquivFunction(file, "unknown", new.env()))
+         expect_silent(fun())
+
+         # Nothing to map breakpoints onto, and the template function's own
+         # srcrefs (present when this module is sourced with keep.source on,
+         # as in debug builds) must not leak out as the file's location.
+         expect_null(attr(fun, "srcref"))
+         expect_null(attr(body(fun), "srcref"))
+         expect_null(attr(body(fun)[[2]][[2]], "srcref"))
+      }
+   }
+
+})
+
+test_that("debugSource restores every breakpointed function it defined", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "cleanup_f <- function() {",
+      "   1",
+      "}",
+      "cleanup_g <- function() {",
+      "   2",
+      "}"
+   ), file)
+
+   # Breakpoints inside functions the file defines are injected into the
+   # generated function before it runs, so the definitions it assigns carry
+   # them too. Afterwards each one must be replaced by a clean copy, in the
+   # environment the file ran in and not the global environment.
+   envir <- new.env()
+   .rs.executeDebugSource(file, "unknown", breaklines = c(2L, 5L), local = envir)
+
+   for (name in c("cleanup_f", "cleanup_g"))
+   {
+      expect_null(.rs.findBreakpointSteps(body(envir[[name]])))
+      expect_false(exists(name, envir = globalenv(), inherits = FALSE))
+
+      # The clean copy keeps its source references, which the client needs
+      # to set breakpoints on it later.
+      expect_s3_class(attr(envir[[name]], "srcref"), "srcref")
+   }
+
+   expect_equal(envir$cleanup_f(), 1)
+   expect_equal(envir$cleanup_g(), 2)
+
+})
+
+test_that("debugSource cleanup leaves the file's final bindings alone", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "redefined <- function() {",
+      "   1",
+      "}",
+      "redefined <- function() {",
+      "   2",
+      "}",
+      "count <- 0",
+      "made <- (function() {",
+      "   count <<- count + 1",
+      "   function() 42",
+      "})()"
+   ), file)
+
+   # A breakpoint inside a definition the file later replaces, and one inside
+   # a statement with side effects. Cleanup must strip the injected browser
+   # calls from what the file left behind, not run those statements again:
+   # replaying them would clobber the second 'redefined' and bump 'count'.
+   envir <- new.env()
+   .rs.executeDebugSource(file, "unknown", breaklines = c(2L, 9L), local = envir)
+
+   expect_equal(envir$redefined(), 2)
+   expect_equal(envir$count, 1)
+   expect_equal(envir$made(), 42)
+
+})
+
+test_that("debugSource runs a comment-only file that has a breakpoint", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines("# the only line used to be code, and still has a breakpoint", file)
+
+   # No steps map onto a file with no expressions; the run must still
+   # finish rather than trip over an empty step list on the way out.
+   expect_silent(
+      .rs.executeDebugSource(file, "unknown", breaklines = 1L, local = new.env())
+   )
+
+})
+
+test_that("debugSource cleans functions bound through chained, conditional and member assignments", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "chain_a <- chain_b <- function() {",
+      "   1",
+      "}",
+      "if (TRUE) cond_f <- function() {",
+      "   2",
+      "}",
+      "holder <- list()",
+      "holder$f <- function() {",
+      "   3",
+      "}",
+      "holder[[\"g\"]] <- function() {",
+      "   4",
+      "}"
+   ), file)
+
+   envir <- new.env()
+   .rs.executeDebugSource(file, "unknown", breaklines = c(2L, 5L, 9L, 12L), local = envir)
+
+   funs <- list(envir$chain_a, envir$chain_b, envir$cond_f, envir$holder$f, envir$holder$g)
+   for (fun in funs)
+   {
+      expect_null(.rs.findBreakpointSteps(body(fun)))
+      expect_s3_class(attr(fun, "srcref"), "srcref")
+   }
+
+   expect_equal(envir$chain_a(), 1)
+   expect_equal(envir$chain_b(), 1)
+   expect_equal(envir$cond_f(), 2)
+   expect_equal(envir$holder$f(), 3)
+   expect_equal(envir$holder$g(), 4)
+
+})
+
+test_that("debugSource cleans functions wherever the file put them", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "for (i in 1:2) loop_f <- function() {",
+      "   1",
+      "}",
+      "handlers <- list(run = function() {",
+      "   2",
+      "})",
+      "alias_src <- function() {",
+      "   3",
+      "}",
+      "alias <- alias_src",
+      "rm(alias_src)",
+      "n <- 0",
+      "holder <- list()",
+      "holder[[{ n <- n + 1; n }]] <- function() {",
+      "   4",
+      "}"
+   ), file)
+
+   # A definition inside a loop, a function built inside a list, a copy of
+   # a function whose original binding is gone, and a target whose index
+   # expression has a side effect: cleanup must reach all of them without
+   # evaluating anything in the file a second time.
+   envir <- new.env()
+   .rs.executeDebugSource(file, "unknown", breaklines = c(2L, 5L, 8L, 15L), local = envir)
+
+   funs <- list(envir$loop_f, envir$handlers$run, envir$alias, envir$holder[[1L]])
+   for (fun in funs)
+   {
+      expect_null(.rs.findBreakpointSteps(body(fun)))
+      expect_s3_class(attr(fun, "srcref"), "srcref")
+   }
+
+   expect_equal(envir$loop_f(), 1)
+   expect_equal(envir$handlers$run(), 2)
+   expect_equal(envir$alias(), 3)
+   expect_equal(envir$holder[[1L]](), 4)
+   expect_equal(envir$n, 1)
+   expect_false(exists("alias_src", envir = envir, inherits = FALSE))
+
+})
+
+test_that("debugSource leaves functions the run did not define alone", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "if (exists(\"halt\")) stop(\"halted\")",
+      "kept_f <- function() {",
+      "   1",
+      "}"
+   ), file)
+
+   # First run defines kept_f; the client then sets its own breakpoint on
+   # it. A second run that stops before redefining it must not strip that
+   # breakpoint: the client only re-applies breakpoints after a successful
+   # run, so the marker would otherwise stay up with nothing behind it.
+   envir <- new.env()
+   .rs.executeDebugSource(file, "unknown", breaklines = 3L, local = envir)
+   suppressMessages(.rs.setFunctionBreakpoints("kept_f", envir, list("2")))
+   expect_true(.rs.isTraced(envir$kept_f))
+
+   envir$halt <- TRUE
+   expect_error(
+      .rs.executeDebugSource(file, "unknown", breaklines = 3L, local = envir),
+      "halted"
+   )
+   expect_true(.rs.isTraced(envir$kept_f))
+   expect_equal(.rs.findBreakpointSteps(body(envir$kept_f)), c(2L, 3L))
+
+})
+
+test_that("debugSource cleans functions defined before the file errors", {
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c(
+      "err_f <- function() {",
+      "   1",
+      "}",
+      "stop(\"boom\")"
+   ), file)
+
+   # The error reaches the caller as-is, and the function the file managed
+   # to define is still cleaned up on the way out.
+   envir <- new.env()
+   expect_error(
+      .rs.executeDebugSource(file, "unknown", breaklines = 2L, local = envir),
+      "boom"
+   )
+
+   expect_null(.rs.findBreakpointSteps(body(envir$err_f)))
+   expect_s3_class(attr(envir$err_f, "srcref"), "srcref")
+   expect_equal(envir$err_f(), 1)
+
+})
+
+test_that("debugSource keeps source references when they are available", {
+
+   op <- options(keep.source = TRUE)
+   on.exit(options(op), add = TRUE)
+
+   file <- tempfile(fileext = ".R")
+   on.exit(unlink(file), add = TRUE)
+   writeLines(c("x <- 1", "y <- x + 1"), file)
+
+   envir <- new.env()
+   fun <- .rs.makeSourceEquivFunction(file, "unknown", envir)
+
+   ref <- attr(fun, "srcref")
+   expect_s3_class(ref, "srcref")
+   expect_equal(as.integer(ref)[c(1, 3)], c(1L, 2L))
+
+   fun()
+   expect_equal(envir$y, 2)
+
+})

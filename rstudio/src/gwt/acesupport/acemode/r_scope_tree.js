@@ -1,0 +1,880 @@
+/*
+ * r_scope_tree.js
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+define('mode/r_scope_tree', ["require", "exports", "module"], function(require, exports, module) {
+
+   var $debuggingEnabled = false;
+   function debuglog(str) {
+      if ($debuggingEnabled)
+         console.log(str);
+   }
+
+   function assert(condition, label) {
+      if (!condition)
+         window.alert("[ASSERTION FAILED] " + label);
+   }
+
+   function comparePoints(pos1, pos2) {
+      if (pos1.row != pos2.row)
+         return pos1.row - pos2.row;
+      return pos1.column - pos2.column;
+   }
+
+   var ScopeNode = function(label, start, preamble, scopeType, attributes) {
+
+      // The label associated with the scope.
+      this.label = label;
+
+      // The 'start' and the 'preamble' both denote where the node begins;
+      // however, the 'start' is where parsing for the scope should begin (for
+      // incremental scope tree builds).
+      //
+      // For example, given the function definition:
+      //
+      //    foo <- function(a, b, c) {
+      //    ^ -- preamble
+      //                             ^ -- start
+      //
+      // In general, these should be supplied separately -- otherwise, the
+      // scope tree builder runs the risk of improperly adding duplicates of a
+      // node when change events are emitted.
+      this.start = start;
+
+      // Validate that the preamble lies before the start.
+      if (start && preamble)
+      {
+         if (preamble.row > start.row ||
+             (preamble.row === start.row && preamble.column > start.column))
+         {
+            throw new Error("Malformed preamble: should lie before start position");
+         }
+      }
+
+      this.preamble = preamble || start;
+
+      // The end position of the scope.
+      this.end = null;
+
+      // Whether a section header cut this (anonymous brace) scope short,
+      // and where the '}' matching its '{' was then found; see
+      // ScopeManager.$cutAnonymousBraces().
+      this.isCut = false;
+      this.matchedEnd = null;
+
+      // Where this scope really ended, when $splitAt() moved its end earlier.
+      this.$endedAt = null;
+
+      // The type of this scope (e.g. a braced scope, a section, and so on)
+      this.scopeType = scopeType;
+
+      // A pointer to the parent scope (if any; only the root scope should
+      // have no parent)
+      this.parentScope = null;
+
+      // Generalized attributes (an object with names)
+      this.attributes = attributes || {};
+
+      // Child nodes
+      this.$children = [];
+   };
+
+   ScopeNode.TYPE_ROOT = 1; // document root
+   ScopeNode.TYPE_BRACE = 2; // curly brace
+   ScopeNode.TYPE_CHUNK = 3; // Sweave chunk
+   ScopeNode.TYPE_SECTION = 4; // Section header
+
+   // The 'depth' attribute of a section header that carries no heading level,
+   // e.g. a bar or banner of '#' characters. Such a header is flat: it ends
+   // every enclosing section, and the next header of any kind ends it. Distinct
+   // from a missing 'depth', which means the section predates the notion of a
+   // heading level entirely (a YAML block, a Sweave chunk).
+   ScopeNode.DEPTH_NONE = 0;
+
+   (function() {
+
+      this.isRoot = function() { return this.scopeType == ScopeNode.TYPE_ROOT; };
+      this.isBrace = function() { return this.scopeType == ScopeNode.TYPE_BRACE; };
+      this.isChunk = function() { return this.scopeType == ScopeNode.TYPE_CHUNK; };
+      this.isSection = function() { return this.scopeType == ScopeNode.TYPE_SECTION; };
+      this.isFunction = function() { return this.isBrace() && !!this.attributes.args; };
+      this.isTest = function() { return this.isBrace() && this.attributes.type === "test"; };
+
+      this.equals = function(node) {
+         if (this.scopeType !== node.scopeType ||
+             this.start.row !== node.start.row ||
+             this.start.column !== node.start.column)
+         {
+            return false;
+         }
+
+         return true;
+      };
+
+      this.addNode = function(node) {
+         assert(!node.end, "New node is already closed");
+         assert(node.$children.length == 0, "New node already had children");
+
+         // Avoid adding duplicate nodes.
+         if (this.equals(node))
+            return;
+
+         var index = this.$binarySearch(node.preamble);
+         if (index >= 0 && !this.$children[index].end) {
+            // This node belongs inside an existing child
+            this.$children[index].addNode(node);
+         }
+         else if (index >= 0 && this.$children[index].$findEqual(node)) {
+            // The node is a duplicate of a scope a closed child holds: the row
+            // a parsing batch ends on is parsed again by the next one, which
+            // re-adds every scope that begins there.
+            return;
+         }
+         else {
+            // This node belongs directly under this scope. It's possible that
+            // it subsumes some existing children under this scope. (We may not
+            // know about a function scope until after we've seen some of its
+            // children, since function scopes don't get created until we see
+            // their opening brace but any argument defaults that are themselves
+            // functions will have been seen already.)
+            //
+            // A child that is already closed doesn't contain the node even when
+            // it spans the preamble: nothing parsed after a scope closed belongs
+            // to it. That is a block cut short by a section header inside the
+            // node's own signature (a braced default argument). The block ends
+            // where the node begins, and the scopes it holds from there on --
+            // the node's other default arguments -- move to the node.
+            var adopted = this.$takeChildrenFrom(node.preamble);
+            for (var i = 0; i < adopted.length; i++)
+               adopted[i].parentScope = node;
+            node.$children = adopted;
+
+            node.parentScope = this;
+            this.$children.push(node);
+         }
+      };
+
+      // The scope equal to 'node' in this subtree, if any. An equal scope
+      // starts where 'node' does, so every scope holding it contains that
+      // position: follow the containing children down.
+      this.$findEqual = function(node) {
+         var scope = this;
+         while (!scope.equals(node))
+         {
+            var index = scope.$binarySearch(node.preamble);
+            if (index < 0)
+               return null;
+            scope = scope.$children[index];
+         }
+         return scope;
+      };
+
+      // Remove and return the children from 'pos' on. A (closed) child that
+      // spans 'pos' is split there, so that the scopes it held from 'pos' on
+      // are taken as well.
+      this.$takeChildrenFrom = function(pos) {
+         var index = this.$binarySearch(pos);
+
+         var taken = [];
+         if (index >= 0) {
+            taken = this.$children[index].$splitAt(pos);
+            index++;
+         }
+         else {
+            index = -(index+1);
+         }
+
+         return taken.concat(this.$children.splice(index, this.$children.length - index));
+      };
+
+      // End this (closed) scope at 'pos' and return the scopes it held from
+      // there on, splitting a child that spans 'pos' the same way: a block
+      // nested in a block, both cut by the same header, keeps its place in
+      // the outer block.
+      this.$splitAt = function(pos) {
+         var taken = this.$takeChildrenFrom(pos);
+         this.$endedAt = this.end;
+         this.end = pos;
+         return taken;
+      };
+
+      this.closeScope = function(pos, scopeType) {
+
+         // NB: This function will never close the "this" node. This is by
+         // design as we don't want the top-level node to ever be closed.
+         
+         // No children
+         if (this.$children.length == 0)
+            return null;
+
+         var lastNode = this.$children[this.$children.length-1];
+
+         // Last child is already closed
+         if (lastNode.end)
+            return null;
+
+         // Last child had a descendant that needed to be closed and was the
+         // appropriate type
+         var closedChild = lastNode.closeScope(pos, scopeType);
+         if (closedChild)
+            return closedChild;
+
+         // Close last child, if it's of the type we want to close
+         if (scopeType == lastNode.scopeType) {
+            lastNode.end = pos;
+            // If any descendants are still open, force them closed. This could
+            // be the case for e.g. Sweave chunk being closed while it contains
+            // unclosed brace scopes.
+            lastNode.$forceDescendantsClosed(pos);
+            return lastNode;
+         }
+
+         return null;
+      };
+
+      this.$forceDescendantsClosed = function(pos) {
+         if (this.$children.length == 0)
+            return;
+         var lastNode = this.$children[this.$children.length - 1];
+         if (lastNode.end)
+            return;
+         lastNode.$forceDescendantsClosed(pos);
+         lastNode.end = pos;
+      };
+
+      // Returns array of nodes that contain the position, from outermost to
+      // innermost; or null if no nodes contain it.
+      this.findNode = function(pos) {
+         var index = this.$binarySearch(pos);
+         if (index >= 0) {
+            var result = this.$children[index].findNode(pos);
+            if (result) {
+               if (this.label)
+                  result.unshift(this);
+               return result;
+            }
+            if (this.label)
+               return [this];
+            return null;
+         }
+         else {
+            return this.label ? [this] : null;
+         }
+      };
+
+      // Returns the open scopes that contain the position, from outermost to
+      // innermost, whether labelled or not. Unlike findNode(), this reports
+      // anonymous brace scopes. A scope that has already been closed is left
+      // out along with everything inside it: while the tree is being built,
+      // nothing parsed later can belong to it.
+      this.findOpenScopeChain = function(pos) {
+         var chain = [this];
+         var node = this;
+         for (var index = node.$binarySearch(pos); index >= 0; index = node.$binarySearch(pos))
+         {
+            node = node.$children[index];
+            if (node.end)
+               break;
+
+            chain.push(node);
+         }
+         return chain;
+      };
+
+      // The innermost open brace scope, if any: the last open node of brace
+      // type along the chain of last children.
+      this.$innermostOpenBrace = function() {
+         var brace = null;
+         for (var node = this; node.$children.length > 0; )
+         {
+            node = node.$children[node.$children.length - 1];
+            if (node.end)
+               break;
+
+            if (node.isBrace())
+               brace = node;
+         }
+         return brace;
+      };
+
+      // Whether a function, test or chunk scope enclosing this one has
+      // closed, so that no token parsed from here on can belong to this
+      // scope. An anonymous brace enclosing this one is no such boundary:
+      // the same header cuts them both.
+      this.$hasClosedBoundary = function() {
+         for (var node = this.parentScope; node != null; node = node.parentScope)
+         {
+            if (((node.isBrace() && node.label) || node.isChunk()) && node.end)
+               return true;
+         }
+         return false;
+      };
+
+      this.$getFunctionStack = function(pos) {
+         var index = this.$binarySearch(pos);
+         var stack = index >= 0 ? this.$children[index].$getFunctionStack(pos)
+                                : [];
+         if (this.isFunction()) {
+            stack.push(this);
+         }
+         return stack;
+      };
+
+      this.findFunctionDefinitionFromUsage = function(usagePos, functionName) {
+         var functionStack = this.$getFunctionStack(usagePos);
+         for (var i = 0; i < functionStack.length; i++) {
+            var thisLevel = functionStack[i];
+            for (var j = 0; j < thisLevel.$children.length; j++) {
+               // optionally, short-circuit iteration if usagePos comes before
+               // thisLevel.$children[j].preamble (or .start?)
+               if (thisLevel.$children[j].label == functionName)
+                  return thisLevel.$children[j];
+            }
+         }
+
+         return null;
+      };
+
+      // Get functions in scope. This returns an array of objects,
+      // one object for each function, of the form:
+      //
+      // [{"name": fn, "args": ["arg1", "arg2", ...]}]
+      //
+      this.getFunctionsInScope = function(pos) {
+         var stack = this.$getFunctionStack(pos);
+         var objects = [];
+         for (var i = 0; i < stack.length; i++)
+         {
+            objects.push({
+               "name": stack[i].attributes.name,
+               "args": stack[i].attributes.args.slice()
+            });
+         }
+         return objects;
+      };
+
+      // Invalidates everything after pos, and possibly some stuff before.
+      // Returns the position from which parsing should resume. Every scope
+      // removed begins at or after that position; every scope kept begins
+      // before it, or contains it and has been reopened.
+      this.invalidateFrom = function(pos) {
+
+         var index = this.$binarySearch(pos);
+
+         var resumePos;
+         if (index >= 0)
+         {
+            // One of the child scopes contains this position (i.e. it's between
+            // the preamble and end). Now figure out if the position is between
+            // the child's start and end.
+
+            if (comparePoints(pos, this.$children[index].start) <= 0)
+            {
+               // The position is between the child's preamble and the start.
+               // We need to drop the child entirely and reparse.
+               resumePos = this.$children[index].preamble;
+            }
+            else
+            {
+               // The position is between the child's start and end. We can keep
+               // the scope, just recurse into the child to make sure its
+               // children get invalidated correctly, and its 'end' property
+               // is nulled out.
+               resumePos = this.$children[index].invalidateFrom(pos);
+
+               // Increment index so this child doesn't get removed.
+               index++;
+            }
+         }
+         else
+         {
+            index = -(index+1);
+            resumePos = pos;
+         }
+
+         if (index < this.$children.length)
+         {
+            this.$children.splice(index, this.$children.length - index);
+         }
+
+         // A child that $splitAt() shortened really ended at a later token.
+         // If that token is to be reparsed, reopen the child: should the
+         // token be gone, the scopes that follow belong inside it.
+         while (index > 0 &&
+                this.$children[index - 1].$endedAt &&
+                comparePoints(this.$children[index - 1].$endedAt, pos) > 0)
+         {
+            index--;
+            var childResumePos = this.$children[index].invalidateFrom(pos);
+            if (comparePoints(childResumePos, resumePos) < 0)
+               resumePos = childResumePos;
+         }
+
+         this.end = null;
+         this.$endedAt = null;
+         this.isCut = false;
+         this.matchedEnd = null;
+
+         return resumePos;
+      };
+
+      // Returns index of the child that contains this position, if it exists;
+      // otherwise, -(index + 1) where index is where such a child would be.
+      this.$binarySearch = function(pos, start /*optional*/, end /*optional*/) {
+         if (typeof(start) === 'undefined')
+            start = 0;
+         if (typeof(end) === 'undefined')
+            end = this.$children.length;
+
+         // No elements left to test
+         if (start === end)
+            return -(start + 1);
+
+         var mid = Math.floor((start + end)/2);
+         var comp = this.$children[mid].comparePosition(pos);
+         if (comp === 0)
+            return mid;
+         else if (comp < 0)
+            return this.$binarySearch(pos, start, mid);
+         else // comp > 0
+            return this.$binarySearch(pos, mid + 1, end);
+      };
+
+      this.comparePosition = function(pos)
+      {
+         // TODO
+         if (comparePoints(pos, this.preamble) < 0)
+            return -1;
+         if (this.end != null && comparePoints(pos, this.end) >= 0)
+            return 1;
+         return 0;
+      };
+
+      this.printDebug = function(indent) {
+         if (typeof(indent) === 'undefined')
+            indent = "";
+
+         debuglog(indent + "\"" + this.label + "\" ["
+                        + this.preamble.row + "x" + this.preamble.column
+                  + (this.start ? ("-" + this.start.row + "x" + this.start.column) : "")
+                        + ", "
+                        + (this.end ? (this.end.row + "x" + this.end.column) : "null" ) + "]");
+         for (var i = 0; i < this.$children.length; i++)
+            this.$children[i].printDebug(indent + "    ");
+      };
+
+   }).call(ScopeNode.prototype);
+
+   
+   // The 'ScopeNodeFactory' is a constructor of scope nodes -- it exists so that
+   // we can properly perform inheritance for specializations of the ScopeNode 'class'.
+   var ScopeManager = function(ScopeNodeFactory) {
+      this.$ScopeNodeFactory = ScopeNodeFactory || ScopeNode;
+      this.parsePos = {row: 0, column: 0};
+      this.$root = new this.$ScopeNodeFactory("(Top Level)", this.parsePos, null,
+                                 ScopeNode.TYPE_ROOT);
+
+      // Cut braces still waiting for their '}', most recently cut last; and
+      // every cut brace in the tree, in the order they were cut, which
+      // invalidateFrom() rebuilds the former from (so the rebuilt stack is
+      // ordered as a fresh parse would have left it).
+      this.$cutBraces = [];
+      this.$allCutBraces = [];
+   };
+
+   (function() {
+
+      this.getParsePosition = function() {
+         return this.parsePos;
+      };
+
+      this.setParsePosition = function(position) {
+         this.parsePos = position;
+      };
+
+      this.onSectionStart = function(sectionLabel, sectionPos, attributes) {
+
+         if (typeof attributes == "undefined")
+            attributes = {};
+
+         var existingScopes = this.getActiveScopes(sectionPos);
+
+         // A section will close a previous section that exists as part
+         // of that parent node (if it exists).
+         if (existingScopes.length > 1)
+         {
+            var parentNode = existingScopes[existingScopes.length - 2];
+            var children = parentNode.$children;
+            for (var i = children.length - 1; i >= 0; i--)
+            {
+               if (children[i].isSection())
+               {
+                  this.$root.closeScope(sectionPos, ScopeNode.TYPE_SECTION);
+                  break;
+               }
+            }
+         }
+
+         var node = new this.$ScopeNodeFactory(
+            sectionLabel,
+            sectionPos,
+            sectionPos,
+            ScopeNode.TYPE_SECTION,
+            attributes
+         );
+
+         this.$root.addNode(node);
+      };
+
+      // Close the open sections at 'position', innermost first, for as long
+      // as 'shouldClose' accepts them. 'scopes' is the chain of open scopes
+      // at 'position', outermost first. A labelled brace (a function, a test)
+      // or a chunk bounds the walk: it is not a section, and the sections
+      // inside it are its own. The root is never a section either, so the
+      // walk ends once every enclosing section has been considered.
+      this.$closeSectionScopesWhile = function(scopes, position, shouldClose)
+      {
+         for (var i = scopes.length - 1; i >= 0; i--)
+         {
+            if (!scopes[i].isSection() || !shouldClose(scopes[i]))
+               break;
+
+            this.$root.closeScope(position, ScopeNode.TYPE_SECTION);
+         }
+      };
+
+      // Anonymous braces are transparent to section headers: a header inside
+      // 'if (x) { ... }' nests exactly as it would outside the braces. The
+      // tree nests by position, though, so such a header cuts the anonymous
+      // braces enclosing it, closing each one at the header. Their '}' tokens
+      // are still to come, and must not close an enclosing function instead,
+      // so each cut brace waits on a stack for its '}' (see onScopeEnd()).
+      // Returns the scopes still open at 'position', outermost first.
+      this.$cutAnonymousBraces = function(position)
+      {
+         var scopes = this.$root.findOpenScopeChain(position);
+
+         var first = scopes.length;
+         while (first > 0 && scopes[first - 1].isBrace() && !scopes[first - 1].label)
+            first--;
+
+         for (var i = first; i < scopes.length; i++)
+         {
+            scopes[i].end = position;
+            scopes[i].isCut = true;
+            this.$cutBraces.push(scopes[i]);
+            this.$allCutBraces.push(scopes[i]);
+         }
+
+         return scopes.slice(0, first);
+      };
+
+      // Whether the '}' at 'pos' matches a cut brace rather than an open brace
+      // scope. It belongs to the most recently opened brace still waiting for
+      // one: a brace opened after the cut is an open scope nested below the
+      // cut brace's section, and comes first.
+      this.$matchCutBrace = function(pos)
+      {
+         // A cut brace inside a function or chunk that has since closed can
+         // no longer be matched.
+         while (this.$cutBraces.length > 0 &&
+                this.$cutBraces[this.$cutBraces.length - 1].$hasClosedBoundary())
+         {
+            this.$cutBraces.pop();
+         }
+
+         if (this.$cutBraces.length === 0)
+            return false;
+
+         var cut = this.$cutBraces[this.$cutBraces.length - 1];
+         var open = this.$root.$innermostOpenBrace();
+         if (open && comparePoints(open.preamble, cut.preamble) > 0)
+            return false;
+
+         cut.matchedEnd = pos;
+         this.$cutBraces.pop();
+         return true;
+      };
+
+      // Add the section header 'node', closing the open sections at its
+      // preamble that 'shouldClose' accepts (see $closeSectionScopesWhile).
+      this.$addSectionHeader = function(node, shouldClose)
+      {
+         var position = node.preamble;
+         var scopes = this.$cutAnonymousBraces(position);
+         this.$closeSectionScopesWhile(scopes, position, shouldClose);
+         this.$root.addNode(node);
+      };
+
+      // A section header carrying no heading level (e.g. a bar of '#'
+      // characters) is top-level, so it closes every open section rather than
+      // just the innermost one -- matching section folding, which ends every
+      // enclosing section fold when it reaches such a header.
+      this.onTopLevelSectionStart = function(sectionLabel, sectionPos)
+      {
+         // Mark the section depthless rather than leaving it without a depth
+         // at all: onMarkdownHead() has to tell a header that carries no
+         // heading level apart from one that predates the notion, such as a
+         // YAML block.
+         var node = new this.$ScopeNodeFactory(
+            sectionLabel,
+            sectionPos,
+            sectionPos,
+            ScopeNode.TYPE_SECTION,
+            {depth: ScopeNode.DEPTH_NONE}
+         );
+
+         this.$addSectionHeader(node, function() { return true; });
+      };
+
+      this.onSectionEnd = function(position)
+      {
+         this.$root.closeScope(position, ScopeNode.TYPE_SECTION);
+      };
+
+      this.onMarkdownHead = function(label, labelStartPos, labelEndPos, depth, isMarkdown)
+      {
+         debuglog("Adding Markdown header: '" + label + "' [" + depth + "]");
+
+         var node = new this.$ScopeNodeFactory(
+            label,
+            labelEndPos,
+            labelStartPos,
+            ScopeNode.TYPE_SECTION,
+            {depth: depth, isMarkdown: isMarkdown}
+         );
+
+         // A new Markdown header implicitly closes all previously open
+         // headers of greater or equal depth. For example:
+         //
+         //    # Top Level
+         //    ## Sub Section
+         //    ### Sub-sub Section
+         //    ## Sub Section Two
+         //
+         // Here '## Sub Section Two' closes both '### Sub-sub Section' and
+         // '## Sub Section'. A section that carries no heading level does not
+         // contain the sections that follow it, so it is closed as well.
+         this.$addSectionHeader(node, function(scope) {
+            return scope.attributes.depth === ScopeNode.DEPTH_NONE ||
+                   scope.attributes.depth >= depth;
+         });
+      };
+
+      /**
+       * @param chunkLabel The actual label associated with the chunk.
+       * @param label An alternate label with more information (e.g. used in the status bar)
+       * @param chunkStartPos The start position of the chunk header.
+       * @param chunkPos The start position of the chunk, excluding the chunk header.
+       */
+      this.onChunkStart = function(chunkLabel, label, chunkStartPos, chunkPos) {
+         // Starting a chunk means closing the previous chunk, if any
+         var prev = this.$root.closeScope(chunkStartPos, ScopeNode.TYPE_CHUNK);
+         if (prev)
+            debuglog("chunk-scope implicit end: " + prev.label);
+
+         debuglog("adding chunk-scope " + label);
+         var node = new this.$ScopeNodeFactory(label, chunkPos, chunkStartPos,
+                                  ScopeNode.TYPE_CHUNK);
+         node.chunkLabel = chunkLabel;
+         this.$root.addNode(node);
+         this.printScopeTree();
+      };
+
+      this.onChunkEnd = function(pos) {
+         var closed = this.$root.closeScope(pos, ScopeNode.TYPE_CHUNK);
+         if (closed)
+            debuglog("chunk-scope end: " + closed.label);
+         else
+            debuglog("extra chunk-scope end");
+         this.printScopeTree();
+         return closed;
+      };
+
+      this.onFunctionScopeStart = function(label, functionStartPos, scopePos, name, args) {
+         debuglog("adding function brace-scope " + label);
+         this.$root.addNode(
+            new this.$ScopeNodeFactory(
+               label,
+               scopePos,
+               functionStartPos,
+               ScopeNode.TYPE_BRACE,
+               {
+                  "name": name,
+                  "args": args, 
+                  "type": "function"
+               }
+            )
+         );
+         
+         this.printScopeTree();
+      };
+
+      this.onTestScopeStart = function(desc, startPos, scopePos) {
+         debuglog("adding test_that() brace-scope " + desc);
+         var label = "test_that(" + desc + ")";
+         var name = desc.replace(/^['"](.*)['"]/, "$1");
+         
+         this.$root.addNode(
+            new this.$ScopeNodeFactory(
+               label,
+               scopePos,
+               startPos,
+               ScopeNode.TYPE_BRACE,
+               {
+                  "name": name,
+                  "type": "test"
+               }
+            )
+         );
+         
+         this.printScopeTree();
+      }
+
+      this.onNamedScopeStart = function(label, pos) {
+         this.$root.addNode(new this.$ScopeNodeFactory(label, pos, null, ScopeNode.TYPE_BRACE));
+      };
+
+      this.onScopeStart = function(pos) {
+         debuglog("adding anon brace-scope");
+         this.$root.addNode(new this.$ScopeNodeFactory(null, pos, null,
+                                          ScopeNode.TYPE_BRACE));
+         this.printScopeTree();
+      };
+
+      this.onScopeEnd = function(pos) {
+         if (this.$matchCutBrace(pos))
+         {
+            debuglog("cut brace-scope end");
+            return null;
+         }
+
+         var closed = this.$root.closeScope(pos, ScopeNode.TYPE_BRACE);
+         if (closed)
+            debuglog("brace-scope end: " + closed.label);
+         else
+            debuglog("extra brace-scope end");
+         this.printScopeTree();
+         return closed;
+      };
+
+      this.getActiveScopes = function(pos) {
+         return this.$root.findNode(pos);
+      };
+
+      this.getScopeList = function() {
+         return this.$root.$children;
+      };
+
+      this.findFunctionDefinitionFromUsage = function(usagePos, functionName) {
+         return this.$root.findFunctionDefinitionFromUsage(usagePos,
+                                                           functionName);
+      };
+
+      this.getFunctionsInScope = function(pos, tokenizer) {
+         return this.$root.getFunctionsInScope(pos, tokenizer);
+      };
+
+      this.invalidateFrom = function(pos) {
+         pos = {row: Math.max(0, pos.row-1), column: 0};
+         debuglog("Invalidate from " + pos.row + ", " + pos.column);
+         if (comparePoints(this.parsePos, pos) > 0)
+         {
+            // Dropping a scope resumes parsing at its preamble, which can
+            // precede scopes kept beside it (a block cut by a header in the
+            // scope's own signature); their tokens will be seen again, so
+            // invalidate from there as well, until the position settles.
+            var resumePos = this.$root.invalidateFrom(pos);
+            while (comparePoints(resumePos, pos) < 0)
+            {
+               pos = resumePos;
+               resumePos = this.$root.invalidateFrom(pos);
+            }
+            this.parsePos = resumePos;
+
+            // A cut brace that was reopened is no longer cut (it is cut again
+            // when its header is reparsed), and one removed from the tree
+            // began at or after the resume position; see
+            // ScopeNode.invalidateFrom(). Of the rest, a brace whose '}' was
+            // matched from the resume position on waits for it again: the
+            // reparse sees that '}' again -- or not at all, if it was edited
+            // away, so the match is forgotten until a '}' is matched again.
+            var resumePos = this.parsePos;
+            this.$allCutBraces = this.$allCutBraces.filter(function(brace) {
+               return brace.isCut && comparePoints(brace.preamble, resumePos) < 0;
+            });
+
+            this.$cutBraces = [];
+            for (var i = 0; i < this.$allCutBraces.length; i++)
+            {
+               var brace = this.$allCutBraces[i];
+               if (!brace.matchedEnd || comparePoints(brace.matchedEnd, resumePos) >= 0)
+               {
+                  brace.matchedEnd = null;
+                  this.$cutBraces.push(brace);
+               }
+            }
+         }
+         this.printScopeTree();
+      };
+
+      function $getChunkCount(node) {
+         count = node.isChunk() ? 1 : 0;
+         var children = node.$children || [];
+         for (var i = 0; i < children.length; i++)
+            count += $getChunkCount(children[i]);
+         return count;
+      }
+
+      this.getChunkCount = function(count) {
+         return $getChunkCount(this.$root);
+      };
+
+      this.getTopLevelScopeCount = function() {
+         return this.$root.$children.length;
+      };
+
+      this.printScopeTree = function() {
+         if (!$debuggingEnabled)
+            return;
+         
+         this.$root.printDebug();
+      };
+
+      this.getAllFunctionScopes = function() {
+         var array = [];
+         var node = this.$root;
+         doGetAllFunctionScopes(node, array);
+         return array;
+      };
+
+      var doGetAllFunctionScopes = function(node, array) {
+         if (node.isFunction())
+         {
+            array.push(node);
+         }
+         var children = node.$children;
+         for (var i = 0; i < children.length; i++)
+         {
+            doGetAllFunctionScopes(children[i], array);
+         }
+         
+      };
+
+   }).call(ScopeManager.prototype);
+
+
+   exports.ScopeManager = ScopeManager;
+   exports.ScopeNode = ScopeNode;
+
+});

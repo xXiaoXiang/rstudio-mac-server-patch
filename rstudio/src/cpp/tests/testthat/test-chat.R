@@ -1,0 +1,412 @@
+#
+# test-chat.R
+#
+# Copyright (C) 2026 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+context("chat")
+
+test_that("manifestDownloadCommand sets a 30s timeout and downloads to a temp file", {
+   cmd <- .rs.chat.manifestDownloadCommand("https://cdn.posit.co/posit-ai/manifest.json")
+   expect_true(grepl("options(timeout = 30L)", cmd, fixed = TRUE))
+   expect_true(grepl("tempfile()", cmd, fixed = TRUE))
+   expect_true(grepl("download.file(", cmd, fixed = TRUE))
+   expect_true(grepl("cat(readLines(", cmd, fixed = TRUE))
+   # the URL is deparsed (quoted) into the command
+   expect_true(grepl("https://cdn.posit.co/posit-ai/manifest.json", cmd, fixed = TRUE))
+})
+
+test_that("manifestDownloadCommand injects download.file.method when set", {
+   withr::with_options(list(download.file.method = "libcurl"), {
+      cmd <- .rs.chat.manifestDownloadCommand("https://example.test/m.json")
+      expect_true(grepl("method = \"libcurl\"", cmd, fixed = TRUE))
+   })
+})
+
+test_that("manifestDownloadCommand injects download.file.extra when set", {
+   withr::with_options(list(download.file.extra = c("--cacert", "/etc/ca.pem")), {
+      cmd <- .rs.chat.manifestDownloadCommand("https://example.test/m.json")
+      expect_true(grepl("extra = ", cmd, fixed = TRUE))
+      expect_true(grepl("--cacert", cmd, fixed = TRUE))
+   })
+})
+
+test_that("manifestDownloadCommand omits method/extra when unset", {
+   withr::with_options(list(download.file.method = NULL, download.file.extra = NULL), {
+      cmd <- .rs.chat.manifestDownloadCommand("https://example.test/m.json")
+      expect_false(grepl("method = ", cmd, fixed = TRUE))
+      expect_false(grepl("extra = ", cmd, fixed = TRUE))
+   })
+})
+
+test_that("manifestDownloadCommand errors when download.file reports a non-zero status", {
+   # Some download.file methods return a non-zero status with only a warning, so
+   # the command must check the status and stop() -- otherwise a failed download
+   # would exit 0 with a partial/empty body and be parsed as a valid manifest.
+   # Exercise the behavior (the command throws), not the command text. cmd is the
+   # trusted output of the function under test, evaluated in a sandbox env whose
+   # download.file is stubbed to report failure -- this is how the generated R
+   # command is meant to be run.
+   cmd <- .rs.chat.manifestDownloadCommand("https://example.test/m.json")
+
+   env <- new.env()
+   env$download.file <- function(...) 1L  # non-zero status, no file written
+   expect_error(eval(parse(text = cmd), envir = env), "download.file failed")
+})
+
+test_that("manifestDownloadCommand emits the downloaded body with newlines intact", {
+   # cat() defaults to sep = " "; the command uses sep = "\n" so a multi-line body
+   # round-trips verbatim rather than having its line breaks collapsed to spaces.
+   cmd <- .rs.chat.manifestDownloadCommand("https://example.test/m.json")
+
+   env <- new.env()
+   env$download.file <- function(url, destfile, ...) {
+      writeLines(c("{", '  "v": 1', "}"), destfile)
+      0L
+   }
+   out <- paste(capture.output(eval(parse(text = cmd), envir = env)), collapse = "\n")
+   expect_identical(out, "{\n  \"v\": 1\n}")
+})
+
+# Runs .rs.chat.downloadPackage with download.file stubbed. The function looks
+# download.file up lexically, so a child of its closure environment supplies the
+# stub without touching the real utils::download.file.
+downloadPackageWith <- function(stub, url = "https://example.test/pai.zip") {
+   fn <- .rs.chat.downloadPackage
+   env <- new.env(parent = environment(fn))
+   env$download.file <- stub
+   environment(fn) <- env
+   fn(url, destfile = tempfile())
+}
+
+test_that("chat.downloadPackage reports no reason when the download succeeds", {
+   reason <- downloadPackageWith(function(url, destfile, ...) {
+      writeLines("package", destfile)
+      0L
+   })
+   expect_identical(reason, "")
+})
+
+test_that("chat.downloadPackage ignores a warning from a download that succeeded", {
+   # e.g. R >= 4.2 warns that method = "wininet" is deprecated on every download.
+   reason <- suppressWarnings(downloadPackageWith(function(url, destfile, ...) {
+      warning("the 'wininet' method is deprecated for http:// and https:// URLs")
+      writeLines("package", destfile)
+      0L
+   }))
+   expect_identical(reason, "")
+})
+
+test_that("chat.downloadPackage reports a failure that download.file only warns about", {
+   # download.file()'s libcurl and internal methods can return a non-zero status
+   # with only a warning rather than erroring. Ignoring the status lets a
+   # truncated download reach the SHA-256 check, which then blames its integrity.
+   reason <- suppressWarnings(downloadPackageWith(function(url, destfile, ...) {
+      writeLines("truncated", destfile)
+      warning(sprintf("URL '%s': status was 'Couldn't connect to server'", url))
+      1L
+   }))
+
+   expect_match(reason, "download.file failed, status 1", fixed = TRUE)
+   expect_match(reason, "Couldn't connect to server", fixed = TRUE)
+})
+
+test_that("chat.downloadPackage folds the download warning into an error", {
+   # download.file() names the cause (proxy, DNS, TLS) in a warning; the error it
+   # raises says only that the URL could not be opened, so the error alone leaves
+   # the user with nothing to act on.
+   reason <- suppressWarnings(downloadPackageWith(function(url, destfile, ...) {
+      warning(sprintf("URL '%s': status was 'Couldn't connect to server'", url))
+      stop(sprintf("cannot open URL '%s'", url))
+   }))
+
+   expect_match(reason, "cannot open URL 'https://example.test/pai.zip'", fixed = TRUE)
+   expect_match(reason, "status was 'Couldn't connect to server'", fixed = TRUE)
+})
+
+test_that("chat.downloadPackage leaves download warnings visible to the caller", {
+   expect_warning(
+      downloadPackageWith(function(url, destfile, ...) {
+         warning("status was 'Couldn't connect to server'")
+         1L
+      }),
+      "Couldn't connect to server"
+   )
+})
+
+test_that("chat.downloadPackage reports a warning promoted to an error only once", {
+   # options(warn = 2) turns the download's warning into the error, so the
+   # collected warning and the error message carry the same text.
+   withr::with_options(list(warn = 2), {
+      reason <- downloadPackageWith(function(url, destfile, ...) {
+         warning("status was 'Couldn't connect to server'")
+         1L
+      })
+   })
+
+   expect_match(reason, "status was 'Couldn't connect to server'", fixed = TRUE)
+   expect_identical(
+      lengths(regmatches(reason, gregexpr("Couldn't connect to server", reason, fixed = TRUE))),
+      1L
+   )
+})
+
+test_that("chat.downloadPackage raises a short transfer timeout and restores it", {
+   # download.file() has no timeout argument -- options(timeout = ) is the knob --
+   # so a profile that shortens it would otherwise abort the package download.
+   observed <- NULL
+   observe <- function(url, destfile, ...) {
+      observed <<- getOption("timeout")
+      writeLines("package", destfile)
+      0L
+   }
+
+   withr::with_options(list(timeout = 5L), {
+      downloadPackageWith(observe)
+      expect_identical(observed, 60L)
+      expect_identical(getOption("timeout"), 5L)
+   })
+
+   # a longer configured timeout is left alone
+   withr::with_options(list(timeout = 300L), {
+      downloadPackageWith(observe)
+      expect_identical(observed, 300L)
+   })
+
+   # an unset timeout is restored to unset rather than to the substituted default
+   withr::with_options(list(timeout = NULL), {
+      downloadPackageWith(observe)
+      expect_identical(observed, 60L)
+      expect_null(getOption("timeout"))
+   })
+})
+
+# A zip holding one file, a.txt, containing "ok" (made with tar -a, stored).
+writeTinyZip <- function(path) {
+   hex <- paste0(
+      "504b03040a0008000000c07b6d5d00000000000000000000000005002000612e7478",
+      "7475780b00010400000000040000000055540d00075881f76a5881f76a5881f76a6f",
+      "6b504b070847dddc790200000002000000504b01020a030a0008000000c07b6d5d47",
+      "dddc790200000002000000050018000000000000000000b68100000000612e747874",
+      "75780b00010400000000040000000055540500015881f76a504b0506000000000100",
+      "01004b000000550000000000"
+   )
+   bytes <- substring(hex, seq(1, nchar(hex), 2), seq(2, nchar(hex), 2))
+   writeBin(as.raw(strtoi(bytes, 16L)), path)
+}
+
+writeCorruptZip <- function(path) {
+   writeBin(charToRaw("not a zip file"), path)
+}
+
+test_that("chat.extractPackage reports no reason when the extraction succeeds", {
+   zipfile <- tempfile(fileext = ".zip")
+   exdir <- tempfile()
+   writeTinyZip(zipfile)
+
+   expect_identical(.rs.chat.extractPackage(zipfile, exdir), "")
+   expect_identical(readLines(file.path(exdir, "a.txt"), warn = FALSE), "ok")
+})
+
+test_that("chat.extractPackage reports a failure that unzip only warns about", {
+   # unzip() warns and returns normally when it cannot open or write the archive,
+   # so an install that only checked for an error would go on to publish it.
+   zipfile <- tempfile(fileext = ".zip")
+   writeCorruptZip(zipfile)
+
+   reason <- suppressWarnings(.rs.chat.extractPackage(zipfile, tempfile()))
+   expect_match(reason, "error 1 in extracting from zip file", fixed = TRUE)
+})
+
+test_that("chat.extractPackage leaves unzip warnings visible to the caller", {
+   zipfile <- tempfile(fileext = ".zip")
+   writeCorruptZip(zipfile)
+
+   expect_warning(
+      .rs.chat.extractPackage(zipfile, tempfile()),
+      "error 1 in extracting from zip file",
+      fixed = TRUE
+   )
+})
+
+test_that("chat.extractPackage reports an unzip error", {
+   fn <- .rs.chat.extractPackage
+   env <- new.env(parent = environment(fn))
+   env$unzip <- function(zipfile, exdir, ...) stop("'exdir' does not exist")
+   environment(fn) <- env
+
+   expect_identical(fn(tempfile(), tempfile()), "'exdir' does not exist")
+})
+
+test_that("chat.extractPackage reports a warning promoted to an error only once", {
+   zipfile <- tempfile(fileext = ".zip")
+   writeCorruptZip(zipfile)
+
+   withr::with_options(list(warn = 2), {
+      reason <- .rs.chat.extractPackage(zipfile, tempfile())
+   })
+
+   expect_match(reason, "error 1 in extracting from zip file", fixed = TRUE)
+   expect_identical(
+      lengths(regmatches(reason, gregexpr("error 1", reason, fixed = TRUE))),
+      1L
+   )
+})
+
+test_that("chat.safeEval returns value and visibility with no conditions", {
+   result <- .rs.chat.safeEval(quote(42))
+   # a plain list, not a condition: the C++ dispatch discriminates on class
+   expect_false(inherits(result, "error"))
+   expect_false(inherits(result, "interrupt"))
+   expect_equal(result$value, 42)
+   expect_true(result$visible)
+   expect_equal(result$conditions, list())
+
+   result <- .rs.chat.safeEval(quote(invisible(42)))
+   expect_false(result$visible)
+})
+
+test_that("chat.safeEval records and muffles warnings when warn < 2", {
+   expect_warning(
+      result <- .rs.chat.safeEval(quote(warning("beware"))),
+      regexp = NA
+   )
+   expect_equal(result$conditions, list(list(type = "warning", text = "beware")))
+})
+
+test_that("chat.safeEval records multiple warnings from one expression in order", {
+   expect_warning(
+      result <- .rs.chat.safeEval(quote({ warning("first"); warning("second") })),
+      regexp = NA
+   )
+   expect_equal(result$conditions, list(
+      list(type = "warning", text = "first"),
+      list(type = "warning", text = "second")
+   ))
+})
+
+test_that("chat.safeEval records interleaved messages and warnings in order", {
+   expect_warning(
+      expect_message(
+         result <- .rs.chat.safeEval(
+            quote({ message("m1"); warning("w1"); message("m2") })
+         ),
+         "m1"
+      ),
+      regexp = NA
+   )
+   expect_equal(result$conditions, list(
+      list(type = "message", text = "m1\n"),
+      list(type = "warning", text = "w1"),
+      list(type = "message", text = "m2\n")
+   ))
+})
+
+test_that("chat.safeEval does not record warnings when warn < 0 (REPL suppresses them)", {
+   withr::with_options(list(warn = -1), {
+      expect_warning(
+         result <- .rs.chat.safeEval(quote(warning("quiet"))),
+         regexp = NA
+      )
+   })
+   expect_equal(result$conditions, list())
+})
+
+test_that("chat.safeEval leaves warning-to-error conversion intact under warn = 2", {
+   withr::with_options(list(warn = 2), {
+      result <- .rs.chat.safeEval(quote(warning("beware")))
+   })
+   expect_true(inherits(result, "error"))
+   # the warning surfaces as the error itself, so it is not also recorded
+   # for re-emission as a deferred warning
+   expect_equal(attr(result, "assistant_conditions"), list())
+})
+
+test_that("chat.safeEval returns errors with recorded conditions attached", {
+   expect_message(
+      result <- .rs.chat.safeEval(quote({ message("progress"); stop("boom") })),
+      "progress"
+   )
+   expect_true(inherits(result, "error"))
+   expect_equal(conditionMessage(result), "boom")
+   expect_equal(
+      attr(result, "assistant_conditions"),
+      list(list(type = "message", text = "progress\n"))
+   )
+})
+
+test_that("chat.formatWarningMessages formats deferred warnings like the REPL", {
+   expect_equal(.rs.chat.formatWarningMessages(list()), "")
+
+   one <- list(list(type = "warning", text = "beware"))
+   expect_equal(.rs.chat.formatWarningMessages(one), "Warning message:\nbeware\n")
+
+   several <- list(
+      list(type = "warning", text = "first"),
+      list(type = "message", text = "not a warning\n"),
+      list(type = "warning", text = "second")
+   )
+   expect_equal(
+      .rs.chat.formatWarningMessages(several),
+      "Warning messages:\n1: first\n2: second\n"
+   )
+})
+
+test_that("chat.callExpressionBoundaryHook calls a hidden global hook with its arguments", {
+   calls <- list()
+   assign(".test_boundary_hook", function(expr, value, ok, visible, error, conditions) {
+      calls[[length(calls) + 1L]] <<- list(value = value, ok = ok, visible = visible)
+   }, envir = globalenv())
+   on.exit(rm(".test_boundary_hook", envir = globalenv()), add = TRUE)
+
+   .rs.chat.callExpressionBoundaryHook(".test_boundary_hook", quote(1 + 1), 2, TRUE, TRUE)
+   expect_equal(calls, list(list(value = 2, ok = TRUE, visible = TRUE)))
+})
+
+test_that("chat.callExpressionBoundaryHook passes expr unevaluated and forwards error/conditions", {
+   calls <- list()
+   assign(".test_full_hook", function(expr, value, ok, visible, error, conditions) {
+      calls[[length(calls) + 1L]] <<- list(
+         expr = expr, error = error, conditions = conditions
+      )
+   }, envir = globalenv())
+   on.exit(rm(".test_full_hook", envir = globalenv()), add = TRUE)
+
+   err <- simpleError("boom")
+   conditions <- list(list(type = "warning", text = "beware"))
+   # expr is stop("boom"): evaluating it anywhere in the dispatch would fail
+   .rs.chat.callExpressionBoundaryHook(
+      ".test_full_hook", quote(stop("boom")), NULL, FALSE, FALSE,
+      error = err, conditions = conditions
+   )
+
+   expect_length(calls, 1L)
+   expect_identical(calls[[1L]]$expr, quote(stop("boom")))
+   expect_identical(calls[[1L]]$error, err)
+   expect_identical(calls[[1L]]$conditions, conditions)
+})
+
+test_that("chat.callExpressionBoundaryHook is a no-op for missing or invalid hooks", {
+   expect_silent(.rs.chat.callExpressionBoundaryHook("", quote(1), 1, TRUE, TRUE))
+   expect_silent(.rs.chat.callExpressionBoundaryHook(".no_such_hook", quote(1), 1, TRUE, TRUE))
+
+   assign(".test_not_a_function", 42, envir = globalenv())
+   on.exit(rm(".test_not_a_function", envir = globalenv()), add = TRUE)
+   expect_silent(.rs.chat.callExpressionBoundaryHook(".test_not_a_function", quote(1), 1, TRUE, TRUE))
+})
+
+test_that("chat.callExpressionBoundaryHook swallows hook errors", {
+   assign(".test_error_hook", function(...) stop("hook failed"), envir = globalenv())
+   on.exit(rm(".test_error_hook", envir = globalenv()), add = TRUE)
+
+   expect_silent(.rs.chat.callExpressionBoundaryHook(".test_error_hook", quote(1), 1, TRUE, TRUE))
+})

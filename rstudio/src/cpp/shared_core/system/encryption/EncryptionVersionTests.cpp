@@ -1,0 +1,441 @@
+/*
+ * EncryptionVersionTests.cpp
+ *
+ * Copyright (C) 2024 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <iterator>
+
+#include <gsl/gsl-lite.hpp>
+
+#include <shared_core/system/Crypto.hpp>
+#include <shared_core/system/encryption/EncryptionConfiguration.hpp>
+#include <shared_core/system/encryption/EncryptionVersion.hpp>
+
+#include <gtest/gtest.h>
+
+#include <fcntl.h>
+
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include <shared_core/Error.hpp>
+
+namespace rstudio {
+namespace core {
+namespace system {
+namespace tests {
+
+using namespace core;
+
+std::vector<unsigned char> g_key;
+std::vector<unsigned char> g_iv;
+std::string g_payload = "Hello, world! This is a secret.";
+std::vector<unsigned char> g_data;
+
+// Simplified random function mirrored after core::system::crypto::random()
+bool random(uint32_t in_length, std::vector<unsigned char>& out_randomData)
+{
+   out_randomData.resize(in_length);
+
+   if (!RAND_bytes(&out_randomData[0], in_length))
+      return false;
+
+   return true;
+}
+
+bool generateKeys(unsigned char version)
+{
+   crypto::setMinimumEncryptionVersion(0);
+   crypto::setMaximumEncryptionVersion(2);
+
+   // construct the data to encrypt in tests
+   if (g_data.empty())
+      std::copy(g_payload.begin(), g_payload.end(), std::back_inserter(g_data));
+
+   if (version == crypto::v1::VERSION_BYTE || version == 0)
+      // generate a random 128-bit key and IV
+      return random(16, g_key) && random(16, g_iv);
+   else if (version == crypto::v2::VERSION_BYTE)
+      // generate a random 256-bit key and 128-bit IV
+      return random(32, g_key) && random(16, g_iv);
+
+   return false;
+}
+
+bool decryptedPayloadMatches(std::vector<unsigned char>& decryptedData)
+{
+   std::string decryptedPayload;
+   std::copy(decryptedData.begin(), decryptedData.end(), std::back_inserter(decryptedPayload));
+   return g_payload == decryptedPayload;
+}
+
+TEST(SharedCoreTest, EncryptionVersionTests)
+{
+   // v0: Can AES encrypt/decrypt section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v0::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v0::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::v0::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // v1: Can AES encrypt/decrypt section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v1::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v1::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::v1::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // v2: Can AES encrypt/decrypt section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v2::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v2::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::v2::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // v2: Can AES encrypt/decrypt detect tampering/corruption section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v2::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v2::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data with wrong AAD
+      std::vector<unsigned char> decryptedData;
+      std::vector<unsigned char> bad_aad = encryptedData;
+      bad_aad[crypto::VERSION_BYTE_INDEX] += 1;
+      error = core::system::crypto::v2::aesDecrypt(bad_aad, g_key, g_iv, decryptedData);
+      ASSERT_EQ(0u, decryptedData.size());
+      ASSERT_TRUE(error != Success());
+
+      // decrypt the encrypted data with changed data
+      std::vector<unsigned char> bad_encryptedData = encryptedData;
+      bad_encryptedData[crypto::ENCRYPTION_VERSION_SIZE_BYTES] += 1;
+      error = core::system::crypto::v2::aesDecrypt(bad_encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_EQ(0u, decryptedData.size());
+      ASSERT_TRUE(error != Success());
+
+      // decrypt the encrypted data with wrong MAC
+      std::vector<unsigned char> bad_mac = encryptedData;
+      bad_mac.back() += 1;
+      error = core::system::crypto::v2::aesDecrypt(bad_mac, g_key, g_iv, decryptedData);
+      ASSERT_EQ(0u, decryptedData.size());
+      ASSERT_TRUE(error != Success());
+
+      // Finally, decrypt the encrypted data correctly
+      error = core::system::crypto::v2::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_GT(decryptedData.size(), 0u);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Key size mismatches aren't allowed section
+   {
+      std::vector<unsigned char> iv(16);
+      std::vector<unsigned char> encryptedData;
+
+      // Encrypting v0/v1 with too small key size throws
+      std::vector<unsigned char> key = {};
+      EXPECT_ANY_THROW(core::system::crypto::v0::aesEncrypt(g_data, key, iv, encryptedData));
+      EXPECT_ANY_THROW(core::system::crypto::v1::aesEncrypt(g_data, key, iv, encryptedData));
+
+      // Encrypting v2 with v1 key size throws
+      key.resize(crypto::v1::KEY_LENGTH_BYTES);
+      EXPECT_ANY_THROW(core::system::crypto::v2::aesEncrypt(g_data, key, iv, encryptedData));
+   }
+}
+
+TEST(SharedCoreTest, VersionedCryptoCalls)
+{
+   // Crypto can decrypt v0 data section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v0::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v0::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Crypto can decrypt v1 data section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v1::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v1::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Crypto can decrypt v2 data section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v2::VERSION_BYTE));
+
+      // encrypt the data
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v2::aesEncrypt(g_data, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Crypto can decrypt v0 data with v1 version byte section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v0::VERSION_BYTE));
+
+      // Use a key/iv combo that will generate a v0 encrypted buffer that starts with a v1 version byte
+      std::vector<unsigned char> encryptedData;
+      std::vector<unsigned char> key = {0x95, 0x34, 0xef, 0xab, 0x94, 0xbb, 0xb2, 0xf2, 0x49, 0x3a, 0xbc, 0xe3, 0x69, 0x71, 0x59, 0x06};
+      std::vector<unsigned char> iv = {0xbc, 0x8f, 0x17, 0x56, 0x50, 0xca, 0xeb, 0x4a, 0xcb, 0xcb, 0x63, 0x53, 0xff, 0xba, 0x58, 0x51};
+      Error error = core::system::crypto::v0::aesEncrypt(g_data, key, iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      ASSERT_EQ(crypto::v1::VERSION_BYTE, encryptedData[0]);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, key, iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Crypto can decrypt v0 data with v2 version byte section
+   {
+      // setup
+      ASSERT_TRUE(generateKeys(crypto::v0::VERSION_BYTE));
+
+      // Use a key/iv combo that will generate a v0 encrypted buffer that starts with a v2 version byte
+      std::vector<unsigned char> encryptedData;
+      std::vector<unsigned char> key = {0x78, 0x84, 0x9b, 0x4c, 0x27, 0x6a, 0x07, 0x17, 0xb1, 0xbb, 0x1d, 0xd0, 0x9e, 0xc5, 0x39, 0x55};
+      std::vector<unsigned char> iv = {0x22, 0xaf, 0xca, 0x38, 0x2d, 0xeb, 0xf8, 0xaa, 0xa0, 0xfb, 0x97, 0x40, 0xaa, 0xbb, 0x97, 0x13};
+      Error error = core::system::crypto::v0::aesEncrypt(g_data, key, iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      ASSERT_EQ(crypto::v2::VERSION_BYTE, encryptedData[0]);
+
+      // decrypt the encrypted data
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, key, iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // Crypto can decrypt v0 data with v2 version byte using a v2-sized key section
+   {
+      // The section above uses a 16-byte key, so v2::aesDecrypt rejects it on the
+      // key-length guard before any OpenSSL call is made. Real callers (e.g. the
+      // secure-cookie key, which is required to be >= 32 bytes) get past that
+      // guard and run a full AES-256-GCM decrypt that then fails its tag check.
+      // That is the path that must fall back to v0 cleanly.
+      ASSERT_TRUE(generateKeys(crypto::v0::VERSION_BYTE));
+
+      // v0 encryption is AES-128-CBC and only consumes the first 16 bytes of the
+      // key and IV, so padding this key out to 32 bytes leaves the ciphertext
+      // (and therefore its leading v2 version byte) unchanged.
+      std::vector<unsigned char> key = {0x78, 0x84, 0x9b, 0x4c, 0x27, 0x6a, 0x07, 0x17, 0xb1, 0xbb, 0x1d, 0xd0, 0x9e, 0xc5, 0x39, 0x55,
+                                        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f};
+      std::vector<unsigned char> iv = {0x22, 0xaf, 0xca, 0x38, 0x2d, 0xeb, 0xf8, 0xaa, 0xa0, 0xfb, 0x97, 0x40, 0xaa, 0xbb, 0x97, 0x13};
+
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v0::aesEncrypt(g_data, key, iv, encryptedData);
+      ASSERT_FALSE(error);
+
+      ASSERT_EQ(crypto::v2::VERSION_BYTE, encryptedData[0]);
+      ASSERT_GE(key.size(), (size_t)crypto::v2::KEY_LENGTH_BYTES);
+
+      // the speculative v2 attempt must fail its tag check and fall back to v0
+      std::vector<unsigned char> decryptedData;
+      error = core::system::crypto::aesDecrypt(encryptedData, key, iv, decryptedData);
+      ASSERT_FALSE(error);
+
+      // verify that the decryption gives us back the original data
+      ASSERT_TRUE(decryptedPayloadMatches(decryptedData));
+   }
+
+   // A v2 buffer too short to hold its own overhead is rejected, not underflowed
+   {
+      ASSERT_TRUE(generateKeys(crypto::v2::VERSION_BYTE));
+
+      // [ version byte ][ data ][ mac ] needs at least 1 + MAC_SIZE_BYTES bytes.
+      // Anything shorter used to wrap the unsigned length arithmetic around to
+      // a huge value; it must throw the version mismatch instead so the caller
+      // falls back to an earlier version.
+      const size_t overhead = crypto::ENCRYPTION_VERSION_SIZE_BYTES + crypto::v2::MAC_SIZE_BYTES;
+      std::vector<unsigned char> decryptedData;
+
+      for (size_t len : {(size_t)1, overhead - 1})
+      {
+         std::vector<unsigned char> shortData(len, crypto::v2::VERSION_BYTE);
+         EXPECT_ANY_THROW(core::system::crypto::v2::aesDecrypt(shortData, g_key, g_iv, decryptedData));
+      }
+   }
+
+   // An empty plaintext round-trips through v2 - its ciphertext is exactly the overhead
+   {
+      ASSERT_TRUE(generateKeys(crypto::v2::VERSION_BYTE));
+
+      std::vector<unsigned char> emptyData;
+      std::vector<unsigned char> encryptedData;
+      Error error = core::system::crypto::v2::aesEncrypt(emptyData, g_key, g_iv, encryptedData);
+      ASSERT_FALSE(error);
+      ASSERT_EQ(crypto::ENCRYPTION_VERSION_SIZE_BYTES + crypto::v2::MAC_SIZE_BYTES, encryptedData.size());
+
+      std::vector<unsigned char> decryptedData(1, 'x');
+      error = core::system::crypto::v2::aesDecrypt(encryptedData, g_key, g_iv, decryptedData);
+      ASSERT_FALSE(error);
+      ASSERT_TRUE(decryptedData.empty());
+   }
+
+   // A v1 buffer with no payload after its version byte is rejected
+   {
+      ASSERT_TRUE(generateKeys(crypto::v1::VERSION_BYTE));
+
+      std::vector<unsigned char> decryptedData;
+      std::vector<unsigned char> shortData = {crypto::v1::VERSION_BYTE};
+      EXPECT_ANY_THROW(core::system::crypto::v1::aesDecrypt(shortData, g_key, g_iv, decryptedData));
+   }
+}
+
+namespace {
+
+std::vector<unsigned char> fromHex(const std::string& hex)
+{
+   std::vector<unsigned char> bytes;
+   for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
+      bytes.push_back(static_cast<unsigned char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+   return bytes;
+}
+
+} // anonymous namespace
+
+// The v0 and v1 formats are AES-128-CBC with PKCS#7 padding, and stored data
+// and other components depend on these exact bytes. The key, IV, plaintext,
+// and first four ciphertext blocks are the CBC-AES128 example from NIST
+// SP 800-38A, appendix F.2.1. The fifth block is the padding block.
+TEST(SharedCoreTest, LegacyEncryptionVersionsMatchAes128CbcKnownAnswer)
+{
+   const std::vector<unsigned char> key = fromHex("2b7e151628aed2a6abf7158809cf4f3c");
+   const std::vector<unsigned char> iv = fromHex("000102030405060708090a0b0c0d0e0f");
+   const std::vector<unsigned char> plaintext = fromHex(
+      "6bc1bee22e409f96e93d7e117393172a"
+      "ae2d8a571e03ac9c9eb76fac45af8e51"
+      "30c81c46a35ce411e5fbc1191a0a52ef"
+      "f69f2445df4f9b17ad2b417be66c3710");
+   const std::vector<unsigned char> ciphertext = fromHex(
+      "7649abac8119b246cee98e9b12e9197d"
+      "5086cb9b507219ee95db113a917678b2"
+      "73bed6b8e3c1743b7116e69e22229516"
+      "3ff1caa1681fac09120eca307586e1a7"
+      "8cb82807230e1321d3fae00d18cc2012");
+
+   // v0: the ciphertext alone
+   {
+      std::vector<unsigned char> encrypted;
+      ASSERT_FALSE(crypto::v0::aesEncrypt(plaintext, key, iv, encrypted));
+      EXPECT_EQ(ciphertext, encrypted);
+
+      std::vector<unsigned char> decrypted;
+      ASSERT_FALSE(crypto::v0::aesDecrypt(ciphertext, key, iv, decrypted));
+      EXPECT_EQ(plaintext, decrypted);
+   }
+
+   // v1: the version byte, then the same ciphertext
+   {
+      std::vector<unsigned char> v1Ciphertext = { crypto::v1::VERSION_BYTE };
+      v1Ciphertext.insert(v1Ciphertext.end(), ciphertext.begin(), ciphertext.end());
+
+      std::vector<unsigned char> encrypted;
+      ASSERT_FALSE(crypto::v1::aesEncrypt(plaintext, key, iv, encrypted));
+      EXPECT_EQ(v1Ciphertext, encrypted);
+
+      std::vector<unsigned char> decrypted;
+      ASSERT_FALSE(crypto::v1::aesDecrypt(v1Ciphertext, key, iv, decrypted));
+      EXPECT_EQ(plaintext, decrypted);
+   }
+}
+
+} // end namespace tests
+} // end namespace system
+} // end namespace core
+} // end namespace rstudio

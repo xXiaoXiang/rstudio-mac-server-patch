@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+   <assemblyIdentity version="1.0.0.0" name="rsession-utf8" type="win32"/>
+
+   <description>rsession-utf8</description>
+
+   <!--
+      Support UTF-8 code page with R 4.2.0 and newer.
+
+      longPathAware opts out of the MAX_PATH (260 character) limit. R declares
+      long path awareness on its own front-ends, but a manifest applies to the
+      process, and we host R.dll ourselves, so R's declaration never takes
+      effect under RStudio unless we declare it here too. Also requires the
+      machine's HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled
+      registry value to be set.
+   -->
+   <application>
+     <windowsSettings>
+       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+     </windowsSettings>
+  </application>
+
+   <!-- Identify the application security requirements. -->
+   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+      <security>
+         <requestedPrivileges>
+            <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+         </requestedPrivileges>
+      </security>
+   </trustInfo>
+
+   <!-- Declare compatibility with different versions of Windows. -->
+   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+      <application>
+         <!-- Windows 10 -->
+         <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+         <!-- Windows 8.1 -->
+         <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+         <!-- Windows Vista -->
+         <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+         <!-- Windows 7 -->
+         <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+         <!-- Windows 8 -->
+         <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      </application>
+   </compatibility>
+
+</assembly>
