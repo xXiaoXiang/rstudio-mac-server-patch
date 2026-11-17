@@ -1,0 +1,94 @@
+/*
+ * PreferencesDialogConstants.java
+ *
+ * Copyright (C) 2024 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.workbench.prefs.views;
+
+//
+// This class exists primarily to make changes to the preference dialog's
+// dimensions more straightforward. A variety of sizes are still hardcoded
+// in different dialogs, but where possible, those values should either be
+// moved here, or computed based on existing values herein.
+//
+public class PreferencesDialogConstants
+{
+   public static final int PANEL_CONTAINER_WIDTH  = 640;
+
+   // Sized so Code > Editing fits with a project open under the tallest UI
+   // font we ship against: Noto Sans, the fontconfig default on Fedora and
+   // RHEL 10, renders the pane's section headers 3px taller each than DejaVu
+   // Sans does, and 630px left only 6px to spare (#19270).
+   public static final int PANEL_CONTAINER_HEIGHT = 640;
+   public static final int SECTION_CHOOSER_WIDTH = 132;
+   public static final int SECTION_CHOOSER_PADDING = 10;
+
+   // The width left for a pane beside the section chooser, once the pane
+   // container pads its left edge by SECTION_CHOOSER_PADDING.
+   public static final int PANE_CONTENT_WIDTH =
+         PANEL_CONTAINER_WIDTH - SECTION_CHOOSER_WIDTH - SECTION_CHOOSER_PADDING;
+
+   // Allow 100px for the caption, footer, borders, and padding, plus the
+   // 30px bottom margin used by ModalDialogBase's overflow fallback.
+   // Keep this allowance in sync with the dialog chrome in ThemeStyles.css.
+   private static final int DIALOG_VERTICAL_RESERVE = 100 + 30;
+
+   // Width of the panel container when the section chooser is not shown, e.g.
+   // Help / Accessibility / Accessibility Options... Panes keep the width
+   // they have beside the chooser, with its padding on either side.
+   public static final int PANEL_CONTAINER_WIDTH_NO_CHOOSER =
+         PANE_CONTENT_WIDTH + 2 * SECTION_CHOOSER_PADDING;
+
+   public static final String panelContainerWidth()
+   {
+      return PANEL_CONTAINER_WIDTH + "px";
+   }
+   
+   public static final String panelContainerHeight()
+   {
+      return panelContainerHeight(0);
+   }
+
+   public static final String panelContainerHeight(int offset)
+   {
+      return "min(" + (PANEL_CONTAINER_HEIGHT - offset) +
+            "px, calc(100vh - " + (DIALOG_VERTICAL_RESERVE + offset) + "px))";
+   }
+   
+   public static final String panelContainerWidthNoChooser()
+   {
+      return PANEL_CONTAINER_WIDTH_NO_CHOOSER + "px";
+   }
+
+   // Project preferences dialog dimensions
+   public static final int PROJECT_PANEL_CONTAINER_WIDTH  = 555;
+   public static final int PROJECT_PANEL_CONTAINER_HEIGHT = 445;
+   public static final int PROJECT_PANE_CONTENT_WIDTH =
+         PROJECT_PANEL_CONTAINER_WIDTH - SECTION_CHOOSER_WIDTH - SECTION_CHOOSER_PADDING;
+   public static final int PROJECT_PANEL_CONTAINER_WIDTH_NO_CHOOSER =
+         PROJECT_PANE_CONTENT_WIDTH + 2 * SECTION_CHOOSER_PADDING;
+
+   public static final String projectPanelContainerWidth()
+   {
+      return PROJECT_PANEL_CONTAINER_WIDTH + "px";
+   }
+
+   public static final String projectPanelContainerHeight()
+   {
+      return PROJECT_PANEL_CONTAINER_HEIGHT + "px";
+   }
+
+   public static final String projectPanelContainerWidthNoChooser()
+   {
+      return PROJECT_PANEL_CONTAINER_WIDTH_NO_CHOOSER + "px";
+   }
+}

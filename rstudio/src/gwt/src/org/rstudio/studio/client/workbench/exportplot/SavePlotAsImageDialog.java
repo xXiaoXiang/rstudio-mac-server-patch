@@ -1,0 +1,424 @@
+/*
+ * SavePlotAsImageDialog.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.workbench.exportplot;
+
+import org.rstudio.core.client.BrowseCap;
+import org.rstudio.core.client.ElementIds;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.files.FileSystemContext;
+import org.rstudio.core.client.files.FileSystemItem;
+import org.rstudio.core.client.widget.FormLabel;
+import org.rstudio.core.client.widget.Operation;
+import org.rstudio.core.client.widget.OperationWithInput;
+import org.rstudio.core.client.widget.ProgressIndicator;
+import org.rstudio.core.client.widget.ProgressOperationWithInput;
+import org.rstudio.core.client.widget.ThemedButton;
+import org.rstudio.studio.client.RStudioGinjector;
+import org.rstudio.studio.client.common.FileDialogs;
+import org.rstudio.studio.client.common.GlobalDisplay;
+import org.rstudio.studio.client.workbench.exportplot.model.ExportPlotOptions;
+import org.rstudio.studio.client.workbench.exportplot.model.SavePlotAsImageContext;
+
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.core.client.JsArrayString;
+import com.google.gwt.dom.client.Style.Unit;
+import com.google.gwt.event.dom.client.ClickEvent;
+import com.google.gwt.event.dom.client.ClickHandler;
+import com.google.gwt.i18n.client.NumberFormat;
+import com.google.gwt.user.client.ui.CheckBox;
+import com.google.gwt.user.client.ui.HasVerticalAlignment;
+import com.google.gwt.user.client.ui.HorizontalPanel;
+import com.google.gwt.user.client.ui.Label;
+import com.google.gwt.user.client.ui.ListBox;
+import com.google.gwt.user.client.ui.Widget;
+
+public class SavePlotAsImageDialog extends ExportPlotDialog
+{
+   public SavePlotAsImageDialog(
+                           GlobalDisplay globalDisplay,
+                           SavePlotAsImageOperation saveOperation,
+                           ExportPlotPreviewer previewer,
+                           SavePlotAsImageContext context,
+                           final ExportPlotOptions options,
+                           final OperationWithInput<ExportPlotOptions> onClose)
+   {
+      super(options, previewer);
+
+      setText(constants_.savePlotAsImageText());
+
+      globalDisplay_ = globalDisplay;
+      saveOperation_ = saveOperation;
+      context_ = context;
+      progressIndicator_ = addProgressIndicator();
+
+      ThemedButton saveButton = new ThemedButton(constants_.saveTitle() + "...",
+                                                 new ClickHandler() {
+         public void onClick(ClickEvent event)
+         {
+            attemptSavePlot(new Operation() {
+               @Override
+               public void execute()
+               {
+                  onClose.execute(getCurrentOptions(options));
+
+                  closeDialog();
+               }
+            });
+         }
+      });
+      addOkButton(saveButton);
+      addCancelButton();
+
+      // file type
+      saveAsTarget_ = new SavePlotAsImageTargetEditor(options.getFormat(),
+                                                      context);
+
+      // view after save
+      viewAfterSaveCheckBox_ = new CheckBox(constants_.viewAfterSaveCheckBoxTitle());
+      viewAfterSaveCheckBox_.setValue(options.getViewAfterSave());
+
+      // use device pixel ratio
+      useDevicePixelRatioCheckBox_ = new CheckBox(constants_.useDevicePixelRatioCheckBoxLabel());
+      useDevicePixelRatioCheckBox_.setTitle(constants_.useDevicePixelRatioCheckBoxTitle());
+      useDevicePixelRatioCheckBox_.setValue(options.getUseDevicePixelRatio());
+      useDevicePixelRatioCheckBox_.getElement().getStyle().setPaddingLeft(6, Unit.PX);
+
+      // resolution of saved bitmaps, which replaces the device pixel ratio
+      // option where the saved image is drawn by R (see supportsResolution)
+      resolutionListBox_ = new ListBox();
+      resolutionListBox_.getElement().setId(ElementIds.getElementId(ElementIds.EXPORT_PLOT_RESOLUTION));
+      // an explicit resolution is listed even when it matches the screen's,
+      // since the screen's changes with the display
+      resolutionListBox_.addItem(constants_.screenResolutionText(Integer.toString(screenResolution())), "0");
+      for (int dpi : RESOLUTIONS)
+         resolutionListBox_.addItem(constants_.resolutionText(Integer.toString(dpi)), Integer.toString(dpi));
+      resolutionListBox_.setSelectedIndex(0);
+      for (int i = 0; i < resolutionListBox_.getItemCount(); i++)
+      {
+         if (resolutionListBox_.getValue(i).equals(Integer.toString(options.getResolution())))
+            resolutionListBox_.setSelectedIndex(i);
+      }
+      resolutionListBox_.addChangeHandler(event -> updateSizeText());
+
+      // the compression of TIFFs, as named by R's tiff() device
+      tiffCompressionListBox_ = new ListBox();
+      tiffCompressionListBox_.getElement().setId(ElementIds.getElementId(ElementIds.EXPORT_PLOT_TIFF_COMPRESSION));
+      // (the Viewer pane's context has none; its dialog doesn't offer them)
+      JsArrayString compressionTypes = context.getTiffCompressionTypes();
+      int selectedCompression = -1;
+      for (int i = 0; compressionTypes != null && i < compressionTypes.length(); i++)
+      {
+         String type = compressionTypes.get(i);
+         tiffCompressionListBox_.addItem(tiffCompressionText(type), type);
+         if (type.equals(options.getTiffCompression()))
+            selectedCompression = i;
+         else if (selectedCompression < 0 && type.equals(DEFAULT_TIFF_COMPRESSION))
+            selectedCompression = i;
+      }
+      tiffCompressionListBox_.setSelectedIndex(Math.max(0, selectedCompression));
+      tiffCompressionLabel_ = new FormLabel(constants_.tiffCompressionLabel(), tiffCompressionListBox_);
+
+      // the quality of JPEGs
+      jpegQualityListBox_ = new ListBox();
+      jpegQualityListBox_.getElement().setId(ElementIds.getElementId(ElementIds.EXPORT_PLOT_JPEG_QUALITY));
+      for (int quality : JPEG_QUALITIES)
+         jpegQualityListBox_.addItem(Integer.toString(quality), Integer.toString(quality));
+      jpegQualityListBox_.setSelectedIndex(0);
+      for (int i = 0; i < jpegQualityListBox_.getItemCount(); i++)
+      {
+         if (jpegQualityListBox_.getValue(i).equals(Integer.toString(options.getJpegQuality())))
+            jpegQualityListBox_.setSelectedIndex(i);
+      }
+      jpegQualityLabel_ = new FormLabel(constants_.jpegQualityLabel(), jpegQualityListBox_);
+
+      sizeText_ = new Label();
+      sizeText_.getElement().setId(ElementIds.getElementId(ElementIds.EXPORT_PLOT_SIZE_TEXT));
+      sizeText_.getElement().getStyle().setMarginLeft(10, Unit.PX);
+
+      // update preview button
+      ThemedButton updatePreviewButton = new ThemedButton(
+            constants_.updatePreviewTitle(),
+            new ClickHandler() {
+               public void onClick(ClickEvent event)
+               {
+                  getSizeEditor().updatePreview();
+               }
+            });
+      addLeftWidget(updatePreviewButton);
+   }
+
+   @Override
+   protected Widget createMainWidget()
+   {
+      Widget mainWidget = super.createMainWidget();
+      getSizeEditor().setUpdateButtonVisible(false);
+      return mainWidget;
+   }
+
+   @Override
+   protected Widget createTopLeftWidget()
+   {
+      return saveAsTarget_;
+   }
+
+   @Override
+   protected Widget createBottomWidget()
+   {
+      HorizontalPanel panel = new HorizontalPanel();
+      panel.setVerticalAlignment(HasVerticalAlignment.ALIGN_MIDDLE);
+      panel.add(viewAfterSaveCheckBox_);
+      if (!supportsResolution())
+      {
+         panel.add(useDevicePixelRatioCheckBox_);
+         return panel;
+      }
+
+      FormLabel resolutionLabel = new FormLabel(constants_.resolutionLabel(), resolutionListBox_);
+      resolutionLabel.getElement().getStyle().setMarginLeft(16, Unit.PX);
+      resolutionLabel.getElement().getStyle().setMarginRight(5, Unit.PX);
+      panel.add(resolutionLabel);
+      panel.add(resolutionListBox_);
+
+      // the options of the selected format (see updateFormatOptions)
+      for (FormLabel label : new FormLabel[] { tiffCompressionLabel_, jpegQualityLabel_ })
+      {
+         label.getElement().getStyle().setMarginLeft(16, Unit.PX);
+         label.getElement().getStyle().setMarginRight(5, Unit.PX);
+      }
+      panel.add(tiffCompressionLabel_);
+      panel.add(tiffCompressionListBox_);
+      panel.add(jpegQualityLabel_);
+      panel.add(jpegQualityListBox_);
+      panel.add(sizeText_);
+
+      getSizeEditor().addSizeChangedHandler(() -> updateSizeText());
+      saveAsTarget_.addChangeHandler(event ->
+      {
+         updateFormatOptions();
+         updateSizeText();
+      });
+      updateFormatOptions();
+      updateSizeText();
+      return panel;
+   }
+
+   // Shows the options of the selected format: the compression for TIFFs,
+   // and the quality for JPEGs.
+   private void updateFormatOptions()
+   {
+      String format = saveAsTarget_.getFormat();
+      boolean tiff = format.equals("tiff");
+      tiffCompressionLabel_.setVisible(tiff);
+      tiffCompressionListBox_.setVisible(tiff);
+      boolean jpeg = format.equals("jpeg");
+      jpegQualityLabel_.setVisible(jpeg);
+      jpegQualityListBox_.setVisible(jpeg);
+   }
+
+   // The name shown for a TIFF compression, as named by R's tiff() device.
+   private static String tiffCompressionText(String type)
+   {
+      switch (type)
+      {
+      case "none":  return constants_.tiffCompressionNoneText();
+      case "lzw":   return constants_.tiffCompressionLzwText();
+      case "zip":   return constants_.tiffCompressionZipText();
+      case "lzw+p": return constants_.tiffCompressionLzwPredictorText();
+      case "zip+p": return constants_.tiffCompressionZipPredictorText();
+      default:      return type.toUpperCase();
+      }
+   }
+
+   /**
+    * Whether the dialog offers a resolution for saved images; otherwise, it
+    * offers whether to use the display's device pixel ratio.
+    */
+   protected boolean supportsResolution()
+   {
+      return true;
+   }
+
+   // The selected resolution in DPI; 0 means the display's.
+   private int getResolution()
+   {
+      if (!supportsResolution())
+         return 0;
+      return StringUtil.parseInt(resolutionListBox_.getSelectedValue(), 0);
+   }
+
+   private boolean getUseDevicePixelRatio()
+   {
+      if (!supportsResolution())
+         return useDevicePixelRatioCheckBox_.getValue();
+      return getResolution() == 0;
+   }
+
+   // The selected TIFF compression, as named by R's tiff() device.
+   private String getTiffCompression()
+   {
+      if (!supportsResolution() || tiffCompressionListBox_.getItemCount() == 0)
+         return DEFAULT_TIFF_COMPRESSION;
+      return tiffCompressionListBox_.getSelectedValue();
+   }
+
+   // The selected JPEG quality, from 1 to 100.
+   private int getJpegQuality()
+   {
+      if (!supportsResolution())
+         return DEFAULT_JPEG_QUALITY;
+      return StringUtil.parseInt(jpegQualityListBox_.getSelectedValue(), DEFAULT_JPEG_QUALITY);
+   }
+
+   private static int screenResolution()
+   {
+      return (int) Math.round(96 * BrowseCap.devicePixelRatio());
+   }
+
+   // Shows the physical size of the saved image, and its size in pixels
+   // (plot sizes are in pixels at 96 DPI; the resolution scales them).
+   private void updateSizeText()
+   {
+      boolean bitmap = saveAsTarget_.isBitmapFormat();
+      resolutionListBox_.setEnabled(bitmap);
+
+      ExportPlotSizeEditor sizeEditor = getSizeEditor();
+      int width = sizeEditor.getImageWidth();
+      int height = sizeEditor.getImageHeight();
+      NumberFormat inches = NumberFormat.getFormat("0.##");
+      String widthInches = inches.format(width / 96.0);
+      String heightInches = inches.format(height / 96.0);
+      if (!bitmap)
+      {
+         sizeText_.setText(constants_.exportSizeInchesText(widthInches, heightInches));
+         return;
+      }
+
+      // the session scales by the exact pixel ratio for the screen's resolution
+      double scale = getResolution() == 0
+            ? BrowseCap.devicePixelRatio()
+            : getResolution() / 96.0;
+      int widthPixels = (int) (width * scale);
+      int heightPixels = (int) (height * scale);
+      boolean tooLarge = (double) widthPixels * heightPixels > MAX_BITMAP_PIXELS;
+      sizeText_.setText(tooLarge
+            ? constants_.exportSizeTooLargeText(
+                  widthInches,
+                  heightInches,
+                  Integer.toString(widthPixels),
+                  Integer.toString(heightPixels))
+            : constants_.exportSizeText(
+                  widthInches,
+                  heightInches,
+                  Integer.toString(widthPixels),
+                  Integer.toString(heightPixels)));
+   }
+
+   @Override
+   protected ExportPlotOptions getCurrentOptions(ExportPlotOptions previous)
+   {
+      ExportPlotSizeEditor sizeEditor = getSizeEditor();
+      return ExportPlotOptions.create(sizeEditor.getImageWidth(),
+                                      sizeEditor.getImageHeight(),
+                                      sizeEditor.getKeepRatio(),
+                                      saveAsTarget_.getFormat(),
+                                      viewAfterSaveCheckBox_.getValue(),
+                                      getUseDevicePixelRatio(),
+                                      previous.getCopyAsMetafile(),
+                                      supportsResolution() ? getResolution() : previous.getResolution(),
+                                      supportsResolution() ? getTiffCompression() : previous.getTiffCompression(),
+                                      supportsResolution() ? getJpegQuality() : previous.getJpegQuality());
+   }
+
+   private void attemptSavePlot(final Operation onCompleted)
+   {
+      // compose default file path
+      String ext = saveAsTarget_.getDefaultExtension();
+      FileSystemItem defaultDir = ExportPlotUtils.getDefaultSaveDirectory(
+                                       context_.getDirectory());
+      FileSystemItem initialPath = FileSystemItem.createFile(
+                                       defaultDir.completePath(
+                                          context_.getUniqueFileStem() + ext));
+
+      fileDialogs_.saveFile(
+         constants_.savePlotAsImageText(),
+         fileSystemContext_,
+         initialPath,
+         ext,
+         false,
+         new ProgressOperationWithInput<FileSystemItem>() {
+            @Override
+            public void execute(FileSystemItem input, ProgressIndicator indicator)
+            {
+               if (input == null)
+               {
+                  indicator.onCompleted();
+                  return;
+               }
+
+               indicator.onCompleted();
+
+               // update default save directory
+               ExportPlotUtils.setDefaultSaveDirectory(input.getParentPath());
+
+               // determine format from the chosen file extension
+               String format = saveAsTarget_.getFormat();
+
+               saveOperation_.attemptSave(
+                     progressIndicator_,
+                     input,
+                     format,
+                     getSizeEditor(),
+                     true, // overwrite (user confirmed via save dialog)
+                     viewAfterSaveCheckBox_.getValue(),
+                     getUseDevicePixelRatio(),
+                     getResolution(),
+                     getTiffCompression(),
+                     getJpegQuality(),
+                     onCompleted);
+            }
+         });
+   }
+
+   private final GlobalDisplay globalDisplay_;
+   private ProgressIndicator progressIndicator_;
+   private final SavePlotAsImageOperation saveOperation_;
+   private final SavePlotAsImageContext context_;
+   private SavePlotAsImageTargetEditor saveAsTarget_;
+   private CheckBox viewAfterSaveCheckBox_;
+   private CheckBox useDevicePixelRatioCheckBox_;
+   private ListBox resolutionListBox_;
+   private FormLabel tiffCompressionLabel_;
+   private ListBox tiffCompressionListBox_;
+   private FormLabel jpegQualityLabel_;
+   private ListBox jpegQualityListBox_;
+   private Label sizeText_;
+
+   private static final int[] RESOLUTIONS = { 96, 150, 300, 600 };
+   private static final int[] JPEG_QUALITIES = { 100, 95, 90, 80, 75 };
+   private static final String DEFAULT_TIFF_COMPRESSION = "lzw";
+   private static final int DEFAULT_JPEG_QUALITY = 100;
+
+   // the session refuses to draw bitmaps larger than this (kMaxBitmapPixels
+   // in RGraphicsPlotManager.cpp); the save then fails with the same advice
+   private static final double MAX_BITMAP_PIXELS = 100e6;
+
+   private final FileSystemContext fileSystemContext_ =
+      RStudioGinjector.INSTANCE.getRemoteFileSystemContext();
+
+   private final FileDialogs fileDialogs_ =
+      RStudioGinjector.INSTANCE.getFileDialogs();
+
+   private static final ExportPlotConstants constants_ = GWT.create(ExportPlotConstants.class);
+}

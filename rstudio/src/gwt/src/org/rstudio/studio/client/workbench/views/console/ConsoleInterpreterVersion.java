@@ -1,0 +1,380 @@
+/*
+ * ConsoleInterpreterVersion.java
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+package org.rstudio.studio.client.workbench.views.console;
+
+import org.rstudio.core.client.Debug;
+import org.rstudio.core.client.ElementIds;
+import org.rstudio.core.client.StringUtil;
+import org.rstudio.core.client.resources.ImageResource2x;
+import org.rstudio.core.client.theme.res.ThemeResources;
+import org.rstudio.core.client.theme.res.ThemeStyles;
+import org.rstudio.core.client.widget.DecorativeImage;
+import org.rstudio.core.client.widget.ToolbarPopupMenu;
+import org.rstudio.studio.client.RStudioGinjector;
+import org.rstudio.studio.client.application.events.EventBus;
+import org.rstudio.studio.client.application.model.ApplicationServerOperations;
+import org.rstudio.studio.client.application.model.RVersionSpec;
+import org.rstudio.studio.client.common.dependencies.DependencyManager;
+import org.rstudio.studio.client.events.ReticulateEvent;
+import org.rstudio.studio.client.server.ServerError;
+import org.rstudio.studio.client.server.ServerRequestCallback;
+import org.rstudio.studio.client.workbench.commands.Commands;
+import org.rstudio.studio.client.workbench.model.Session;
+import org.rstudio.studio.client.workbench.model.SessionInfo;
+import org.rstudio.studio.client.workbench.prefs.views.PythonInterpreter;
+import org.rstudio.studio.client.workbench.views.console.shell.ConsoleLanguageTracker;
+
+import com.google.gwt.core.client.GWT;
+import com.google.gwt.dom.client.SpanElement;
+import com.google.gwt.event.dom.client.ClickEvent;
+import com.google.gwt.event.dom.client.ClickHandler;
+import com.google.gwt.event.logical.shared.CloseEvent;
+import com.google.gwt.event.logical.shared.CloseHandler;
+import com.google.gwt.resources.client.ClientBundle;
+import com.google.gwt.resources.client.CssResource;
+import com.google.gwt.resources.client.DataResource;
+import com.google.gwt.resources.client.DataResource.MimeType;
+import com.google.gwt.user.client.ui.Composite;
+import com.google.gwt.user.client.ui.FlowPanel;
+import com.google.gwt.user.client.ui.HorizontalPanel;
+import com.google.gwt.user.client.ui.Image;
+import com.google.gwt.user.client.ui.Label;
+import com.google.gwt.user.client.ui.MenuItem;
+import com.google.gwt.user.client.ui.PopupPanel;
+import com.google.gwt.event.shared.HandlerRegistration;
+import com.google.gwt.user.client.ui.Widget;
+import com.google.inject.Inject;
+
+public class ConsoleInterpreterVersion
+   extends Composite
+   implements ReticulateEvent.Handler
+
+{
+   @Inject
+   private void initialize(Session session,
+                           Commands commands,
+                           EventBus events,
+                           ConsoleLanguageTracker tracker,
+                           DependencyManager depoman,
+                           ApplicationServerOperations server)
+   {
+      session_ = session;
+      commands_ = commands;
+      events_ = events;
+      tracker_ = tracker;
+      depoman_ = depoman;
+      server_ = server;
+   }
+   
+   public ConsoleInterpreterVersion()
+   {
+      this(false);
+   }
+   
+   // isTabbedView is used to control styling based on whether
+   // this widget is displayed in the "tabbed" version of the Console Pane
+   // versus the "untabbed" version (when no other tabs are available)
+   public ConsoleInterpreterVersion(boolean isTabbedView)
+   {
+      RStudioGinjector.INSTANCE.injectMembers(this);
+
+      container_ = new HorizontalPanel();
+      label_ = new Label(constants_.unknownLabel());
+      session_.withSessionInfo(info ->
+      {
+         // Seed only once: session info is a startup snapshot, while later
+         // RPC responses can describe a different R after a restart.
+         rVersion_ = info.getRVersionsInfo().getRVersion();
+         setRVersionLabel();
+      });
+      
+      rLogo_ = createLogo(RES.styles().iconR(), ElementIds.CONSOLE_INTERPRETER_R_LOGO, isTabbedView);
+      
+      pythonLogo_ = createLogo(
+            RES.styles().iconPython(),
+            ElementIds.CONSOLE_INTERPRETER_PYTHON_LOGO,
+            isTabbedView);
+      
+      logoContainer_ = new FlowPanel(SpanElement.TAG);
+      container_.addStyleName(RES.styles().container());
+      container_.addDomHandler(new ClickHandler()
+      {
+         @Override
+         public void onClick(ClickEvent event)
+         {
+            ToolbarPopupMenu menu = new ToolbarPopupMenu();
+            
+            menu.addItem(new MenuItem("R", () -> {
+               tracker_.adaptToLanguage(ConsoleLanguageTracker.LANGUAGE_R, () -> {
+                  commands_.activateConsole().execute();
+               });
+            }));
+            
+            menu.addItem(new MenuItem("Python", () -> {
+               tracker_.adaptToLanguage(ConsoleLanguageTracker.LANGUAGE_PYTHON, () -> {
+                  commands_.activateConsole().execute();
+               });
+            }));
+            
+            logoContainer_.addStyleName(RES.styles().menuClicked());
+            menu.addCloseHandler(new CloseHandler<PopupPanel>()
+            {
+               @Override
+               public void onClose(CloseEvent<PopupPanel> event)
+               {
+                  logoContainer_.removeStyleName(RES.styles().menuClicked());
+               }
+            });
+            
+            menu.showRelativeTo(container_);
+         }
+      }, ClickEvent.getType());
+      
+      label_.addStyleName(RES.styles().label());
+      label_.addStyleName(ThemeStyles.INSTANCE.title());
+      label_.addStyleName(isTabbedView ? RES.styles().labelTabbed() : RES.styles().labelUntabbed());
+      ElementIds.assignElementId(label_,
+            ElementIds.CONSOLE_INTERPRETER_VERSION + (isTabbedView ? "_tabbed" : ""));
+
+      pythonActive_ = isPythonActive();
+      if (pythonActive_)
+      {
+         logoContainer_.add(pythonLogo_);
+      }
+      else
+      {
+         logoContainer_.add(rLogo_);
+      }
+      container_.add(logoContainer_);
+      
+      container_.add(label_);
+      initWidget(container_);
+      
+      setVisible(true);
+   }
+
+   @Override
+   protected void onLoad()
+   {
+      super.onLoad();
+
+      if (reticulateHandler_ == null)
+      {
+         reticulateHandler_ = events_.addHandler(ReticulateEvent.TYPE, this);
+      }
+   }
+
+   @Override
+   protected void onUnload()
+   {
+      super.onUnload();
+
+      if (reticulateHandler_ != null)
+      {
+         reticulateHandler_.removeHandler();
+         reticulateHandler_ = null;
+      }
+   }
+
+   private Widget createLogo(String languageClass,
+                             String elementId,
+                             boolean isTabbedView)
+   {
+      HorizontalPanel panel = new HorizontalPanel();
+      
+      // The logo is a CSS background image so the stylesheet can pick the
+      // variant for the current theme. As with an <img>, the SVG is its own
+      // document, so its internal ids can't collide with others in the page
+      // (the console title exists in two variants, so inlining would duplicate
+      // them). Being empty, the element is already hidden from screen readers.
+      FlowPanel logo = new FlowPanel();
+      logo.addStyleName(RES.styles().icon());
+      logo.addStyleName(isTabbedView
+            ? RES.styles().iconTabbed()
+            : RES.styles().iconUntabbed());
+      logo.addStyleName(languageClass);
+      ElementIds.assignElementId(logo, elementId + (isTabbedView ? "_tabbed" : ""));
+      panel.add(logo);
+      
+      // this control is not operable via keyboard or screen reader, so for now we'll just hide it
+      // from screen readers altogether instead of having an unlabeled image
+      Image downArrow = new DecorativeImage(
+            new ImageResource2x(ThemeResources.INSTANCE.menuDownArrow2x()));
+      downArrow.getElement().addClassName("rstudio-themes-inverts");
+      downArrow.addStyleName(RES.styles().iconDownArrow());
+      downArrow.getElement().setAttribute("draggable", "false");
+      panel.add(downArrow);
+      
+      return panel;
+   }
+   
+   public void adaptToR()
+   {
+      pythonActive_ = false;
+      logoContainer_.remove(0);
+      logoContainer_.insert(rLogo_, 0);
+      setRVersionLabel();
+      refreshRVersion();
+   }
+
+   private void adaptToPython(PythonInterpreter info)
+   {
+      pythonActive_ = true;
+      logoContainer_.remove(0);
+      logoContainer_.insert(pythonLogo_, 0);
+      label_.setText(pythonVersionLabel(info));
+   }
+   
+   private boolean isPythonActive()
+   {
+      SessionInfo info = session_.getSessionInfo();
+      return info != null && info.getPythonReplActive();
+   }
+   
+   @Override
+   public void onReticulate(ReticulateEvent event)
+   {
+      String type = event.getType();
+      
+      if (StringUtil.equals(type, ReticulateEvent.TYPE_REPL_INITIALIZED))
+      {
+         PythonInterpreter info = event.getPayload().cast();
+         adaptToPython(info);
+      }
+      else if (StringUtil.equals(type, ReticulateEvent.TYPE_REPL_TEARDOWN))
+      {
+         adaptToR();
+      }
+   }
+
+   private void setRVersionLabel()
+   {
+      label_.setText(StringUtil.isNullOrEmpty(rVersion_)
+            ? constants_.unknownLabel()
+            : rVersionLabel(rVersion_));
+   }
+
+   private void refreshRVersion()
+   {
+      server_.getRVersion(new ServerRequestCallback<RVersionSpec>()
+      {
+         @Override
+         public void onResponseReceived(RVersionSpec versionSpec)
+         {
+            rVersion_ = versionSpec.getVersion();
+
+            // the REPL may have started again while this request was in
+            // flight (e.g. a batch of chunks moving Python -> R -> Python);
+            // the label then already names Python and must stay that way
+            if (!pythonActive_)
+               setRVersionLabel();
+         }
+
+         @Override
+         public void onError(ServerError error)
+         {
+            Debug.logError(error);
+
+            // Preserve the last known version, including successful refreshes.
+            if (StringUtil.isNullOrEmpty(rVersion_))
+               label_.setText("Error fetching R version");
+         }
+      });
+   }
+
+   private String rVersionLabel(String version)
+   {
+      return "R " + version;
+   }
+   
+   private String pythonVersionLabel(PythonInterpreter info)
+   {
+      return "Python " + info.getVersion();
+   }
+   
+   public int getWidth()
+   {
+      return 64;
+   }
+   
+   public int getHeight()
+   {
+      return 18;
+   }
+   
+   private final HorizontalPanel container_;
+   private final FlowPanel logoContainer_;
+   private final Widget rLogo_;
+   private final Widget pythonLogo_;
+   private boolean pythonActive_;
+   private final Label label_;
+   private String rVersion_;
+   private HandlerRegistration reticulateHandler_;
+
+   // Injected ----
+   private Session session_;
+   private Commands commands_;
+   private EventBus events_;
+   private ConsoleLanguageTracker tracker_;
+   private DependencyManager depoman_;
+   private ApplicationServerOperations server_;
+   
+   // Resources ----
+   
+   public interface Styles extends CssResource
+   {
+      String container();
+      String menuClicked();
+      
+      String icon();
+      String iconTabbed();
+      String iconUntabbed();
+      String iconDownArrow();
+      
+      String iconR();
+      String iconPython();
+      
+      String label();
+      String labelTabbed();
+      String labelUntabbed();
+   }
+
+   public interface Resources extends ClientBundle
+   {
+      @Source("ConsoleInterpreterVersion.css")
+      Styles styles();
+
+      @Source("org/rstudio/studio/client/common/icons/r_logo.svg")
+      @MimeType("image/svg+xml")
+      DataResource rLogo();
+
+      // recolored for contrast against the dark-theme toolbar
+      @Source("org/rstudio/studio/client/common/icons/r_logo_dark.svg")
+      @MimeType("image/svg+xml")
+      DataResource rLogoDark();
+
+      @Source("org/rstudio/studio/client/common/icons/python_logo.svg")
+      @MimeType("image/svg+xml")
+      DataResource pythonLogo();
+   }
+
+   private static Resources RES = GWT.create(Resources.class);
+   static
+   {
+      RES.styles().ensureInjected();
+   }
+   private static final ConsoleConstants constants_ = GWT.create(ConsoleConstants.class);
+
+}

@@ -1,0 +1,117 @@
+@charset "UTF-8";
+
+@external windows;
+
+@external rstudio-themes-default;
+@external rstudio-themes-dark;
+@external rstudio-console-header-layout;
+
+@url R_LOGO rLogo;
+@url R_LOGO_DARK rLogoDark;
+@url PYTHON_LOGO pythonLogo;
+
+.container {
+   display: inline-block;
+   cursor: pointer;
+}
+
+.rstudio-console-header-layout .container {
+	margin-top: -2px;
+}
+
+.menuClicked {
+	position: relative;
+	top: 1px;
+}
+
+.icon {
+   display: inline-block;
+   position: relative;
+   top: 3px;
+   margin-right: 4px;
+   margin-top: -3px;
+   vertical-align: top;
+   /* the logo fills the content box, as it did as an <img> */
+   background-origin: content-box;
+   background-repeat: no-repeat;
+   background-size: 100% 100%;
+}
+
+.iconTabbed {
+   margin-right: 10px;
+}
+
+.iconUntabbed {
+   margin-top: -3px;
+   margin-left: -8px;
+   margin-right: 10px;
+}
+
+.iconDownArrow {
+	position: relative;
+	left: -6px;
+	top: 2px;
+}
+
+.windows .iconTabbed {
+	margin-top: -4px;
+}
+
+.windows .iconUntabbed {
+	margin-top: -2px;
+}
+
+.iconR {
+   width: 17px;
+   height: 17px;
+   padding: 2px;
+   background-image: R_LOGO;
+}
+
+/* The dark variant carries its own colors, so unlike the Python logo it
+   takes no brightness filter. */
+.rstudio-themes-dark .iconR {
+   background-image: R_LOGO_DARK;
+}
+
+.iconPython {
+   width: 16px;
+   height: 16px;
+   padding: 2px;
+   background-image: PYTHON_LOGO;
+}
+
+.rstudio-themes-default .iconPython {
+   height: 18px;
+}
+
+.rstudio-themes-dark .iconPython {
+   filter: brightness(1.25);
+}
+
+
+.labelTabbed {
+   display: inline-block;
+   margin-top: 4px;
+   margin-right: 6px;
+   font-size: 9pt;
+}
+
+.windows .labelTabbed {
+	margin-top: 3px;
+}
+
+.labelUntabbed {
+   display: inline-block;
+   margin-top: 3px;
+   margin-right: 6px;
+   font-size: 9pt;
+}
+
+.rstudio-themes-default .label {
+   color: black;
+}
+
+.rstudio-themes-dark .label {
+   color: white;
+}
