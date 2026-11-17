@@ -1,0 +1,422 @@
+/*
+ * System.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef CORE_SYSTEM_SYSTEM_HPP
+#define CORE_SYSTEM_SYSTEM_HPP
+
+
+#if defined(_WIN32)
+#include <windows.h>
+typedef DWORD PidType;
+typedef DWORD UidType;
+#else  // UNIX
+#include <sys/types.h>
+#include <sys/resource.h>
+
+#include <shared_core/system/PosixSystem.hpp>
+
+typedef pid_t PidType;
+typedef uid_t UidType;
+#endif
+
+#include <string>
+#include <vector>
+#include <map>
+#include <iosfwd>
+
+#include <boost/utility.hpp>
+#include <boost/shared_ptr.hpp>
+#include <boost/function.hpp>
+#include <boost/date_time.hpp>
+
+#include <core/Log.hpp>
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+
+#include <core/system/Types.hpp>
+
+namespace rstudio {
+namespace core {
+
+class FileInfo;
+class FilePath;
+
+namespace system {
+
+// portable realPath
+Error realPath(const FilePath& filePath, FilePath* pRealPath);
+Error realPath(const std::string& path, FilePath* pRealPath);
+bool realPathsEqual(const FilePath& a, const FilePath& b);
+
+// Searches for a program by name and returns its path.
+//
+// A bare name is searched for: on Windows, in the system directories and then the
+// directories on PATH; on POSIX, in the directories on PATH. Neither searches the
+// current directory, and the Windows search also omits the executable's own
+// directory -- PathFindOnPath, which the Windows implementation replaced, searched
+// both.
+//
+// The Windows order means PATH cannot override a program that ships in System32 or
+// the Windows directory. That is deliberate for cmd.exe (see the rationale in
+// Win32System.cpp), but it applies to every name: Windows also ships curl.exe,
+// tar.exe, find.exe, sort.exe and more.exe there, and its bash.exe is the WSL
+// launcher. Looking up any of those here resolves the system copy no matter what
+// PATH says.
+//
+// A name that is already path-qualified is resolved directly rather than searched for.
+// "Qualified" means containing '/' on POSIX, or any of '/', '\' or ':' on Windows. As
+// with any path, a relative qualified name resolves against the current directory --
+// that is execvp's rule, and is distinct from searching the current directory for a
+// bare name.
+//
+// Two behaviors differ by platform and are not smoothed over here:
+//
+//  - Extension probing is Windows-only. There, a name with no extension is also probed
+//    with .exe/.com/.bat/.cmd, for qualified and bare names alike. POSIX probes nothing.
+//  - POSIX requires the result to be executable by the effective user (X_OK); Windows
+//    requires only that it be a regular file, so it can return a file that is not.
+Error findProgramOnPath(const std::string& program,
+                        core::FilePath* pProgramPath);
+
+#ifndef _WIN32
+Error closeAllFileDescriptors();
+Error closeNonStdFileDescriptors();
+
+// retrieves a list of file descriptors opened by the specified child process
+// and sends each fd to the child via pipe so that the child can signal-safely
+// close the fds
+Error closeChildFileDescriptorsFrom(pid_t childPid, int pipeFd, uint32_t fdStart);
+
+// gets the list of open fds for the current process
+Error getOpenFds(std::vector<uint32_t>* pFds);
+
+// gets the list of open fds for the specified process
+Error getOpenFds(pid_t pid, std::vector<uint32_t>* pFds);
+
+namespace signal_safe {
+
+// thread and signal-safe version of closeNonStdFileDescriptors()
+void closeNonStdFileDescriptors(rlim_t fdLimit);
+
+// close file descriptors given to us by our parent process
+// must be paired with a call to closeChildFileDescriptorsFrom in the parent
+void closeFileDescriptorsFromParent(int pipeFd, uint32_t fdStart, rlim_t fdLimit);
+
+int clearSignalMask();
+
+} // namespace signal_safe
+
+void closeStdFileDescriptors();
+void attachStdFileDescriptorsToDevNull();
+void setStandardStreamsToDevNull();
+
+
+// Handles EINTR retrying and error logging. Only for use with functions
+// that return -1 on error and set errno.
+template <typename T>
+void safePosixCall(const boost::function<T()>& func,
+                          const ErrorLocation& location)
+{
+   Error error = posix::posixCall<T>(func, location, nullptr);
+   if (error)
+      LOG_ERROR(error);
+}
+
+#endif
+
+#ifdef _WIN32
+
+// Is 64-bit Windows?
+bool isWin64();
+
+// Is calling process 64-bit?
+bool isCurrentProcessWin64();
+
+bool isWin7OrLater();
+Error makeFileHidden(const FilePath& path);
+Error copyMetafileToClipboard(const FilePath& path);
+void ensureLongPath(FilePath* pFilePath);
+Error expandEnvironmentVariables(std::string value, std::string* pResult);
+FilePath expandComSpec();
+
+// close a handle then set it to NULL (so we can call this function
+// repeatedly without failure or other side effects)
+Error closeHandle(HANDLE* pHandle, const ErrorLocation& location);
+
+class CloseHandleOnExitScope : boost::noncopyable
+{
+public:
+   CloseHandleOnExitScope(HANDLE* pHandle, const ErrorLocation& location)
+      : pHandle_(pHandle), location_(location)
+   {
+   }
+
+   virtual ~CloseHandleOnExitScope();
+   void detach() { pHandle_ = nullptr; }
+private:
+   HANDLE* pHandle_;
+   ErrorLocation location_;
+};
+
+// set $HOME to $USERPROFILE
+void setHomeToUserProfile(core::system::Options* pChildEnv);
+
+// Folder for per-machine configuration data.
+// NOTE: no callers in this repository; retained for RStudio Pro, which uses it for
+// the license manager's verify config directory under C:\ProgramData.
+FilePath systemSettingsPath(const std::string& appName, bool create);
+
+#endif // WIN32
+
+#if defined(__APPLE__)
+
+// Is code running on a system with Apple Silicon?
+// NOTE: Returns true even if running under Rosetta2.
+bool isAppleSilicon();
+
+#endif
+
+// early process initialization; runs before logging is initialized, so any
+// error is returned for the caller to log once logging is available
+Error initHook();
+
+// initialization
+Error initializeSystemLog(const std::string& programIdentity,
+                          log::LogLevel logLevel,
+                          bool enableConfigReload = true);
+
+Error initializeStderrLog(const std::string& programIdentity,
+                          log::LogLevel logLevel,
+                          bool enableConfigReload = true);
+
+Error initializeLog(const std::string& programIdentity,
+                    log::LogLevel logLevel,
+                    const FilePath& logDir,
+                    bool forceLogDir,
+                    bool enableConfigReload = true);
+
+Error initializeLog(const std::string& programIdentity,
+                    log::LogLevel logLevel,
+                    bool enableConfigReload = true);
+
+void initializeLogConfigReload();
+
+// common initialization functions - do not invoke directly
+Error initLog();
+Error reinitLog();
+
+void ttyCheck(const std::string& destination);
+
+void initFileLogDestination(const log::LogLevel level, const FilePath defaultLogDir);
+
+// exit
+int exitFailure(const Error& error, const ErrorLocation& loggedFromLocation);
+int exitFailure(const std::string& errMsg,
+                const ErrorLocation& loggedFromLocation);
+   
+// signals 
+   
+// ignore selected signals
+Error ignoreTerminalSignals();
+Error ignoreChildExits();
+   
+// reap children (better way to handle child exits than ignoreChildExits
+// because it doesn't prevent system from determining exit codes)
+Error reapChildren();
+
+ 
+enum SignalType 
+{
+   SigInt,
+   SigHup,
+   SigAbrt,
+   SigSegv,
+   SigIll,
+   SigUsr1,
+   SigUsr2,
+   SigPipe,
+   SigChld,
+   SigTerm
+};
+
+
+   
+// block all signals for a given scope
+class SignalBlocker : boost::noncopyable
+{
+public:
+   SignalBlocker();
+   virtual ~SignalBlocker();
+   // COPYING: boost::noncopyable
+   
+   Error block(SignalType signal);
+   Error blockAll();
+   
+private:
+   struct Impl;
+   boost::shared_ptr<Impl> pImpl_;
+};
+   
+core::Error clearSignalMask();
+
+core::Error handleSignal(SignalType signal, void (*handler)(int));
+core::Error ignoreSignal(SignalType signal);
+core::Error useDefaultSignalHandler(SignalType signal);
+
+void sendSignalToSelf(SignalType signal);
+
+// user info
+std::string username();
+
+FilePath userHomePath(std::string envOverride = std::string());
+FilePath userSettingsPath(const FilePath& userHomeDirectory,
+                          const std::string& appName,
+                          bool ensureDirectory = true /* create directory */);
+unsigned int effectiveUserId();
+bool effectiveUserIsRoot();
+bool currentUserIsPrivilleged(unsigned int minimumUserId);
+
+// log
+void log(log::LogLevel level,
+         const char* message,
+         const std::string&logSection = std::string());
+
+void log(log::LogLevel level,
+         const std::string& message,
+         const std::string& logSection = std::string());
+
+void log(log::LogLevel level,
+         const boost::function<std::string()>& action,
+         const std::string& logSection = std::string());
+
+const char* logLevelToStr(log::LogLevel level);
+
+log::LoggerType loggerType(const std::string& logSection = "");
+
+log::LogLevel lowestLogLevel();
+
+// filesystem
+bool isHiddenFile(const FilePath& filePath);
+bool isHiddenFile(const FileInfo& fileInfo);
+bool isReadOnly(const FilePath& filePath);
+
+// Best-effort detection of whether a path lives on a network or remote
+// filesystem: a Windows UNC path or mapped network drive, or an NFS/SMB/CIFS/
+// AFP/FUSE/etc. mount on macOS and Linux. Used to reduce background filesystem
+// operations on slow drives. Fails safe (returns false) when detection is not
+// possible.
+// See https://github.com/rstudio/rstudio/issues/10417.
+bool isRemotePath(const FilePath& filePath);
+   
+// terminals
+bool stderrIsTerminal();
+bool stdoutIsTerminal();
+
+// uuid
+std::string generateUuid(bool includeDashes = true);
+std::string generateShortenedUuid();
+
+// process info
+
+PidType currentProcessId();
+std::string currentProcessPidStr();
+
+Error executablePath(int argc, const char * argv[],
+                     FilePath* pExecutablePath);
+
+Error executablePath(const char * argv0,
+                     FilePath* pExecutablePath);
+
+
+Error installPath(const std::string& relativeToExecutable,
+                  const char * argv0,
+                  FilePath* pInstallationPath);
+
+void fixupExecutablePath(FilePath* pExePath);
+
+void abort();
+
+Error terminateProcess(PidType pid);
+
+// Terminate a process together with all of its descendants (the process
+// first, so it cannot start anything else). Descendants are best effort:
+// a failure to terminate one is logged, and the result reflects only the
+// process itself. A descendant that has already exited is not a failure.
+Error terminateProcessTree(PidType pid);
+
+// check whether a process exists; a process the caller lacks permission to
+// inspect (e.g. one owned by another user) counts as running
+bool isProcessRunning(PidType pid);
+
+struct SubprocInfo
+{
+   PidType pid;
+   std::string exe;
+};
+
+// Return list of child processes, by executable filename and pid
+std::vector<SubprocInfo> getSubprocesses(PidType pid);
+
+// Get current-working directory of a process; returns empty FilePath
+// if unable to determine cwd
+FilePath currentWorkingDir(PidType pid);
+
+struct ProcessInfo
+{
+   ProcessInfo() : pid(0), ppid(0), pgrp(0), uidSet_(false) {}
+   PidType pid;
+   PidType ppid;
+   PidType pgrp;
+   UidType uid_;
+   bool uidSet_;
+   std::string username;
+   std::string exe;
+   std::string state;
+   std::vector<std::string> arguments;
+
+#ifndef _WIN32
+   core::Error creationTime(boost::posix_time::ptime* pCreationTime) const;
+#endif
+   std::string getUsername() const;
+   UidType uid() const;
+};
+
+// simple encapsulation of parent-child relationship of processes
+struct ProcessTreeNode
+{
+   boost::shared_ptr<ProcessInfo> data;
+   std::vector<boost::shared_ptr<ProcessTreeNode> > children;
+};
+
+// process tree, indexed by pid
+typedef std::map<PidType, boost::shared_ptr<ProcessTreeNode> > ProcessTreeT;
+
+Error terminateChildProcesses();
+
+void createProcessTree(const std::vector<ProcessInfo>& processes,
+                       ProcessTreeT *pOutTree);
+
+void getChildren(const boost::shared_ptr<ProcessTreeNode>& node,
+                 std::vector<ProcessInfo>* pOutChildren,
+                 int depth = 0);
+
+std::string getHostname();
+   
+} // namespace system
+} // namespace core 
+} // namespace rstudio
+
+#endif // CORE_SYSTEM_SYSTEM_HPP
+

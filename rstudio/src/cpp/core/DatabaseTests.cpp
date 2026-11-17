@@ -1,0 +1,1566 @@
+/*
+ * DatabaseTests.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <gtest/gtest.h>
+
+#include <core/Database.hpp>
+#include <core/SqlPreprocessor.hpp>
+#include <core/QueryBuilder.hpp>
+#include <core/FileSerializer.hpp>
+#include <core/system/System.hpp>
+#include <shared_core/SafeConvert.hpp>
+
+#include <soci/session.h>
+#include <soci/sqlite3/soci-sqlite3.h>
+
+namespace rstudio {
+namespace core {
+namespace tests {
+
+using namespace core;
+using namespace core::database;
+
+// Shared helper logic (keeps fixtures DRY)
+namespace {
+Error initializeCommonTestSchema(IConnection& connection)
+{
+   Query query = connection.query("create table Test(id int, text varchar(255))");
+   Error error = connection.execute(query);
+   return error;
+}
+} // anonymous namespace
+
+class DatabaseTestsFixture : public ::testing::Test
+{
+protected:
+   boost::shared_ptr<IConnection> sqliteConnection;
+   FilePath dbPath;
+
+   void SetUp() override
+   {
+      ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+      dbPath.removeIfExists();
+
+      SqliteConnectionOptions options;
+      options.file = dbPath.getAbsolutePath();
+      Error error = connect(options, &sqliteConnection);
+      ASSERT_FALSE(error) << "Failed to create SQLite test database in fixture: " << error.getMessage();
+
+      error = initializeCommonTestSchema(*sqliteConnection);
+      ASSERT_FALSE(error) << "Failed to initialize common test schema: " << error.getMessage();
+   }
+
+   void TearDown() override
+   {
+      sqliteConnection.reset();
+      dbPath.removeIfExists();
+   }
+};
+
+core::database::PostgresqlConnectionOptions postgresConnectionOptions()
+{
+   PostgresqlConnectionOptions options;
+   options.connectionTimeoutSeconds = 10;
+   options.database = "rstudio_test";
+   options.host = "localhost";
+   options.username = "postgres";
+   const char* dbPass = std::getenv("RSTUDIO_TEST_DB_PASS");
+   options.password = (dbPass) ? dbPass : "postgres";
+
+   return options;
+}
+
+TEST_F(DatabaseTestsFixture, CanCreateSqliteDatabase)
+{
+   int id = 10;
+   std::string text = "Hello, database!";
+
+   Query query = sqliteConnection->query("insert into Test(id, text) values(:id, :text)")
+          .withInput(id)
+          .withInput(text);
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into Test table: " << error.getMessage();
+
+   int rowId;
+   std::string rowText;
+   query = sqliteConnection->query("select id, text from Test where id = (:id)")
+          .withInput(id)
+          .withOutput(rowId)
+          .withOutput(rowText);
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to select from Test table: " << error.getMessage();
+
+   EXPECT_EQ(id, rowId);
+   EXPECT_EQ(text, rowText);
+}
+
+TEST_F(DatabaseTestsFixture, CanPreprocessSql)
+{
+   std::string text = "#if 1\nA1\n#else\nB1\n#endif";
+   auto result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "A1\n");
+
+   text = "#if 0\nA2\n#else\nB2\n#endif";
+   result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "B2\n");
+
+   text = "#if driver(sqlite3)\nA3\n#else\nB3\n#endif";
+   result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "A3\n");
+
+   text = "#if driver(postgresql)\nA4\n#else\nB4\n#endif";
+   result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "B4\n");
+
+   text = "#if !1\nA5\n#else\nB5\n#endif";
+   result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "B5\n");
+
+   text = "#if (1 || 0) && 1\nA6\n#else\nB6\n#endif";
+   result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+   EXPECT_EQ(*result, "A6\n");
+}
+
+void testCanCheckExists(DatabaseConnection dbConnection)
+{
+   Error error = dbConnection->executeStr("CREATE TABLE exist_test (id INTEGER)");
+   ASSERT_FALSE(error) << error.getMessage();
+
+   std::string text = R""(
+#if exists(table, exist_test)
+A
+#endif
+#if exists(table, noexist_test)
+B
+#endif
+#if exists(column, exist_test.id)
+C
+#endif
+#if exists(column, exist_test.bogus)
+D
+#endif
+#if exists(column, noexist_test.id)
+E
+#endif
+)"";
+   auto result = preprocessSchemaFile(dbConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+
+   bool tableTest = result->find("A") != std::string::npos;
+   EXPECT_TRUE(tableTest) << "exists(table) failed to find existing table";
+
+   bool noTableTest = result->find("B") != std::string::npos;
+   EXPECT_FALSE(noTableTest) << "exists(table) failed to reject missing table";
+
+   bool columnTest = result->find("C") != std::string::npos;
+   EXPECT_TRUE(columnTest) << "exists(column) failed to find existing column";
+
+   bool noColumnTest = result->find("D") != std::string::npos;
+   EXPECT_FALSE(noColumnTest) << "exists(column) failed to reject missing column";
+
+   bool noTableColumnTest = result->find("E") != std::string::npos;
+   EXPECT_FALSE(noTableColumnTest) << "exists(column) failed to reject missing table";
+}
+
+TEST_F(DatabaseTestsFixture, CanCheckExistsSqlite)
+{
+   testCanCheckExists(sqliteConnection);
+}
+
+TEST_F(DatabaseTestsFixture, CanCheckExistsPostgres)
+{
+   if (!std::getenv("POSTGRES_ENABLED") || std::string(std::getenv("POSTGRES_ENABLED")) != "1")
+   {
+      GTEST_SKIP() << "Skipping Postgres migration tests as POSTGRES_ENABLED is not set";
+   }
+
+   boost::shared_ptr<IConnection> postgresConnection;
+   Error error = connect(postgresConnectionOptions(), &postgresConnection);
+   ASSERT_FALSE(error) << "Failed to connect to PostgreSQL database for schema update test: " << error.getMessage();
+
+   // Reset the PostgreSQL test database so the test is repeatable.
+   // The SQLite DB is already cleaned up by the fixture (file is deleted in TearDown).
+   error = postgresConnection->executeStr("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
+   ASSERT_FALSE(error) << "Failed to reset PostgreSQL test database: " << error.getMessage();
+
+   testCanCheckExists(postgresConnection);
+}
+
+TEST_F(DatabaseTestsFixture, CanNestPreprocessorIf)
+{
+   std::string text = R""(
+#if 1
+A
+#if 1
+B
+#else
+C
+#endif
+#if 0
+D
+#else
+E
+#endif
+#else
+F
+#if 1
+G
+#else
+H
+#endif
+#if 0
+I
+#else
+J
+#endif
+#endif
+)"";
+   auto result = preprocessSchemaFile(sqliteConnection, text);
+   ASSERT_TRUE(result) << result.error().getMessage();
+
+   EXPECT_NE(result->find("A"), std::string::npos);
+   EXPECT_NE(result->find("B"), std::string::npos);
+   EXPECT_EQ(result->find("C"), std::string::npos);
+   EXPECT_EQ(result->find("D"), std::string::npos);
+   EXPECT_NE(result->find("E"), std::string::npos);
+   EXPECT_EQ(result->find("F"), std::string::npos);
+   EXPECT_EQ(result->find("G"), std::string::npos);
+   EXPECT_EQ(result->find("H"), std::string::npos);
+   EXPECT_EQ(result->find("I"), std::string::npos);
+   EXPECT_EQ(result->find("J"), std::string::npos);
+}
+
+TEST(DatabaseTest, CanCreatePostgresqlDatabase)
+{
+   if (!std::getenv("POSTGRES_ENABLED") || std::string(std::getenv("POSTGRES_ENABLED")) != "1")
+   {
+      GTEST_SKIP() << "Skipping Postgres migration tests as POSTGRES_ENABLED is not set";
+   }
+
+   boost::shared_ptr<IConnection> connection;
+   Error error = connect(postgresConnectionOptions(), &connection);
+   ASSERT_FALSE(error) << "Failed to connect to PostgreSQL database: " << error.getMessage();
+
+   Query query = connection->query("create table Test(id int, text varchar(255))");
+   error = connection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create Test table in PostgreSQL: " << error.getMessage();
+
+   int id = 10;
+   std::string text = "Hello, database!";
+
+   query = connection->query("insert into Test(id, text) values(:id, :text)")
+         .withInput(id)
+         .withInput(text);
+   error = connection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into PostgreSQL Test table: " << error.getMessage();
+
+   int rowId;
+   std::string rowText;
+   query = connection->query("select id, text from Test where id = (:id)")
+         .withInput(id)
+         .withOutput(rowId)
+         .withOutput(rowText);
+   error = connection->execute(query);
+   ASSERT_FALSE(error) << "Failed to select from PostgreSQL Test table: " << error.getMessage();
+
+   EXPECT_EQ(id, rowId);
+   EXPECT_EQ(text, rowText);
+}
+
+TEST_F(DatabaseTestsFixture, CanPerformTransactions)
+{
+   Transaction transaction(sqliteConnection);
+   bool dataReturned = false;
+
+   // verify that we can commit a transaction
+   Query query = sqliteConnection->query("insert into Test(id, text) values(:id, :text)");
+   for (int id = 0; id < 100; ++id)
+   {
+      std::string text = "Test text " + core::safe_convert::numberToString(id);
+      query.withInput(id).withInput(text);
+
+      Error error = sqliteConnection->execute(query);
+      ASSERT_FALSE(error) << "Failed to insert row " << id << ": " << error.getMessage();
+   }
+   transaction.commit();
+
+   int rowId;
+   std::string rowText;
+   query = sqliteConnection->query("select id, text from Test where id = 50")
+      .withOutput(rowId)
+      .withOutput(rowText);
+
+   Error error = sqliteConnection->execute(query, &dataReturned);
+   ASSERT_FALSE(error) << "Failed to select test row: " << error.getMessage();
+   ASSERT_TRUE(dataReturned) << "Expected data to be returned but none was";
+   ASSERT_EQ(50, rowId);
+   ASSERT_EQ(std::string("Test text 50"), rowText);
+
+   // now attempt to rollback a transaction
+   Transaction transaction2(sqliteConnection);
+   query = sqliteConnection->query("insert into Test(id, text) values(:id, :text)");
+   for (int id = 100; id < 200; ++id)
+   {
+      std::string text = "Test text " + core::safe_convert::numberToString(id);
+      query.withInput(id).withInput(text);
+
+      Error error = sqliteConnection->execute(query);
+      ASSERT_FALSE(error) << "Failed to insert row " << id << " (for rollback): " << error.getMessage();
+   }
+   transaction2.rollback();
+
+   query = sqliteConnection->query("select id, text from Test where id = 150")
+      .withOutput(rowId)
+      .withOutput(rowText);
+
+   // expect no data
+   error = sqliteConnection->execute(query, &dataReturned);
+   ASSERT_FALSE(error) << "Failed to select test row after rollback: " << error.getMessage();
+   ASSERT_FALSE(dataReturned) << "Expected no data after rollback, but data was returned";
+}
+
+TEST_F(DatabaseTestsFixture, CanBulkSelect)
+{
+   Rowset rows;
+   Query query = sqliteConnection->query("select id, text from Test where id >= 50 and id <= 100 order by id asc");
+   Error error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to execute bulk select query: " << error.getMessage();
+
+   int i = 0;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it)
+   {
+      Row& row = *it;
+      ASSERT_EQ(i + 50, row.get<int>(0));
+      ASSERT_EQ(std::string("Test text ") + safe_convert::numberToString(i + 50), row.get<std::string>(1));
+      ++i;
+   }
+}
+
+TEST_F(DatabaseTestsFixture, CanBulkInsert)
+{
+   std::vector<int> rowIds {1000, 2000, 3000, 4000, 5000};
+   std::vector<std::string> rowTexts {"1000", "2000", "3000", "4000", "5000"};
+
+   Query query = sqliteConnection->query("insert into Test values (:id, :txt)")
+         .withInput(rowIds)
+         .withInput(rowTexts);
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to execute bulk insert query: " << error.getMessage();
+
+   Query selectQuery = sqliteConnection->query("select * from Test where id >= 1000 order by id asc");
+
+   Rowset rowset;
+   error = sqliteConnection->execute(selectQuery, rowset);
+   ASSERT_FALSE(error) << "Failed to select bulk inserted data: " << error.getMessage();
+
+   int i = 1;
+   for (RowsetIterator it = rowset.begin(); it != rowset.end(); ++it)
+   {
+      Row& row = *it;
+      ASSERT_EQ(i * 1000, row.get<int>(0));
+      ASSERT_EQ(safe_convert::numberToString(i * 1000), row.get<std::string>(1));
+      ++i;
+   }
+}
+
+TEST(DatabaseTest, CanUseConnectionPool)
+{
+   FilePath dbPath;
+   ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+   dbPath.removeIfExists();
+
+   SqliteConnectionOptions options;
+   options.file = dbPath.getAbsolutePath();
+
+   // Scope the pool, connections, and queries so they are all destroyed - and their
+   // SQLite handles closed - before the database file is removed. The Query objects
+   // hold prepared statements that keep the connection open, so they must go out of
+   // scope too; otherwise the file handle is still open and, on Windows, the delete
+   // fails silently and orphans the random temp file.
+   {
+      boost::shared_ptr<ConnectionPool> connectionPool;
+      Error error = createConnectionPool(5, options, &connectionPool);
+      ASSERT_FALSE(error) << "Failed to create connection pool: " << error.getMessage();
+      boost::shared_ptr<IConnection> connection = connectionPool->getConnection();
+      ASSERT_TRUE(connection) << "Failed to get connection from pool";
+
+      Query query = connection->query("create table Test(id int, text varchar(255))");
+      error = connection->execute(query);
+      ASSERT_FALSE(error) << "Failed to create Test table in fixture: " << error.getMessage();
+
+      // Insert some data into the Test table
+      for (int id = 0; id < 100; ++id)
+      {
+         std::string text = "Test text " + core::safe_convert::numberToString(id);
+         query = connection->query("insert into Test(id, text) values(:id, :text)")
+               .withInput(id)
+               .withInput(text);
+         error = connection->execute(query);
+         ASSERT_FALSE(error) << "Failed to insert row " << id << ": " << error.getMessage();
+      }
+
+      int rowId;
+      std::string rowText;
+      query = connection->query("select id, text from Test where id = 50")
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+      bool dataReturned = false;
+      error = connection->execute(query, &dataReturned);
+      ASSERT_FALSE(error) << "Failed to execute query from pool connection: " << error.getMessage();
+      ASSERT_TRUE(dataReturned) << "Expected data to be returned but none was";
+
+      boost::shared_ptr<IConnection> connection2 = connectionPool->getConnection();
+      ASSERT_TRUE(connection2) << "Failed to get second connection from pool";
+
+      Query query2 = connection2->query("select id, text from Test where id = 25")
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+      dataReturned = false;
+      error = connection2->execute(query2, &dataReturned);
+      ASSERT_FALSE(error) << "Failed to execute query from second pool connection: " << error.getMessage();
+      ASSERT_TRUE(dataReturned) << "Expected data to be returned from second query but none was";
+   }
+
+   dbPath.removeIfExists();
+}
+
+static void testCanUpdateSchemas(DatabaseConnection dbConnection)
+{
+   bool isSqlite = dbConnection->driver() == Driver::Sqlite;
+   std::string ext = isSqlite ? "sqlite" : "postgresql";
+
+   Error error;
+
+   // Copy the real CreateTables files to a temp directory so we can add test migration
+   // files alongside them. This validates the production schema as part of the test.
+   FilePath dbSchemaDir(RSTUDIO_DB_SCHEMA_DIR);
+   FilePath schemaDir;
+   ASSERT_FALSE(FilePath::tempFilePath(schemaDir));
+   ASSERT_FALSE(schemaDir.ensureDirectory());
+
+   std::string createTablesContent;
+   error = readStringFromFile(dbSchemaDir.completeChildPath("CreateTables." + ext), &createTablesContent);
+   ASSERT_FALSE(error) << "Failed to read CreateTables." << ext << " from " << dbSchemaDir.getAbsolutePath();
+   error = writeStringToFile(schemaDir.completeChildPath("CreateTables." + ext), createTablesContent);
+   ASSERT_FALSE(error) << "Failed to copy CreateTables." << ext;
+
+   // Test migration files create and modify test-specific tables.
+   // Migration filenames use the 3-part convention: {version}_{Release-Name}_{Description}.{ext}
+   // Versions use "99..." timestamps to sort after all production migration versions.
+   std::string schema1 =
+      R""(
+      CREATE TABLE TestTable1_Persons(
+         id int NOT NULL,
+         first_name varchar(255),
+         last_name varchar(255) NOT NULL,
+         email_address varchar(255)
+      );
+
+      CREATE TABLE TestTable2_AccountHolders(
+         id int,
+         fk_person_id int
+      );
+
+      UPDATE schema_version SET current_version = '99000000000000000000001', release_name = 'Test Release';
+      )"";
+
+   std::string schema2;
+   if (isSqlite)
+   {
+      // sqlite cannot alter tables very well, so adding constraints necessitates dropping
+      // and re-creating the tables
+      schema2 =
+         R""(
+         CREATE TABLE TestTable1_Persons_new(
+            id int NOT NULL,
+            first_name varchar(255),
+            last_name varchar(255),
+            email_address varchar(255),
+            PRIMARY KEY (id)
+         );
+
+         DROP TABLE TestTable1_Persons;
+         ALTER TABLE TestTable1_Persons_new RENAME TO TestTable1_Persons;
+
+         CREATE TABLE TestTable2_AccountHolders_new(
+            id int,
+            fk_person_id int,
+            PRIMARY KEY (id),
+            FOREIGN KEY (fk_person_id) REFERENCES TestTable1_Persons(id)
+         );
+
+         DROP TABLE TestTable2_AccountHolders;
+         ALTER TABLE TestTable2_AccountHolders_new RENAME TO TestTable2_AccountHolders;
+
+         UPDATE schema_version SET current_version = '99000000000000000000002', release_name = 'Test Release';
+         )"";
+   }
+   else
+   {
+      // postgresql supports modification of tables
+      schema2 =
+         R""(
+         ALTER TABLE TestTable1_Persons
+         ADD PRIMARY KEY (id);
+
+         ALTER TABLE TestTable2_AccountHolders
+         ADD PRIMARY KEY (id);
+
+         ALTER TABLE TestTable2_AccountHolders
+         ADD FOREIGN KEY (fk_person_id) REFERENCES TestTable1_Persons(id);
+
+         UPDATE schema_version SET current_version = '99000000000000000000002', release_name = 'Test Release';
+         )"";
+   }
+
+   std::string schema3;
+   if (isSqlite)
+   {
+      schema3 =
+         R""(
+         CREATE TABLE TestTable2_AccountHolders_new(
+            id int,
+            fk_person_id int,
+            creation_time text,
+            PRIMARY KEY (id),
+            FOREIGN KEY (fk_person_id) REFERENCES TestTable1_Persons(id)
+         );
+
+         DROP TABLE TestTable2_AccountHolders;
+         ALTER TABLE TestTable2_AccountHolders_new RENAME TO TestTable2_AccountHolders;
+
+         UPDATE schema_version SET current_version = '99000000000000000000003', release_name = 'Test Release';
+         )"";
+   }
+   else
+   {
+      schema3 =
+         R""(
+         ALTER TABLE TestTable2_AccountHolders
+         ADD COLUMN creation_time text;
+
+         UPDATE schema_version SET current_version = '99000000000000000000003', release_name = 'Test Release';
+         )"";
+   }
+
+   FilePath outFile1 = schemaDir.completeChildPath("99000000000000000000001_Test-Release_InitialTables.sql");
+   FilePath outFile2 = schemaDir.completeChildPath("99000000000000000000002_Test-Release_AddConstraints." + ext);
+   FilePath outFile3= schemaDir.completeChildPath("99000000000000000000003_Test-Release_AddCreationTime." + ext);
+
+   error = writeStringToFile(outFile1, schema1);
+   ASSERT_FALSE(error) << "Failed to write initial test tables schema file: " << error.getMessage();
+
+   error = writeStringToFile(outFile2, schema2);
+   ASSERT_FALSE(error) << "Failed to write " << ext << " constraints schema file: " << error.getMessage();
+
+   error = writeStringToFile(outFile3, schema3);
+   ASSERT_FALSE(error) << "Failed to write " << ext << " account creation schema file: " << error.getMessage();
+
+   SchemaUpdater updater(dbConnection, schemaDir);
+
+   // First update: creates schema from the real CreateTables files (production version)
+   error = updater.update();
+   ASSERT_FALSE(error) << "Failed initial " << ext << " schema creation: " << error.getMessage();
+
+   // Second update: applies test migration files (versions higher than production)
+   error = updater.update();
+   ASSERT_FALSE(error) << "Failed to apply " << ext << " test migrations: " << error.getMessage();
+
+   SchemaVersion expectedVersion("99000000000000000000003", "Test Release");
+
+   SchemaVersion currentSchemaVersion;
+   error = updater.databaseSchemaVersion(&currentSchemaVersion);
+   ASSERT_FALSE(error) << "Failed to get " << ext << " schema version: " << error.getMessage();
+   ASSERT_EQ(currentSchemaVersion, expectedVersion);
+
+   // ensure repeated calls to update work without error
+   error = updater.update();
+   ASSERT_FALSE(error) << "Failed to update " << ext << " schema (repeated call): " << error.getMessage();
+
+   // ensure we can insert data as expected (given our expected constraints)
+   int id = 1;
+   std::string firstName = "Billy";
+   std::string lastName = "Joel";
+   std::string email = "bjoel@example.com";
+   std::string creationTime = "03/03/2020 12:00:00";
+
+   // create queries - we will be executing them multiple times, so bind input just before execution
+   Query insertQuery = dbConnection->query("INSERT INTO TestTable1_Persons VALUES (:id, :fname, :lname, :email)");
+   Query insertQuery2 = dbConnection->query("INSERT INTO TestTable2_AccountHolders VALUES (:id, :pid, :time)");
+
+   // should fail - FK constraint
+   insertQuery2
+         .withInput(id, "id")
+         .withInput(id, "pid")
+         .withInput(creationTime, "time");
+   EXPECT_TRUE(dbConnection->execute(insertQuery2));
+
+   // should succeed - properly ordered
+   insertQuery
+         .withInput(id, "id")
+         .withInput(firstName, "fname")
+         .withInput(lastName, "lname")
+         .withInput(email, "email");
+   EXPECT_FALSE(dbConnection->execute(insertQuery));
+   insertQuery2
+         .withInput(id, "id")
+         .withInput(id, "pid")
+         .withInput(creationTime, "time");
+   EXPECT_FALSE(dbConnection->execute(insertQuery2));
+
+   // should fail - PK constraint
+   insertQuery
+         .withInput(id, "id")
+         .withInput(firstName, "fname")
+         .withInput(lastName, "lname")
+         .withInput(email, "email");
+   ASSERT_TRUE(dbConnection->execute(insertQuery));
+   insertQuery2
+         .withInput(id, "id")
+         .withInput(id, "pid")
+         .withInput(creationTime, "time");
+   ASSERT_TRUE(dbConnection->execute(insertQuery2));
+}
+
+TEST_F(DatabaseTestsFixture, CanUpdateSchemasSqlite)
+{
+   testCanUpdateSchemas(sqliteConnection);
+}
+
+TEST_F(DatabaseTestsFixture, CanUpdateSchemasPostgres)
+{
+   if (!std::getenv("POSTGRES_ENABLED") || std::string(std::getenv("POSTGRES_ENABLED")) != "1")
+   {
+      GTEST_SKIP() << "Skipping Postgres migration tests as POSTGRES_ENABLED is not set";
+   }
+
+   boost::shared_ptr<IConnection> postgresConnection;
+   Error error = connect(postgresConnectionOptions(), &postgresConnection);
+   ASSERT_FALSE(error) << "Failed to connect to PostgreSQL database for schema update test: " << error.getMessage();
+
+   // Reset the PostgreSQL test database so the test is repeatable.
+   // The SQLite DB is already cleaned up by the fixture (file is deleted in TearDown).
+   error = postgresConnection->executeStr("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
+   ASSERT_FALSE(error) << "Failed to reset PostgreSQL test database: " << error.getMessage();
+
+   testCanUpdateSchemas(postgresConnection);
+}
+
+TEST(DatabaseTest, SchemaVersionComparisonsAreCorrect)
+{
+   std::vector<SchemaVersion> versions {
+      {"", ""},
+      {"Ghost Orchid", "20210712182145921760944"},
+      {"Prairie Trillium", "20210916132211194382021"},
+   };
+
+   for(int i=0; i < (int) versions.size(); i++)
+   {
+      //Compare against smaller
+      for(int j=0; j < i; j++){
+         ASSERT_LT(versions[j], versions[i]) << "Expected " << versions[j] << " to be less than " << versions[i];
+         ASSERT_FALSE(versions[j] > versions[i]) << "Expected " << versions[j] << " to not be greater than " << versions[i];
+         ASSERT_LE(versions[j], versions[i]) << "Expected " << versions[j] << " to be less than or equal to " << versions[i];
+      }
+
+      SchemaVersion sameVersion(versions[i]);
+      ASSERT_EQ(versions[i], sameVersion);
+
+      //Compare against larger
+      for(int j=i+1; j < (int) versions.size(); j++)
+      {
+         ASSERT_LT(versions[i], versions[j]) << "Expected " << versions[i] << " to be less than " << versions[j];
+         ASSERT_FALSE(versions[i] > versions[j]) << "Expected " << versions[i] << " to not be greater than " << versions[j];
+         ASSERT_LE(versions[i], versions[j]) << "Expected " << versions[i] << " to be less than or equal to " << versions[j];
+      }
+   }
+}
+
+TEST_F(DatabaseTestsFixture, CanExecuteStrWithMultipleQueries)
+{
+   std::string queryStr =
+         "CREATE TABLE TestTable_3("
+         "A text, B text\n);            \n"
+         "INSERT INTO TestTable_3 VALUES (\"Hello\", \"World;      \");\n"
+         "INSERT INTO TestTable_3 VALUES (\"Hello2\", \";;;\");";
+
+   Error error = sqliteConnection->executeStr(queryStr);
+   ASSERT_FALSE(error) << "Failed to execute multi-statement query: " << error.getMessage();
+
+   Query selectQuery = sqliteConnection->query("select * from TestTable_3 order by A asc");
+
+   Rowset rowset;
+   error = sqliteConnection->execute(selectQuery, rowset);
+   ASSERT_FALSE(error) << "Failed to select from TestTable_3: " << error.getMessage();
+
+   int i = 0;
+   std::string vals[2][2];
+   vals[0][0] = "Hello";
+   vals[0][1] = "World;      ";
+   vals[1][0] = "Hello2";
+   vals[1][1] = ";;;";
+   for (RowsetIterator it = rowset.begin(); it != rowset.end(); ++it)
+   {
+      Row& row = *it;
+   ASSERT_EQ(std::string(vals[i][0]), row.get<std::string>(0));
+   ASSERT_EQ(std::string(vals[i][1]), row.get<std::string>(1));
+      ++i;
+   }
+}
+
+TEST(DatabaseTest, CanCorrectlyParsePostgresqlConnectionUris)
+{
+#ifdef RSTUDIO_HAS_SOCI_POSTGRESQL
+   PostgresqlConnectionOptions options;
+   // Invalid URIs should return errors
+   options.connectionUri = "bogus://not-a-uri";
+   EXPECT_TRUE(validateOptions(options, nullptr));
+
+   options.connectionUri = "postgresql://";
+   EXPECT_TRUE(validateOptions(options, nullptr));
+
+   std::string connectionStr;
+
+   // There urls are invalid because they don't include passwords and we don't have ssl support.
+   options.connectionUri = "postgres://localhost";
+   EXPECT_TRUE(validateOptions(options, &connectionStr));
+
+   options.connectionUri = "postgres://joe@myhost/";
+   EXPECT_TRUE(validateOptions(options, &connectionStr));
+
+   options.connectionUri = "postgres://joe@myhost/rstudio-test";
+   EXPECT_TRUE(validateOptions(options, &connectionStr));
+
+   // For valid URIs in the current environment configuration,
+   // validateOptions returns true and the connection string is empty in our test environment
+   options.connectionUri = "postgres://joe:mypass@myhost";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' user='joe' password='mypass'"), connectionStr);
+
+   options.connectionUri = "postgres://joe@myhost/rstudio-test";
+   options.password = "abc123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' user='joe' dbname='rstudio-test' password='abc123'"), connectionStr);
+
+   // ' and \ have to be backslash-escaped once embedded in the connection string,
+   // or libpq reads the password as ending at the embedded quote
+   options.connectionUri = "postgres://joe@myhost/rstudio-test";
+   options.password = "abc'\\123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' user='joe' dbname='rstudio-test' password='abc\\'\\\\123'"), connectionStr);
+
+   options.connectionUri = "postgres://joe@myhost/rstudio-test?sslmode=disable";
+   options.password = "abc123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' user='joe' dbname='rstudio-test' sslmode='disable' password='abc123'"), connectionStr);
+
+   options.connectionUri = "postgres://joe@myhost:3342/rstudio-test?sslmode=disable&options=-csearch_path=public";
+   options.password = "abc123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' port='3342' user='joe' dbname='rstudio-test' sslmode='disable' options='-csearch_path=public' password='abc123'"), connectionStr);
+
+   options.connectionUri = "postgres://joe@myhost/rstudio-test?sslmode=disable&options=-csearch_path=public&random-value=something%20with%20spaces";
+   options.password = "abc123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='myhost' user='joe' dbname='rstudio-test' sslmode='disable' options='-csearch_path=public' random-value='something with spaces' password='abc123'"), connectionStr);
+
+   options.connectionUri = "postgres://joe@[fd9a:3b89:ca91:43a2:0:0:0:0]:2345/rstudio-test";
+   options.password = "12345";
+   EXPECT_FALSE(validateOptions(options, &connectionStr));
+   EXPECT_EQ(std::string("host='[fd9a:3b89:ca91:43a2:0:0:0:0]' port='2345' user='joe' dbname='rstudio-test' password='12345'"), connectionStr);
+
+   // When password is returned separately (3-arg validateOptions), it doesn't appear in the connection string
+   std::string password;
+   EXPECT_FALSE(validateOptions(options, &connectionStr, &password));
+   EXPECT_EQ(std::string("12345"), password) << "Expected password to be '12345' but got '" << password << "'";
+   EXPECT_EQ(std::string("host='[fd9a:3b89:ca91:43a2:0:0:0:0]' port='2345' user='joe' dbname='rstudio-test'"), connectionStr);
+
+   // ... and it is returned verbatim, since the caller is not embedding it in a
+   // connection string and would otherwise have to undo the escaping
+   options.password = "abc'\\123";
+   EXPECT_FALSE(validateOptions(options, &connectionStr, &password));
+   EXPECT_EQ(std::string("abc'\\123"), password) << "Expected the raw password but got '" << password << "'";
+#else
+   GTEST_SKIP() << "Skipping Postgres connection URI tests as Postgres support is not enabled with RSTUDIO_HAS_SOCI_POSTGRESQL";
+#endif
+}
+
+TEST_F(DatabaseTestsFixture,WhenUsedWithMultipleRowsSelectsFromTheFirst)
+{
+   Query query = sqliteConnection->query("create table MultiRowTest(id int, text varchar(255))");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create MultiRowTest table: " << error.getMessage();
+
+   int id = 1;
+   std::string text = "stuff";
+
+   query = sqliteConnection->query("insert into MultiRowTest(id, text) values(:id, :text)")
+         .withInput(id)
+         .withInput(text);
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert first row into MultiRowTest: " << error.getMessage();
+
+   id = 2;
+   text = "stuff";
+   query = sqliteConnection->query("insert into MultiRowTest(id, text) values(:id, :text)")
+         .withInput(id)
+         .withInput(text);
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert second row into MultiRowTest: " << error.getMessage();
+
+   int rowId;
+   std::string rowText;
+   query = sqliteConnection->query("select id, text from MultiRowTest where text = (:text)")
+         .withInput(text)
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+   bool dataReturned = false;
+   error = sqliteConnection->execute(query, &dataReturned);
+   ASSERT_FALSE(error) << "Failed to select from MultiRowTest: " << error.getMessage();
+   ASSERT_TRUE(dataReturned) << "Expected data to be returned but none was";
+   ASSERT_EQ(1, rowId) << "Expected first row ID to be 1 but got " << rowId;
+}
+
+TEST_F(DatabaseTestsFixture, WithoutputReturnsErrorWhenValueIsNull)
+{
+   Query query = sqliteConnection->query("create table NullValueTest(id int, text varchar(255))");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create NullValueTest table: " << error.getMessage();
+
+   int id = 1;
+   query = sqliteConnection->query("insert into NullValueTest(id, text) values(:id, null)")
+         .withInput(id);
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert null value into NullValueTest: " << error.getMessage();
+
+   int rowId;
+   std::string rowText = "stuff";
+   query = sqliteConnection->query("select id, text from NullValueTest where id = (:id)")
+         .withInput(id)
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+   bool dataReturned = false;
+   error = sqliteConnection->execute(query, &dataReturned);
+
+   // The query fails with error for selecting a null value without a null indicator
+   ASSERT_TRUE(error) << "Expected error when retrieving NULL value without indicator, but got success. Error message: " << error.getMessage();
+}
+
+TEST_F(DatabaseTestsFixture, GetOptionalValueCastsNumericTypes)
+{
+   Query query = sqliteConnection->query("create table CastTest(i_val integer, f_val real, b_val bigint, t_val text)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create CastTest table: " << error.getMessage();
+
+   query = sqliteConnection->query("insert into CastTest (i_val, f_val, b_val, t_val) values (1, 2.2, 3, 'test')");
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into CastTest: " << error.getMessage();
+
+   Rowset rows;
+   query = sqliteConnection->query("select i_val, f_val, b_val, t_val from CastTest");
+   error = sqliteConnection->execute(query, rows);
+
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it)
+   {
+      boost::optional<int> i_val;
+      boost::optional<double> f_val;
+      boost::optional<long long> b_val;
+      boost::optional<std::string> t_val;
+
+      // Test without conversions first
+      error = rows.getOptionalValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val.value(), 1);
+      error = rows.getOptionalValue(it, "f_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val.value(), 2.2);
+      error = rows.getOptionalValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val.value(), 3);
+      error = rows.getOptionalValue(it, "t_val", &t_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(t_val.value(), "test");
+
+      // Test int conversions
+      error = rows.getOptionalValue<int>(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val.value(), 1);
+      error = rows.getOptionalValue<int>(it, "f_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val.value(), 2);
+      error = rows.getOptionalValue<int>(it, "b_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val.value(), 3);
+      error = rows.getOptionalValue<int>(it, "t_val", &i_val);
+      EXPECT_TRUE(error) << "no error despite casting t_val to int";
+
+      // Test float conversions
+      error = rows.getOptionalValue<double>(it, "i_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val.value(), 1.0);
+      error = rows.getOptionalValue<double>(it, "f_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val.value(), 2.2);
+      error = rows.getOptionalValue<double>(it, "b_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val.value(), 3.0);
+      error = rows.getOptionalValue<double>(it, "t_val", &f_val);
+      EXPECT_TRUE(error) << "no error despite casting t_val to double";
+
+      // Test long long conversions
+      error = rows.getOptionalValue<long long>(it, "i_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val.value(), 1);
+      error = rows.getOptionalValue<long long>(it, "f_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val.value(), 2);
+      error = rows.getOptionalValue<long long>(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val.value(), 3);
+      error = rows.getOptionalValue<long long>(it, "t_val", &b_val);
+      EXPECT_TRUE(error) << "no error despite casting t_val to long long";
+
+      // Make sure strings don't mingle
+      error = rows.getOptionalValue<std::string>(it, "i_val", &t_val);
+      EXPECT_TRUE(error) << "no error despite casting i_val to string";
+      error = rows.getOptionalValue<std::string>(it, "f_val", &t_val);
+      EXPECT_TRUE(error) << "no error despite casting f_val to string";
+      error = rows.getOptionalValue<std::string>(it, "b_val", &t_val);
+      EXPECT_TRUE(error) << "no error despite casting b_val to string";
+      error = rows.getOptionalValue<std::string>(it, "t_val", &t_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(t_val.value(), "test");
+   }
+}
+
+TEST(DatabaseTest, SqlIdentifierValidation)
+{
+   auto result = SqlIdentifier::from("valid");
+   EXPECT_TRUE(result) << "unexpected error when creating SqlIdentifier from valid input";
+
+   result = SqlIdentifier::from("invalid!");
+   EXPECT_FALSE(result) << "SqlIdentifier::from allowed invalid input";
+}
+
+TEST_F(DatabaseTestsFixture, InsertBuilderInserts)
+{
+   Query query = sqliteConnection->query("create table BuilderTest(i_val integer, f_val real, b_val bigint, t_val text)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   InsertBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("i_val", 1)
+      .add("f_val", 2.2)
+      .add("b_val", 3)
+      .add("t_val", "foo");
+
+   std::string sql = builder.toSQL();
+   EXPECT_EQ(sql, "INSERT INTO BuilderTest (i_val, f_val, b_val, t_val) VALUES (:i_val, :f_val, :b_val, :t_val)");
+
+   query = builder.build();
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+
+   Rowset rows;
+   query = sqliteConnection->query("select i_val, f_val, b_val, t_val from BuilderTest");
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   int i = 0;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it, ++i)
+   {
+      ASSERT_EQ(i, 0) << "too many rows returned";
+
+      int i_val;
+      double f_val;
+      long long b_val;
+      std::string t_val;
+
+      error = rows.getValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val, 1);
+      error = rows.getValue(it, "f_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val, 2.2);
+      error = rows.getValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val, 3);
+      error = rows.getValue(it, "t_val", &t_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(t_val, "foo");
+   }
+   ASSERT_EQ(i, 1) << "not enough rows returned";
+}
+
+TEST_F(DatabaseTestsFixture, SelectBuilderSelects)
+{
+   Query query = sqliteConnection->query("create table BuilderTest(i_val integer, f_val real, b_val bigint, t_val text)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   query = sqliteConnection->query("insert into BuilderTest (i_val, f_val, b_val, t_val) VALUES (1, 2.2, 3, :t_val)");
+   std::string foo = "foo";
+   query.withInput(foo);
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+
+   SelectBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("i_val").add("f_val").add("b_val").add("t_val");
+   builder.where("i_val", 1);
+
+   std::string sql = builder.toSQL();
+   EXPECT_EQ(sql, "SELECT i_val, f_val, b_val, t_val FROM BuilderTest WHERE i_val = :where_i_val");
+
+   query = builder.build();
+
+   Rowset rows;
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   int i = 0;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it, ++i)
+   {
+      ASSERT_EQ(i, 0) << "too many rows returned";
+
+      int i_val;
+      double f_val;
+      long long b_val;
+      std::string t_val;
+
+      error = rows.getValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val, 1);
+      error = rows.getValue(it, "f_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val, 2.2);
+      error = rows.getValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val, 3);
+      error = rows.getValue(it, "t_val", &t_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(t_val, "foo");
+   }
+   ASSERT_EQ(i, 1) << "not enough rows returned";
+}
+
+TEST_F(DatabaseTestsFixture, UpdateBuilderUpdates)
+{
+   Query query = sqliteConnection->query("create table BuilderTest(i_val integer, b_val bigint)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   for (int i = 0; i < 3; i++)
+   {
+      InsertBuilder builder(sqliteConnection, "BuilderTest");
+      builder.add("i_val", i)
+         .add("b_val", i);
+      query = builder.build();
+      error = sqliteConnection->execute(query);
+      ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+   }
+
+   UpdateBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("b_val", 999)
+      .where("i_val", 1);
+
+   std::string sql = builder.toSQL();
+   EXPECT_EQ(sql, "UPDATE BuilderTest SET b_val = :b_val WHERE i_val = :where_i_val");
+
+   query = builder.build();
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to update values in BuilderTest: " << error.getMessage();
+
+   Rowset rows;
+   query = sqliteConnection->query("select i_val, b_val from BuilderTest");
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it)
+   {
+      int i_val;
+      int b_val;
+
+      error = rows.getValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      error = rows.getValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      if (i_val == 1)
+         EXPECT_EQ(b_val, 999);
+      else
+         EXPECT_EQ(b_val, i_val);
+   }
+}
+
+// Also tests .whereIn()
+TEST_F(DatabaseTestsFixture, DeleteBuilderDeletes)
+{
+   Query query = sqliteConnection->query("create table BuilderTest(i_val integer, b_val bigint)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   for (int i = 0; i < 3; i++)
+   {
+      InsertBuilder builder(sqliteConnection, "BuilderTest");
+      builder.add("i_val", i)
+         .add("b_val", i);
+      query = builder.build();
+      error = sqliteConnection->execute(query);
+      ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+   }
+
+   {
+      // Temporary builder just for testing compilation of the container overload
+      DeleteBuilder builder(sqliteConnection, "BuilderTest");
+      builder.whereIn("i_val", std::vector<int>{ 0, 2 });
+   }
+
+   DeleteBuilder builder(sqliteConnection, "BuilderTest");
+   builder.whereIn("i_val", { 0, 2 });
+
+   std::string sql = builder.toSQL();
+   EXPECT_EQ(sql, "DELETE FROM BuilderTest WHERE i_val IN (:where_i_val_0, :where_i_val_1)");
+
+   query = builder.build();
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to update values in BuilderTest: " << error.getMessage();
+
+   Rowset rows;
+   query = sqliteConnection->query("select i_val, b_val from BuilderTest");
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   int i = 0;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it, ++i)
+   {
+      ASSERT_EQ(i, 0) << "too many rows returned";
+
+      int i_val;
+      int b_val;
+
+      error = rows.getValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val, 1);
+      error = rows.getValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val, 1);
+   }
+   ASSERT_EQ(i, 1) << "not enough rows returned";
+}
+
+TEST_F(DatabaseTestsFixture, CompoundWhereExpressions)
+{
+   Query query = sqliteConnection->query("create table BuilderTest(id INTEGER, foo INTEGER, bar INTEGER)");
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   error = sqliteConnection->executeStr("insert into BuilderTest (id, foo, bar) VALUES (1, 2, 0), (3, 4, 0), (5, 6, 1)");
+   ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+
+   SelectBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("id");
+   builder.where(QBWhereOr().where("foo", 2).where("bar", 1));
+
+   std::string sql = builder.toSQL();
+   EXPECT_EQ(sql, "SELECT id FROM BuilderTest WHERE (foo = :where_1_foo OR bar = :where_1_bar)");
+
+   query = builder.build();
+
+   Rowset rows;
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   std::set<int> expected({ 1, 5 });
+   bool unexpected = false;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it)
+   {
+      int id;
+      error = rows.getValue(it, "id", &id);
+      EXPECT_FALSE(error);
+      auto found = expected.find(id);
+      if (found != expected.end())
+         expected.erase(found);
+      else
+         unexpected = true;
+   }
+   ASSERT_EQ(expected.size(), 0) << "missing rows in WHERE OR test";
+   ASSERT_FALSE(unexpected) << "unexpected results in WHERE OR test";
+
+   SelectBuilder builder2(sqliteConnection, "BuilderTest");
+   builder2.add("id");
+   builder2.where(QBWhereOr()
+      .where("foo", 6)
+      .where(QBWhereAnd()
+         .where("bar", 0)
+         .where("foo", 2)
+      )
+   );
+
+   sql = builder2.toSQL();
+   EXPECT_EQ(sql, "SELECT id FROM BuilderTest WHERE (foo = :where_1_foo OR (bar = :where_1_1_bar AND foo = :where_1_1_foo))");
+
+   query = builder2.build();
+
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   expected = std::set<int>({ 1, 5 });
+   unexpected = false;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it)
+   {
+      int id;
+      error = rows.getValue(it, "id", &id);
+      EXPECT_FALSE(error);
+      auto found = expected.find(id);
+      if (found != expected.end())
+         expected.erase(found);
+      else
+         unexpected = true;
+   }
+   ASSERT_EQ(expected.size(), 0) << "missing rows in WHERE AND test";
+   ASSERT_FALSE(unexpected) << "unexpected results in WHERE AND test";
+
+   SelectBuilder builder3(sqliteConnection, "BuilderTest");
+   builder3.add("id");
+   builder3.whereNot(QBWhereAnd()
+      .where("bar", 0)
+      .where("foo", 2)
+   );
+
+   sql = builder3.toSQL();
+   EXPECT_EQ(sql, "SELECT id FROM BuilderTest WHERE NOT (bar = :where_1_bar AND foo = :where_1_foo)");
+}
+
+TEST_F(DatabaseTestsFixture, EmptyCompoundWhere)
+{
+   SelectBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("id").where(QBWhereAnd());
+   EXPECT_EQ(builder.toSQL(), "SELECT id FROM BuilderTest WHERE (1 = 1)");
+
+   SelectBuilder builder2(sqliteConnection, "BuilderTest");
+   builder2.add("id").where(QBWhereOr());
+   EXPECT_EQ(builder2.toSQL(), "SELECT id FROM BuilderTest WHERE (1 = 0)");
+}
+
+TEST_F(DatabaseTestsFixture, RawBuilderWorks)
+{
+   SqlIdentifier iCol("i_val"), fCol("f_val"), bCol("b_val"), tCol("t_val");
+   RawQueryBuilder raw1(sqliteConnection);
+   raw1 << "CREATE TABLE BuilderTest ("
+      << iCol << " INTEGER, "
+      << fCol << " REAL, "
+      << bCol << " BIGINT, "
+      << tCol << " TEXT)";
+   EXPECT_EQ(raw1.toSQL(), "CREATE TABLE BuilderTest (i_val INTEGER, f_val REAL, b_val BIGINT, t_val TEXT)");
+   Query query = raw1.build();
+   Error error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to create BuilderTest table: " << error.getMessage();
+
+   RawQueryBuilder raw2(sqliteConnection);
+   long long bVal = 3LL;
+   std::string tVal = "foo";
+   raw2 << "INSERT INTO BuilderTest (" << iCol << ", " << fCol << ", " << bCol << ", " << tCol
+      << ") VALUES (" << 1 << ", " << SECRET(2.2) << ", " << bVal << ", " << tVal << ")";
+   EXPECT_EQ(raw2.toSQL(), "INSERT INTO BuilderTest (i_val, f_val, b_val, t_val) VALUES (:bind0, :secret_param1, :bind2, :bind3)");
+   query = raw2.build();
+   error = sqliteConnection->execute(query);
+   ASSERT_FALSE(error) << "Failed to insert values into BuilderTest: " << error.getMessage();
+
+   SelectBuilder builder(sqliteConnection, "BuilderTest");
+   builder.add("i_val").add("f_val").add("b_val").add("t_val");
+   query = builder.build();
+
+   Rowset rows;
+   error = sqliteConnection->execute(query, rows);
+   ASSERT_FALSE(error) << "Failed to select values from BuilderTest: " << error.getMessage();
+
+   int i = 0;
+   for (RowsetIterator it = rows.begin(); it != rows.end(); ++it, ++i)
+   {
+      ASSERT_EQ(i, 0) << "too many rows returned";
+
+      int i_val;
+      double f_val;
+      long long b_val;
+      std::string t_val;
+
+      error = rows.getValue(it, "i_val", &i_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(i_val, 1);
+      error = rows.getValue(it, "f_val", &f_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(f_val, 2.2);
+      error = rows.getValue(it, "b_val", &b_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(b_val, 3);
+      error = rows.getValue(it, "t_val", &t_val);
+      EXPECT_FALSE(error);
+      EXPECT_EQ(t_val, "foo");
+   }
+   ASSERT_EQ(i, 1) << "not enough rows returned";
+}
+
+class ConnectionPoolTestsFixture : public ::testing::Test
+{
+protected:
+   FilePath dbPath;
+   boost::shared_ptr<ConnectionPool> connectionPool;
+
+   void SetUp() override
+   {
+      ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+      dbPath.removeIfExists();
+
+      SqliteConnectionOptions options;
+      options.file = dbPath.getAbsolutePath();
+
+      Error error = createConnectionPool(5, options, &connectionPool);
+      ASSERT_FALSE(error) << "Failed to create connection pool: " << error.getMessage();
+
+      boost::shared_ptr<IConnection> connection = connectionPool->getConnection();
+      ASSERT_TRUE(connection) << "Failed to get initial connection from pool";
+
+      error = initializeCommonTestSchema(*connection);
+      ASSERT_FALSE(error) << "Failed to initialize common test schema (pool): " << error.getMessage();
+   }
+
+   void TearDown() override
+   {
+      connectionPool.reset();
+      dbPath.removeIfExists();
+   }
+};
+
+TEST_F(ConnectionPoolTestsFixture, CanUseConnectionPool)
+{
+   boost::shared_ptr<IConnection> connection = connectionPool->getConnection();
+   ASSERT_TRUE(connection) << "Failed to get connection from pool";
+
+   // Insert some data into the Test table
+   Query query = connection->query("insert into Test(id, text) values(:id, :text)");
+   for (int id = 0; id < 100; ++id)
+   {
+      std::string text = "Test text " + core::safe_convert::numberToString(id);
+      query.withInput(id).withInput(text);
+      Error error = connection->execute(query);
+      ASSERT_FALSE(error) << "Failed to insert row " << id << ": " << error.getMessage();
+      // Rebind fresh for next iteration
+      query = connection->query("insert into Test(id, text) values(:id, :text)");
+   }
+
+   int rowId;
+   std::string rowText;
+   Query select50 = connection->query("select id, text from Test where id = 50")
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+   bool dataReturned = false;
+   Error error = connection->execute(select50, &dataReturned);
+   ASSERT_FALSE(error) << "Failed to execute first query: " << error.getMessage();
+   ASSERT_TRUE(dataReturned) << "Expected data for id=50";
+
+   boost::shared_ptr<IConnection> connection2 = connectionPool->getConnection();
+   ASSERT_TRUE(connection2) << "Failed to get second connection from pool";
+
+   Query select25 = connection2->query("select id, text from Test where id = 25")
+         .withOutput(rowId)
+         .withOutput(rowText);
+
+   dataReturned = false;
+   error = connection2->execute(select25, &dataReturned);
+   ASSERT_FALSE(error) << "Failed to execute second query: " << error.getMessage();
+   ASSERT_TRUE(dataReturned) << "Expected data for id=25";
+}
+
+// Defense-in-depth for rstudio-pro#10885: a connection returned to the pool
+// while a transaction is still open must be rolled back before reuse, so a
+// later writer cannot inherit a stale read snapshot.
+TEST(ConnectionPoolTest, ReturningConnectionWithOpenTransactionRollsItBack)
+{
+   FilePath dbPath;
+   ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+   dbPath.removeIfExists();
+
+   SqliteConnectionOptions options;
+   options.file = dbPath.getAbsolutePath();
+
+   {
+      // Pool of one so the re-acquired connection is guaranteed to be the same
+      // underlying connection we just returned.
+      boost::shared_ptr<ConnectionPool> pool;
+      ASSERT_FALSE(createConnectionPool(1, options, &pool)) << "Failed to create connection pool";
+
+      {
+         boost::shared_ptr<IConnection> conn = pool->getConnection();
+         ASSERT_TRUE(conn) << "Failed to get connection from pool";
+         ASSERT_FALSE(conn->executeStr("CREATE TABLE Txn(id int)")) << "Failed to create Txn table";
+
+         // Open a write transaction and leave it open, simulating a path that
+         // returns the connection without committing or rolling back.
+         ASSERT_FALSE(conn->executeStr("BEGIN")) << "Failed to begin transaction";
+         Query insert = conn->query("INSERT INTO Txn(id) VALUES (:id)").withInput(1);
+         ASSERT_FALSE(conn->execute(insert)) << "Failed to insert within transaction";
+         // conn leaves scope here -> returned to pool -> transaction rolled back.
+      }
+
+      boost::shared_ptr<IConnection> conn2 = pool->getConnection();
+      ASSERT_TRUE(conn2) << "Failed to re-acquire connection from pool";
+
+      // The connection must be back in autocommit: without the rollback-on-return
+      // the prior transaction would still be open and this BEGIN would fail with
+      // "cannot start a transaction within a transaction".
+      ASSERT_FALSE(conn2->executeStr("BEGIN")) << "Connection was not returned to autocommit state";
+      ASSERT_FALSE(conn2->executeStr("ROLLBACK"));
+
+      // And the uncommitted row must not have survived.
+      int count = -1;
+      Query countQuery = conn2->query("SELECT COUNT(*) FROM Txn").withOutput(count);
+      bool dataReturned = false;
+      ASSERT_FALSE(conn2->execute(countQuery, &dataReturned)) << "Failed to count Txn rows";
+      ASSERT_TRUE(dataReturned);
+      EXPECT_EQ(count, 0) << "Uncommitted row should have been rolled back on return";
+   }
+
+   dbPath.removeIfExists();
+}
+
+// The rollback-on-return probe opens its own transaction when none was left
+// open (BEGIN succeeds); that probe transaction must itself be closed before
+// the connection is pooled, or every cleanly-returned connection would come
+// back inside a stale deferred transaction.
+TEST(ConnectionPoolTest, ReturningConnectionCleanlyLeavesAutocommit)
+{
+   FilePath dbPath;
+   ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+   dbPath.removeIfExists();
+
+   SqliteConnectionOptions options;
+   options.file = dbPath.getAbsolutePath();
+
+   {
+      // Pool of one so the re-acquired connection is guaranteed to be the same
+      // underlying connection we just returned.
+      boost::shared_ptr<ConnectionPool> pool;
+      ASSERT_FALSE(createConnectionPool(1, options, &pool)) << "Failed to create connection pool";
+
+      {
+         boost::shared_ptr<IConnection> conn = pool->getConnection();
+         ASSERT_TRUE(conn) << "Failed to get connection from pool";
+         ASSERT_FALSE(conn->executeStr("CREATE TABLE Txn(id int)")) << "Failed to create Txn table";
+
+         // A plain autocommit insert; no transaction is left open.
+         Query insert = conn->query("INSERT INTO Txn(id) VALUES (:id)").withInput(1);
+         ASSERT_FALSE(conn->execute(insert)) << "Failed to insert row";
+         // conn leaves scope here -> returned to pool -> probe runs.
+      }
+
+      boost::shared_ptr<IConnection> conn2 = pool->getConnection();
+      ASSERT_TRUE(conn2) << "Failed to re-acquire connection from pool";
+
+      // The connection must be back in autocommit: if the probe's own BEGIN
+      // had leaked, this BEGIN would fail with "cannot start a transaction
+      // within a transaction".
+      ASSERT_FALSE(conn2->executeStr("BEGIN")) << "Probe transaction leaked into the pooled connection";
+      ASSERT_FALSE(conn2->executeStr("ROLLBACK"));
+
+      // And the committed row must have survived.
+      int count = -1;
+      Query countQuery = conn2->query("SELECT COUNT(*) FROM Txn").withOutput(count);
+      bool dataReturned = false;
+      ASSERT_FALSE(conn2->execute(countQuery, &dataReturned)) << "Failed to count Txn rows";
+      ASSERT_TRUE(dataReturned);
+      EXPECT_EQ(count, 1) << "Committed row should survive the return-to-pool probe";
+   }
+
+   dbPath.removeIfExists();
+}
+
+// Regression for rstudio-pro#10885: a SELECT's Rowset holds a SQLite read
+// snapshot until it is destroyed. A connection that is reused for a write while
+// still carrying such a snapshot - after another connection has committed -
+// fails with SQLITE_BUSY_SNAPSHOT, which busy_timeout cannot clear and retries
+// cannot resolve. oauthToken() now scopes its Rowset so the snapshot is released
+// before the write; this guards that Rowset-lifetime contract.
+TEST(ConnectionPoolTest, RowsetReleasesReadSnapshotWhenDestroyed)
+{
+   FilePath dbPath;
+   ASSERT_FALSE(FilePath::tempFilePath(dbPath));
+   dbPath.removeIfExists();
+
+   SqliteConnectionOptions options;
+   options.file = dbPath.getAbsolutePath();
+
+   {
+      boost::shared_ptr<ConnectionPool> pool;
+      ASSERT_FALSE(createConnectionPool(2, options, &pool)) << "Failed to create connection pool";
+
+      boost::shared_ptr<IConnection> reader = pool->getConnection();
+      boost::shared_ptr<IConnection> writer = pool->getConnection();
+      ASSERT_TRUE(reader) << "Failed to get reader connection";
+      ASSERT_TRUE(writer) << "Failed to get writer connection";
+
+      ASSERT_FALSE(reader->executeStr("CREATE TABLE Snap(id int)")) << "Failed to create Snap table";
+      ASSERT_FALSE(reader->executeStr("INSERT INTO Snap(id) VALUES (1)")) << "Failed seed insert";
+
+      // Raw write that bypasses the execute() retry ladder, so a snapshot
+      // conflict surfaces immediately rather than after the retry budget.
+      auto writeOnReader = [&]() -> bool {
+         try
+         {
+            reader->session() << "INSERT INTO Snap(id) VALUES (99)";
+            return true;
+         }
+         catch (const soci::soci_error&)
+         {
+            return false;
+         }
+      };
+
+      {
+         // Hold a read snapshot open on `reader` by starting, but not finishing,
+         // a SELECT.
+         Rowset rows;
+         Query select = reader->query("SELECT id FROM Snap");
+         ASSERT_FALSE(reader->execute(select, rows)) << "Failed to execute SELECT";
+         RowsetIterator it = rows.begin(); // first step opens the read transaction
+         ASSERT_TRUE(it != rows.end());
+
+         // Another connection commits a write, advancing the WAL past the
+         // reader's snapshot.
+         ASSERT_FALSE(writer->executeStr("INSERT INTO Snap(id) VALUES (2)")) << "Writer insert failed";
+
+         // The reader still holds the stale snapshot, so its write conflicts.
+         EXPECT_FALSE(writeOnReader()) << "expected a snapshot conflict while the Rowset is open";
+      } // Rowset/Query destroyed here -> read snapshot released
+
+      // With the snapshot released, the same connection can write.
+      EXPECT_TRUE(writeOnReader()) << "write should succeed once the Rowset is destroyed";
+   }
+
+   dbPath.removeIfExists();
+}
+
+} // namespace tests
+} // namespace core
+} // namespace rstudio

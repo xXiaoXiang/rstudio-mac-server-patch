@@ -1,0 +1,168 @@
+/*
+ * Resources.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef CORE_SYSTEM_RESOURCES_HPP
+#define CORE_SYSTEM_RESOURCES_HPP
+
+#include <string>
+#include <vector>
+#include <sys/types.h>
+
+namespace rstudio {
+namespace core {
+
+class Error;
+
+namespace system {
+
+// Enumeration of possible sources of memory information. When computing usage
+// information, we indicate where the information comes from so we can provide
+// detail in the UI.
+enum MemoryProvider {
+   // Source of stat unknown
+   MemoryProviderUnknown = 0,
+
+   // Native MacOS memory provider
+   MemoryProviderMacOS,
+
+   // Native Windows memory provider
+   MemoryProviderWindows,
+
+   // Linux provider based on cgroups; only available when process is inside a
+   // cgroup
+   MemoryProviderLinuxCgroups,
+   
+   // Linux provider based on ulimit; only useful if process has been given a
+   // memory cap via setrlimit(1) and friends
+   MemoryProviderLinuxUlimit,
+
+   // Linux provider serving process memory information from the /proc virtual
+   // filesystem
+   MemoryProviderLinuxProcFs,
+
+   // Linux provider serving system-wide memory stats from /proc/meminfo
+   MemoryProviderLinuxProcMeminfo
+};
+
+
+// Returns the amount of memory used by the *current* system process (i.e. the one that calls this
+// function). Note that this will not be the memory used by the main R session if called from a
+// forked/child process.
+Error getProcessMemoryUsed(long *pUsedKb, MemoryProvider *pProvider);
+
+// Returns the total amount of memory in use.
+Error getTotalMemoryUsed(long *pUsedKb, MemoryProvider *pProvider);
+
+// Returns the total amount of available memory. This may be a physical constraint (e.g., physical
+// RAM) or a virtual one (e.g., a cgroup-imposed limit)
+Error getTotalMemory(long *pTotalKb, MemoryProvider *pProvider);
+
+// Returns 0 if there's no limit. cgroups memory limits if enabled, or ulimit -m
+Error getProcessMemoryLimit(long *pTotalKb, MemoryProvider *pProvider);
+
+// Returns 0.0 if the cpu is unlimited, otherwise, the number of cpus with fractional allocation (e.g. 0.5)
+Error getProcessCpuLimit(double *pNumCpus, MemoryProvider *pProvider);
+
+#ifdef __linux__
+
+// Selects how session and total memory usage are computed and reported. See the
+// rsession.conf "memory-usage-mode" option for the meaning of each mode.
+enum MemoryUsageMode {
+   // Auto-detect: resolves to MemoryUsageModeContainer when running inside a
+   // container and MemoryUsageModeDefault otherwise. This is the default.
+   MemoryUsageModeAuto = 0,
+
+   // Preserve the historical behavior: report the node's physical/cgroup RAM as
+   // the total and rely on node free memory (plus a grace period) for aborts.
+   MemoryUsageModeDefault,
+
+   // Report the session's cgroup memory limit as the total so the session is
+   // aborted when it reaches its own limit rather than when the node runs low.
+   MemoryUsageModeContainer,
+
+   // Force memory usage to be read from the cgroup.
+   MemoryUsageModeCgroup,
+
+   // Force memory usage to be read from the node's /proc/meminfo instead of
+   // the cgroup.
+   MemoryUsageModeMemInfo
+};
+
+// Sets the mode used to compute and report memory usage. Call once at startup,
+// before the memory providers are first used.
+void setMemoryUsageMode(MemoryUsageMode mode);
+
+// Computes cgroup memory usage excluding reclaimable page cache: currentKb
+// (memory.current on v2, memory.usage_in_bytes on v1) minus the active and
+// inactive file LRU pages from the contents of the cgroup's memory.stat.
+// Returns an error if memory.stat doesn't contain the needed keys.
+Error computeCgroupMemoryUsedKb(long currentKb, const std::string& memoryStat, bool isV2, long *pUsedKb);
+
+// Reads a procfs file in full. This uses read(2) rather than a stream so that
+// a failed read is reported with its cause, and can't be mistaken for a file
+// that has more to give.
+Error readProcFile(const std::string& procPath, std::string* pContents);
+
+// Reads what remains of a procfs file from an open descriptor. The kernel
+// generates these files as they are read, so a read can fail after the open
+// succeeded: /proc/<pid>/status fails with ESRCH once the process is reaped.
+// Returns an error for contents of more than 1MB, which no procfs file read
+// here comes near, rather than read without end.
+Error readProcFileDescriptor(int fd, std::string* pContents);
+
+// Looks up the values of "Key: value" lines, as found in /proc/meminfo and
+// /proc/<pid>/status. Returns an error unless every key is found; pValues
+// then holds one value per key, in the order of the keys. Where a key is
+// repeated, its first line is the one that counts.
+Error parseProcFileKeys(const std::string& contents, const std::vector<std::string>& keys, std::vector<long>* pValues);
+
+// The parent and the size (RSS + swap, in kB) of a process.
+struct ProcessStatus
+{
+   pid_t parentPid = -1;
+   long sizeKb = 0;
+};
+
+// Parses the parent and the size of a process from the contents of its
+// /proc/<pid>/status. A memory line that is missing counts as 0: processes
+// without an address space (zombies, kernel threads) have none. Returns an
+// error if there is no parent, or a value can't be read. With a memory line
+// that can't be read, the parent is still given, if it could be read.
+Error parseProcessStatus(const std::string& contents, ProcessStatus* pStatus);
+
+// Returns the path of the memory cgroup named by the contents of
+// /proc/<pid>/cgroup. Returns an empty string if there is none, or if it is
+// shared with other users.
+std::string parseMemoryCgroup(const std::string& contents, uid_t uid);
+
+// Sets the memory limit. Must have privileges and provide the uid of the ultimate process owner
+Error setProcessMemoryLimit(long memHighKb, long memMaxKb, uid_t uid, MemoryProvider *pProvider);
+
+// Sets the cpu limit. Must have privileges and provide the uid of the ultimate process owner
+Error setProcessCpuLimit(double numCpus, uid_t uid, MemoryProvider *pProvider);
+
+#endif
+
+// Returns the RSS + swap for the current process.
+// The goal here is to choose values that are specific to a given process,
+// that are using real resources on the system. Including swap so that processes
+// that overflow main memory continue are measured based on their complete size.
+long getProcessSize();
+
+} // namespace system
+} // namespace core
+} // namespace rstudio
+
+#endif // CORE_SYSTEM_RESOURCES_HPP

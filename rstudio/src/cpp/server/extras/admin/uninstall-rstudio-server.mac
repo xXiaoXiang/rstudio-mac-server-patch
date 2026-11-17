@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+SCRIPT_DIR=$(cd "$(/usr/bin/dirname "$0")" && /bin/pwd -P)
+exec "$SCRIPT_DIR/rstudio-server-install" uninstall --remove-app

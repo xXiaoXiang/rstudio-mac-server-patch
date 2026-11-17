@@ -1,0 +1,1404 @@
+/*
+ * SessionModuleContextTests.cpp
+ *
+ * Copyright (C) 2026 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <session/SessionModuleContext.hpp>
+
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/thread.hpp>
+
+#include <core/FileSerializer.hpp>
+#include <core/http/Request.hpp>
+#include <core/system/Environment.hpp>
+#include <core/system/Process.hpp>
+#include <core/system/ShellUtils.hpp>
+#include <shared_core/FilePath.hpp>
+
+#include <session/SessionOptions.hpp>
+
+#ifdef __APPLE__
+# include <climits>
+# include <cstdlib>
+# include <unistd.h>
+# include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#ifdef _WIN32
+# include <windows.h>
+# include <objbase.h>
+# include <shlobj.h>
+# include <algorithm>
+# include <core/FileSerializer.hpp>
+#endif
+
+namespace rstudio {
+namespace session {
+namespace module_context {
+namespace tests {
+
+namespace {
+
+// http::Request is non-copyable (inherits from boost::noncopyable via
+// Message), so the helper writes through a caller-owned instance rather
+// than returning by value.
+void initRequest(core::http::Request& request,
+                 const std::string& uri,
+                 const std::string& fetchDest = "")
+{
+   request.setUri(uri);
+   if (!fetchDest.empty())
+      request.setHeader("Sec-Fetch-Dest", fetchDest);
+}
+
+} // anonymous namespace
+
+// The Sec-Fetch-Dest and Content-Type based skips below only apply when the
+// track-resource-downloads option is disabled, which is its default value.
+// The FileDownloadGrantTest fixture further down exercises the opt-in-enabled
+// behavior and the server-initiated preview grant.
+
+// --- Returns false: Sec-Fetch-Dest sub-resource ----------------------------
+
+TEST(ShouldAuditFileDownloadTest, FetchDestStyleSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/main.css", "style");
+   core::FilePath file("main.css");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, FetchDestScriptSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/bundle.js", "script");
+   core::FilePath file("bundle.js");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, FetchDestImageSkipsEvenForBinaryExtension)
+{
+   // Sub-resource Sec-Fetch-Dest skips even when the file is a non-
+   // renderable type, since the browser is fetching it as an embedded
+   // asset of another page rather than as a download.
+   core::http::Request request;
+   initRequest(request, "/files/embedded.zip", "image");
+   core::FilePath file("embedded.zip");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, AllSubResourceFetchDestsSkip)
+{
+   // Pins the contract that every value the helper recognizes as a
+   // sub-resource actually skips. Uses a non-renderable file type so a
+   // bug that drops the sub-resource branch would surface as a failure
+   // (and not be masked by the renderable-Content-Type branch).
+   const std::vector<std::string> subResourceDests = {
+      "style", "script", "image", "font", "audio", "video",
+      "track", "object", "embed", "manifest", "xslt", "report",
+      "worker", "serviceworker", "audioworklet", "paintworklet"
+   };
+   for (const auto& dest : subResourceDests)
+   {
+      core::http::Request request;
+      initRequest(request, "/files/asset.zip", dest);
+      core::FilePath file("asset.zip");
+      EXPECT_FALSE(shouldAuditFileDownload(request, file))
+         << "Sec-Fetch-Dest=" << dest << " should skip audit";
+   }
+}
+
+// --- Returns false: renderable Content-Type --------------------------------
+
+TEST(ShouldAuditFileDownloadTest, PdfMimeSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/report.pdf");
+   core::FilePath file("report.pdf");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, HtmlMimeSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/index.html");
+   core::FilePath file("index.html");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, ImageMimeSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/photo.png");
+   core::FilePath file("photo.png");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, JsonMimeSkips)
+{
+   core::http::Request request;
+   initRequest(request, "/files/data.json");
+   core::FilePath file("data.json");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+// --- Returns true: audited downloads ---------------------------------------
+
+TEST(ShouldAuditFileDownloadTest, ZipAudits)
+{
+   core::http::Request request;
+   initRequest(request, "/files/archive.zip");
+   core::FilePath file("archive.zip");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, OfficeDocxAudits)
+{
+   // Office formats serve as application/vnd.openxmlformats-officedocument.*
+   // - not in the renderable set, so they audit.
+   core::http::Request request;
+   initRequest(request, "/files/report.docx");
+   core::FilePath file("report.docx");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, OctetStreamAudits)
+{
+   // The canonical "binary, save to disk" Content-Type. Most installer-
+   // style files (.exe, .iso, .dmg, .deb, .dll) resolve to this MIME.
+   core::http::Request request;
+   initRequest(request, "/files/installer.exe");
+   core::FilePath file("installer.exe");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, NoExtensionAuditsAsOctetStream)
+{
+   // The helper passes "application/octet-stream" as the explicit
+   // default to getMimeContentType, so files with unknown / missing
+   // extensions audit. Closes the rename-bypass surface (e.g. renaming
+   // secret.zip to "secret") at the cost of also auditing legitimate
+   // extensionless text-file fetches (README, LICENSE, etc.).
+   core::http::Request request;
+   initRequest(request, "/files/README");
+   core::FilePath file("README");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, DocumentFetchDestForBinaryAudits)
+{
+   // Top-level navigation to a non-renderable type is the prototypical
+   // "user typed a download URL" case and must produce an audit row.
+   core::http::Request request;
+   initRequest(request, "/files/archive.zip", "document");
+   core::FilePath file("archive.zip");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, MissingFetchDestForBinaryAudits)
+{
+   // Older browsers don't send Sec-Fetch-Dest; treat absence as
+   // "top-level navigation" and audit when the type is non-renderable.
+   core::http::Request request;
+   initRequest(request, "/files/archive.zip");
+   core::FilePath file("archive.zip");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, IframeFetchDestForBinaryAudits)
+{
+   // iframe is intentionally not in the sub-resource skip set - if an
+   // iframe loads a binary, it's effectively exfiltration and should be
+   // audited.
+   core::http::Request request;
+   initRequest(request, "/files/archive.zip", "iframe");
+   core::FilePath file("archive.zip");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST(ShouldAuditFileDownloadTest, IframeFetchDestForRenderableSkips)
+{
+   // iframe loading a renderable type (HTML, etc.) is just sub-view
+   // behavior; skip via the Content-Type branch.
+   core::http::Request request;
+   initRequest(request, "/files/page.html", "iframe");
+   core::FilePath file("page.html");
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+// --- Grant + opt-in behavior ------------------------------------------------
+//
+// These need real files (registerDownloadGrant stamps size/mtime) and toggle
+// the process-wide track-resource-downloads option, so they use a fixture that
+// creates temp files and resets the option after each case.
+
+class FileDownloadGrantTest : public ::testing::Test
+{
+protected:
+   void TearDown() override
+   {
+      // options() is a process-wide singleton; make sure an opt-in enabled by
+      // one test doesn't leak into the next.
+      session::options().setTrackResourceDownloads(false);
+      for (core::FilePath& file : tempFiles_)
+         file.removeIfExists();
+   }
+
+   core::FilePath makeTempFile(const std::string& extension,
+                               const std::string& contents)
+   {
+      core::FilePath path;
+      core::Error error = core::FilePath::tempFilePath(extension, path);
+      EXPECT_FALSE(error) << error.asString();
+      error = core::writeStringToFile(path, contents);
+      EXPECT_FALSE(error) << error.asString();
+      tempFiles_.push_back(path);
+      return path;
+   }
+
+   void enableResourceTracking()
+   {
+      session::options().setTrackResourceDownloads(true);
+   }
+
+   std::vector<core::FilePath> tempFiles_;
+};
+
+TEST_F(FileDownloadGrantTest, RegisteredPreviewSkipsAudit)
+{
+   // A server-initiated preview registers a grant; the subsequent request for
+   // that exact file (a non-renderable .zip, so nothing else would skip it) is
+   // not audited. This is the unforgeable replacement for the old ?show=1
+   // marker.
+   core::FilePath file = makeTempFile(".zip", "payload");
+   registerDownloadGrant(file);
+
+   core::http::Request request;
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+}
+
+TEST_F(FileDownloadGrantTest, GrantIsPathSpecific)
+{
+   // A grant for one file must not suppress the audit for a different file.
+   core::FilePath granted = makeTempFile(".zip", "payload");
+   core::FilePath other = makeTempFile(".zip", "secret");
+   registerDownloadGrant(granted);
+
+   core::http::Request request;
+   EXPECT_TRUE(shouldAuditFileDownload(request, other));
+}
+
+TEST_F(FileDownloadGrantTest, StaleGrantAudits)
+{
+   // If the file is replaced after the grant is recorded, the size/mtime stamp
+   // no longer matches, so the download is audited -- a grant can't be reused
+   // to smuggle out content swapped in at the same path.
+   core::FilePath file = makeTempFile(".zip", "preview");
+   registerDownloadGrant(file);
+
+   // Rewrite with different-length content to change the stamp.
+   core::Error error = core::writeStringToFile(file, "swapped-in-secret-data");
+   ASSERT_FALSE(error) << error.asString();
+
+   core::http::Request request;
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST_F(FileDownloadGrantTest, CreateFileUrlRegistersGrantAndDropsShowMarker)
+{
+   // Producer side: createFileUrl registers the grant and no longer appends a
+   // ?show=1 marker. Regression guard for the producer/consumer contract.
+   core::FilePath file = makeTempFile(".zip", "preview");
+   const std::string url = createFileUrl(file);
+
+   EXPECT_EQ(url.find("show=1"), std::string::npos)
+      << "createFileUrl should no longer emit a show=1 marker: " << url;
+
+   core::http::Request request;
+   EXPECT_FALSE(shouldAuditFileDownload(request, file))
+      << "createFileUrl should have registered a download grant for " << url;
+}
+
+TEST_F(FileDownloadGrantTest, TrackingEnabledAuditsRenamedText)
+{
+   // #3: renaming a binary to a text extension lands a text/* Content-Type,
+   // which is skipped by default. With resource tracking enabled that skip is
+   // off, so the download is audited regardless of the client-influenced type.
+   core::FilePath file = makeTempFile(".txt", "actually-not-text");
+   enableResourceTracking();
+
+   core::http::Request request;
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST_F(FileDownloadGrantTest, TrackingEnabledAuditsSpoofedFetchDest)
+{
+   // #2: a client can send Sec-Fetch-Dest: image to masquerade as a sub-
+   // resource. With resource tracking enabled that skip is off, so the
+   // download is audited.
+   core::FilePath file = makeTempFile(".zip", "payload");
+   enableResourceTracking();
+
+   core::http::Request request;
+   request.setHeader("Sec-Fetch-Dest", "image");
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+TEST_F(FileDownloadGrantTest, TrackingEnabledAuditsRenderableType)
+{
+   // A genuinely renderable type (PDF) is skipped by default but audited once
+   // resource tracking is enabled.
+   core::FilePath file = makeTempFile(".pdf", "%PDF-1.4");
+
+   core::http::Request request;
+   EXPECT_FALSE(shouldAuditFileDownload(request, file));
+
+   enableResourceTracking();
+   EXPECT_TRUE(shouldAuditFileDownload(request, file));
+}
+
+// --- Supervisor-only pumping during shutdown (#18394) ------------------------
+//
+// The assistant/chat shutdown waits pump ONLY processSupervisor().poll()
+// instead of the full onBackgroundProcessing() pass, on the theory that the
+// poll alone reaps exited children and fires their exit callbacks, without
+// dispatching scheduled commands, background handlers, or R events. (It does
+// still fire I/O and exit callbacks for other supervised children -- the
+// claim is narrower than "no other module's code runs".) These tests pin
+// both halves of that contract, so a supervisor or scheduling refactor that
+// invalidates either assumption fails here rather than resurfacing as a
+// silent CI shard hang.
+
+TEST(SupervisorShutdownPumpTest, PollAloneReapsChildAndFiresExitCallback)
+{
+   // Shared (not stack-captured by reference): if the test fails and the
+   // supervisor fires the callback after this frame is gone, it must not
+   // write through a dangling reference into the still-running session.
+   auto pExited = boost::make_shared<bool>(false);
+   auto pExitStatus = boost::make_shared<int>(-1);
+
+   // Match the production launches this test pins (SessionAssistant /
+   // SessionChat set this explicitly): with the session's main-thread gate
+   // enabled, only main-thread polls -- ours below -- fire these callbacks,
+   // and the pin stays valid even if the ProcessOptions default changes.
+   core::system::ProcessOptions options;
+   options.callbacksRequireMainThread = true;
+
+   core::system::ProcessCallbacks callbacks;
+   callbacks.onExit = [pExited, pExitStatus](int status)
+   {
+      *pExited = true;
+      *pExitStatus = status;
+   };
+
+   core::Error error = module_context::processSupervisor().runCommand(
+            "exit 0", options, callbacks);
+   ASSERT_FALSE(error) << error.asString();
+
+   // Drive ONLY the supervisor poll -- no onBackgroundProcessing, no R event
+   // processing -- exactly as the shutdown waits do.
+   for (int i = 0; i < 100 && !*pExited; i++)
+   {
+      module_context::processSupervisor().poll();
+      boost::this_thread::sleep(boost::posix_time::milliseconds(50));
+   }
+
+   EXPECT_TRUE(*pExited)
+      << "processSupervisor().poll() alone did not reap the child within 5s; "
+         "the #18394 shutdown waits rely on this";
+   EXPECT_EQ(0, *pExitStatus);
+}
+
+TEST(SupervisorShutdownPumpTest, PollDoesNotDispatchScheduledCommands)
+{
+   // Shared for the same dangling-reference reason as above: a command left
+   // pending by a failure would run during the session's own later pumping.
+   auto pCommandRan = boost::make_shared<bool>(false);
+   module_context::scheduleDelayedWork(
+            boost::posix_time::milliseconds(1),
+            [pCommandRan]() { *pCommandRan = true; },
+            false /* not idleOnly */);
+
+   // Let the delay elapse, then drive only the supervisor poll: the scheduled
+   // command must NOT run -- this is the isolation the shutdown waits depend
+   // on (a blocking scheduled command must not be dispatched mid-teardown).
+   boost::this_thread::sleep(boost::posix_time::milliseconds(20));
+   for (int i = 0; i < 10; i++)
+   {
+      module_context::processSupervisor().poll();
+      boost::this_thread::sleep(boost::posix_time::milliseconds(10));
+   }
+   EXPECT_FALSE(*pCommandRan)
+      << "processSupervisor().poll() dispatched a scheduled command; the "
+         "#18394 shutdown waits assume it dispatches supervisor work only";
+
+   // Control: the full background-processing pass DOES run it, proving the
+   // command was genuinely pending rather than lost.
+   module_context::onBackgroundProcessing(false);
+   EXPECT_TRUE(*pCommandRan)
+      << "scheduled command never ran even via onBackgroundProcessing(false)";
+}
+
+// --- shouldIgnoreOutputDir --------------------------------------------------
+//
+// Regression coverage for #17900: a website 'output-dir' that resolves to the
+// project directory itself (e.g. 'output-dir: .') must NOT be added to the
+// ignore list, or Find in Files / code search drops every result. The decision
+// compares by filesystem identity, so '.', './', and 'sub/..' -- all naming the
+// project root -- are recognized even though they do not normalize to the base
+// path as strings (the bug in the original fix: lexically_normal("base/.") is
+// "base/.", not "base").
+
+class ShouldIgnoreOutputDirTest : public ::testing::Test
+{
+protected:
+   void SetUp() override
+   {
+      // Create a unique temp directory to stand in for the project root.
+      core::Error error = core::FilePath::tempFilePath(baseDir_);
+      ASSERT_FALSE(error) << error.asString();
+      error = baseDir_.removeIfExists();
+      ASSERT_FALSE(error) << error.asString();
+      error = baseDir_.ensureDirectory();
+      ASSERT_FALSE(error) << error.asString();
+   }
+
+   void TearDown() override
+   {
+      baseDir_.removeIfExists();
+   }
+
+   core::FilePath baseDir_;
+};
+
+TEST_F(ShouldIgnoreOutputDirTest, EmptyOutputDirIsNotIgnored)
+{
+   EXPECT_FALSE(shouldIgnoreOutputDir(baseDir_, ""));
+}
+
+TEST_F(ShouldIgnoreOutputDirTest, DotResolvesToBaseAndIsNotIgnored)
+{
+   // 'output-dir: .' -- the exact #17900 repro.
+   EXPECT_FALSE(shouldIgnoreOutputDir(baseDir_, "."));
+}
+
+TEST_F(ShouldIgnoreOutputDirTest, DotSlashResolvesToBaseAndIsNotIgnored)
+{
+   EXPECT_FALSE(shouldIgnoreOutputDir(baseDir_, "./"));
+}
+
+TEST_F(ShouldIgnoreOutputDirTest, SubdirParentResolvesToBaseAndIsNotIgnored)
+{
+   // 'sub/..' names the project root; boost::filesystem::equivalent needs the
+   // intermediate 'sub' to exist on disk to resolve the path.
+   core::Error error = baseDir_.completeChildPath("sub").ensureDirectory();
+   ASSERT_FALSE(error) << error.asString();
+   EXPECT_FALSE(shouldIgnoreOutputDir(baseDir_, "sub/.."));
+}
+
+TEST_F(ShouldIgnoreOutputDirTest, RealSubdirIsIgnored)
+{
+   // A genuine output dir (e.g. a built '_site') is distinct from the project
+   // root and must still be ignored.
+   core::Error error = baseDir_.completeChildPath("_site").ensureDirectory();
+   ASSERT_FALSE(error) << error.asString();
+   EXPECT_TRUE(shouldIgnoreOutputDir(baseDir_, "_site"));
+}
+
+TEST_F(ShouldIgnoreOutputDirTest, UnbuiltSubdirIsIgnored)
+{
+   // A not-yet-built output dir does not exist on disk; it must still be
+   // ignored (isEquivalentTo returns false when a path is missing).
+   EXPECT_TRUE(shouldIgnoreOutputDir(baseDir_, "_site_not_built"));
+}
+
+#ifdef __APPLE__
+
+// --- Finder aliases (#18158) -------------------------------------------------
+//
+// macOS Finder aliases are bookmark files, not symlinks. The fixture creates
+// real alias files through the CoreFoundation bookmark API -- the same data
+// Finder writes -- so these tests exercise genuine alias resolution.
+
+namespace {
+
+CFURLRef createCFURL(const core::FilePath& path, bool isDirectory)
+{
+   const std::string& absolutePath = path.getAbsolutePath();
+   return CFURLCreateFromFileSystemRepresentation(
+            kCFAllocatorDefault,
+            reinterpret_cast<const UInt8*>(absolutePath.c_str()),
+            absolutePath.size(),
+            isDirectory);
+}
+
+bool createFinderAlias(const core::FilePath& targetPath,
+                       const core::FilePath& aliasPath)
+{
+   CFURLRef targetUrl = createCFURL(targetPath, targetPath.isDirectory());
+   if (targetUrl == nullptr)
+      return false;
+
+   CFDataRef bookmark = CFURLCreateBookmarkData(
+            kCFAllocatorDefault,
+            targetUrl,
+            kCFURLBookmarkCreationSuitableForBookmarkFile,
+            nullptr,
+            nullptr,
+            nullptr);
+   CFRelease(targetUrl);
+   if (bookmark == nullptr)
+      return false;
+
+   CFURLRef aliasUrl = createCFURL(aliasPath, false);
+   bool written = aliasUrl != nullptr &&
+                  CFURLWriteBookmarkDataToFile(bookmark, aliasUrl, 0, nullptr);
+   if (aliasUrl != nullptr)
+      CFRelease(aliasUrl);
+   CFRelease(bookmark);
+   return written;
+}
+
+} // anonymous namespace
+
+class FinderAliasTest : public ::testing::Test
+{
+protected:
+   void SetUp() override
+   {
+      core::FilePath tempPath;
+      core::Error error = core::FilePath::tempFilePath(tempPath);
+      ASSERT_FALSE(error) << error.asString();
+      error = tempPath.ensureDirectory();
+      ASSERT_FALSE(error) << error.asString();
+
+      // canonicalize (/var -> /private/var) so fixture paths compare equal
+      // to resolved alias targets, which come back canonicalized
+      char realPath[PATH_MAX];
+      ASSERT_NE(nullptr,
+                ::realpath(tempPath.getAbsolutePath().c_str(), realPath));
+      baseDir_ = core::FilePath(realPath);
+
+      targetFile_ = baseDir_.completeChildPath("target.txt");
+      error = targetFile_.ensureFile();
+      ASSERT_FALSE(error) << error.asString();
+
+      targetDir_ = baseDir_.completeChildPath("target-dir");
+      error = targetDir_.ensureDirectory();
+      ASSERT_FALSE(error) << error.asString();
+   }
+
+   void TearDown() override
+   {
+      baseDir_.removeIfExists();
+   }
+
+   core::FilePath makeAlias(const core::FilePath& targetPath,
+                            const std::string& name)
+   {
+      core::FilePath aliasPath = baseDir_.completeChildPath(name);
+      EXPECT_TRUE(createFinderAlias(targetPath, aliasPath));
+      return aliasPath;
+   }
+
+   core::FilePath baseDir_;
+   core::FilePath targetFile_;
+   core::FilePath targetDir_;
+};
+
+TEST_F(FinderAliasTest, DetectsAliasToFile)
+{
+   core::FilePath alias = makeAlias(targetFile_, "file-alias");
+   EXPECT_TRUE(isFinderAlias(alias));
+}
+
+TEST_F(FinderAliasTest, DetectsAliasToDirectory)
+{
+   core::FilePath alias = makeAlias(targetDir_, "dir-alias");
+   EXPECT_TRUE(isFinderAlias(alias));
+}
+
+TEST_F(FinderAliasTest, RegularFileIsNotAlias)
+{
+   EXPECT_FALSE(isFinderAlias(targetFile_));
+}
+
+TEST_F(FinderAliasTest, DirectoryIsNotAlias)
+{
+   EXPECT_FALSE(isFinderAlias(targetDir_));
+}
+
+TEST_F(FinderAliasTest, SymlinkIsNotAlias)
+{
+   // symlinks already navigate correctly (the filesystem follows them);
+   // they must not be reported as aliases even though NSURLIsAliasFileKey
+   // is true for both
+   core::FilePath link = baseDir_.completeChildPath("symlink");
+   ASSERT_EQ(0, ::symlink(targetFile_.getAbsolutePath().c_str(),
+                          link.getAbsolutePath().c_str()));
+   EXPECT_FALSE(isFinderAlias(link));
+}
+
+TEST_F(FinderAliasTest, NonexistentPathIsNotAlias)
+{
+   EXPECT_FALSE(isFinderAlias(baseDir_.completeChildPath("does-not-exist")));
+}
+
+TEST_F(FinderAliasTest, ResolvesAliasToFile)
+{
+   core::FilePath alias = makeAlias(targetFile_, "file-alias");
+   core::FilePath target;
+   core::Error error = resolveFinderAlias(alias, &target);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(targetFile_.getAbsolutePath(), target.getAbsolutePath());
+}
+
+TEST_F(FinderAliasTest, ResolvesAliasToDirectory)
+{
+   core::FilePath alias = makeAlias(targetDir_, "dir-alias");
+   core::FilePath target;
+   core::Error error = resolveFinderAlias(alias, &target);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(targetDir_.getAbsolutePath(), target.getAbsolutePath());
+   EXPECT_TRUE(target.isDirectory());
+}
+
+TEST_F(FinderAliasTest, ResolveFailsWhenTargetDeleted)
+{
+   core::FilePath doomed = baseDir_.completeChildPath("doomed.txt");
+   core::Error error = doomed.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+   core::FilePath alias = makeAlias(doomed, "doomed-alias");
+   error = doomed.remove();
+   ASSERT_FALSE(error) << error.asString();
+
+   core::FilePath target;
+   error = resolveFinderAlias(alias, &target);
+   EXPECT_TRUE(static_cast<bool>(error));
+}
+
+// --- createFileSystemItem alias contract -------------------------------------
+//
+// The Files pane decides navigate-vs-open from 'dir' and substitutes
+// 'alias_target' for the clicked path, so a directory alias must carry the
+// target's directory-ness, not the alias file's.
+
+TEST_F(FinderAliasTest, FileSystemItemForDirectoryAlias)
+{
+   core::FilePath alias = makeAlias(targetDir_, "dir-alias");
+   core::json::Object item = createFileSystemItem(alias);
+   EXPECT_TRUE(item["dir"].getBool());
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(targetDir_.getAbsolutePath(), item["alias_target"].getString());
+}
+
+TEST_F(FinderAliasTest, FileSystemItemForFileAlias)
+{
+   core::FilePath alias = makeAlias(targetFile_, "file-alias");
+   core::json::Object item = createFileSystemItem(alias);
+   EXPECT_FALSE(item["dir"].getBool());
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(targetFile_.getAbsolutePath(), item["alias_target"].getString());
+}
+
+TEST_F(FinderAliasTest, FileSystemItemForRegularFileHasNoAliasTarget)
+{
+   core::json::Object item = createFileSystemItem(targetFile_);
+   EXPECT_FALSE(item.hasMember("alias_target"));
+}
+
+TEST_F(FinderAliasTest, FileSystemItemForBrokenAliasHasNoAliasTarget)
+{
+   core::FilePath doomed = baseDir_.completeChildPath("doomed.txt");
+   core::Error error = doomed.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+   core::FilePath alias = makeAlias(doomed, "doomed-alias");
+   error = doomed.remove();
+   ASSERT_FALSE(error) << error.asString();
+
+   core::json::Object item = createFileSystemItem(alias);
+   EXPECT_FALSE(item.hasMember("alias_target"));
+   EXPECT_FALSE(item["dir"].getBool());
+}
+
+#endif // __APPLE__
+
+#ifdef _WIN32
+
+// --- Windows shortcuts (#18274) -----------------------------------------------
+//
+// Windows .lnk shortcuts are shell objects, not symlinks. The fixture creates
+// real .lnk files through IShellLinkW + IPersistFile::Save -- the same data
+// Explorer writes -- so these tests exercise genuine shortcut resolution.
+//
+// COM note: rsession --run-tests reaches gtest on the main thread, after the
+// eager CoInitializeEx in SessionMain.cpp, so the fixture (like the resolver
+// itself) uses COM without initializing it here.
+
+namespace {
+
+// the shell APIs store and expect native (backslash) separators, while
+// FilePath::getAbsolutePathW() may contain forward-slash separators (it
+// exposes the stored representation, which FilePath builds in generic form)
+std::wstring toNativeSeparators(std::wstring path)
+{
+   std::replace(path.begin(), path.end(), L'/', L'\\');
+   return path;
+}
+
+// each failing COM step records its own failure so a CI break names the
+// step and HRESULT instead of a bare "Actual: false"
+bool createWindowsShortcut(const core::FilePath& targetPath,
+                           const core::FilePath& shortcutPath)
+{
+   IShellLinkW* pShellLink = nullptr;
+   HRESULT hr = ::CoCreateInstance(CLSID_ShellLink,
+                                   nullptr,
+                                   CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW,
+                                   (void**) &pShellLink);
+   if (FAILED(hr))
+   {
+      ADD_FAILURE() << "CoCreateInstance(CLSID_ShellLink) failed, hr=0x"
+                    << std::hex << hr;
+      return false;
+   }
+
+   std::wstring target = toNativeSeparators(targetPath.getAbsolutePathW());
+   hr = pShellLink->SetPath(target.c_str());
+   if (FAILED(hr))
+   {
+      ADD_FAILURE() << "IShellLinkW::SetPath failed, hr=0x" << std::hex << hr;
+      pShellLink->Release();
+      return false;
+   }
+
+   IPersistFile* pPersistFile = nullptr;
+   hr = pShellLink->QueryInterface(IID_IPersistFile, (void**) &pPersistFile);
+   if (FAILED(hr))
+   {
+      ADD_FAILURE() << "QueryInterface(IID_IPersistFile) failed, hr=0x"
+                    << std::hex << hr;
+      pShellLink->Release();
+      return false;
+   }
+
+   std::wstring shortcut = toNativeSeparators(shortcutPath.getAbsolutePathW());
+   hr = pPersistFile->Save(shortcut.c_str(), TRUE);
+   if (FAILED(hr))
+      ADD_FAILURE() << "IPersistFile::Save failed, hr=0x" << std::hex << hr;
+
+   pPersistFile->Release();
+   pShellLink->Release();
+   return SUCCEEDED(hr);
+}
+
+// read the target path exactly as the .lnk stores it (IShellLink::GetPath,
+// no normalization), so a test can verify which form Save actually persisted
+bool readStoredShortcutTarget(const core::FilePath& shortcutPath,
+                              std::wstring* pStoredTarget)
+{
+   IShellLinkW* pShellLink = nullptr;
+   HRESULT hr = ::CoCreateInstance(CLSID_ShellLink,
+                                   nullptr,
+                                   CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW,
+                                   (void**) &pShellLink);
+   if (FAILED(hr))
+   {
+      ADD_FAILURE() << "CoCreateInstance(CLSID_ShellLink) failed, hr=0x"
+                    << std::hex << hr;
+      return false;
+   }
+
+   IPersistFile* pPersistFile = nullptr;
+   hr = pShellLink->QueryInterface(IID_IPersistFile, (void**) &pPersistFile);
+   if (FAILED(hr))
+   {
+      ADD_FAILURE() << "QueryInterface(IID_IPersistFile) failed, hr=0x"
+                    << std::hex << hr;
+      pShellLink->Release();
+      return false;
+   }
+
+   std::wstring shortcut = toNativeSeparators(shortcutPath.getAbsolutePathW());
+   hr = pPersistFile->Load(shortcut.c_str(), STGM_READ);
+   if (SUCCEEDED(hr))
+   {
+      wchar_t targetPath[MAX_PATH];
+      hr = pShellLink->GetPath(targetPath, MAX_PATH, nullptr, 0);
+      if (hr == S_OK)
+         pStoredTarget->assign(targetPath);
+      else
+         ADD_FAILURE() << "IShellLinkW::GetPath failed, hr=0x" << std::hex << hr;
+   }
+   else
+   {
+      ADD_FAILURE() << "IPersistFile::Load failed, hr=0x" << std::hex << hr;
+   }
+
+   pPersistFile->Release();
+   pShellLink->Release();
+   return hr == S_OK;
+}
+
+} // anonymous namespace
+
+class WindowsShortcutTest : public ::testing::Test
+{
+protected:
+   void SetUp() override
+   {
+      core::FilePath tempPath;
+      core::Error error = core::FilePath::tempFilePath(tempPath);
+      ASSERT_FALSE(error) << error.asString();
+      error = tempPath.ensureDirectory();
+      ASSERT_FALSE(error) << error.asString();
+
+      // canonicalize (8.3 short names, e.g. RUNNER~1 in TEMP) so fixture
+      // paths compare equal to targets read back from the shell, which
+      // stores long-form paths
+      baseDir_ = core::FilePath(tempPath.getCanonicalPath());
+
+      targetFile_ = baseDir_.completeChildPath("target.txt");
+      error = targetFile_.ensureFile();
+      ASSERT_FALSE(error) << error.asString();
+
+      targetDir_ = baseDir_.completeChildPath("target-dir");
+      error = targetDir_.ensureDirectory();
+      ASSERT_FALSE(error) << error.asString();
+   }
+
+   void TearDown() override
+   {
+      baseDir_.removeIfExists();
+   }
+
+   core::FilePath makeShortcut(const core::FilePath& targetPath,
+                               const std::string& name)
+   {
+      core::FilePath shortcutPath = baseDir_.completeChildPath(name);
+      // createWindowsShortcut records its own failure (step + HRESULT)
+      createWindowsShortcut(targetPath, shortcutPath);
+      return shortcutPath;
+   }
+
+   core::FilePath baseDir_;
+   core::FilePath targetFile_;
+   core::FilePath targetDir_;
+};
+
+TEST_F(WindowsShortcutTest, DetectsShortcutToFile)
+{
+   core::FilePath shortcut = makeShortcut(targetFile_, "file-shortcut.lnk");
+   EXPECT_TRUE(isWindowsShortcut(shortcut));
+}
+
+TEST_F(WindowsShortcutTest, DetectsShortcutToDirectory)
+{
+   core::FilePath shortcut = makeShortcut(targetDir_, "dir-shortcut.lnk");
+   EXPECT_TRUE(isWindowsShortcut(shortcut));
+}
+
+TEST_F(WindowsShortcutTest, DetectsUppercaseLnkExtension)
+{
+   core::FilePath shortcut = makeShortcut(targetFile_, "FILE-SHORTCUT.LNK");
+   EXPECT_TRUE(isWindowsShortcut(shortcut));
+}
+
+TEST_F(WindowsShortcutTest, RegularFileIsNotShortcut)
+{
+   EXPECT_FALSE(isWindowsShortcut(targetFile_));
+}
+
+TEST_F(WindowsShortcutTest, DirectoryIsNotShortcut)
+{
+   EXPECT_FALSE(isWindowsShortcut(targetDir_));
+}
+
+TEST_F(WindowsShortcutTest, DirectoryNamedLnkIsNotShortcut)
+{
+   // a directory can be named *.lnk; only regular files are shortcuts
+   core::FilePath dir = baseDir_.completeChildPath("folder.lnk");
+   core::Error error = dir.ensureDirectory();
+   ASSERT_FALSE(error) << error.asString();
+   EXPECT_FALSE(isWindowsShortcut(dir));
+}
+
+TEST_F(WindowsShortcutTest, NonexistentPathIsNotShortcut)
+{
+   EXPECT_FALSE(isWindowsShortcut(baseDir_.completeChildPath("missing.lnk")));
+}
+
+TEST_F(WindowsShortcutTest, ResolvesShortcutToFile)
+{
+   core::FilePath shortcut = makeShortcut(targetFile_, "file-shortcut.lnk");
+   core::FilePath target;
+   bool targetIsDir = true;
+   core::Error error = resolveWindowsShortcut(shortcut, &target, &targetIsDir);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(targetFile_.getAbsolutePath(), target.getAbsolutePath());
+   EXPECT_FALSE(targetIsDir);
+}
+
+TEST_F(WindowsShortcutTest, ResolvesShortcutToDirectory)
+{
+   core::FilePath shortcut = makeShortcut(targetDir_, "dir-shortcut.lnk");
+   core::FilePath target;
+   bool targetIsDir = false;
+   core::Error error = resolveWindowsShortcut(shortcut, &target, &targetIsDir);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(targetDir_.getAbsolutePath(), target.getAbsolutePath());
+   EXPECT_TRUE(target.isDirectory());
+
+   // the link's stored attributes carry the target's directory-ness, so a
+   // caller can badge/navigate correctly without touching the target
+   EXPECT_TRUE(targetIsDir);
+}
+
+TEST_F(WindowsShortcutTest, ResolvesShortcutWithNonAsciiNames)
+{
+   // exercise the UTF-8 <-> UTF-16 boundary that every shortcut path
+   // crosses: FilePath stores UTF-8 while the shell link APIs speak
+   // UTF-16. "\xC3\xA9" is e-acute and "\xE6\x97\xA5\xE6\x9C\xAC" is
+   // Japanese 'nihon'; byte escapes keep this source file ASCII-only.
+   const std::string suffix = "-\xC3\xA9\xE6\x97\xA5\xE6\x9C\xAC";
+
+   core::FilePath target = baseDir_.completeChildPath("cible" + suffix + ".txt");
+   core::Error error = target.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+
+   core::FilePath shortcut = makeShortcut(target, "raccourci" + suffix + ".lnk");
+   EXPECT_TRUE(isWindowsShortcut(shortcut));
+
+   core::FilePath resolved;
+   bool targetIsDir = true;
+   error = resolveWindowsShortcut(shortcut, &resolved, &targetIsDir);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(target.getAbsolutePath(), resolved.getAbsolutePath());
+   EXPECT_FALSE(targetIsDir);
+
+   core::json::Object item = createFileSystemItem(shortcut);
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(createAliasedPath(target), item["alias_target"].getString());
+}
+
+TEST_F(WindowsShortcutTest, GarbageContentFailsToResolve)
+{
+   // any *.lnk regular file is treated as a shortcut (like Explorer), so
+   // non-shortcut content must surface as a resolution error, not a crash
+   core::FilePath garbage = baseDir_.completeChildPath("garbage.lnk");
+   core::Error error = core::writeStringToFile(garbage, "this is not a shell link");
+   ASSERT_FALSE(error) << error.asString();
+
+   EXPECT_TRUE(isWindowsShortcut(garbage));
+
+   core::FilePath target;
+   bool targetIsDir = false;
+   error = resolveWindowsShortcut(garbage, &target, &targetIsDir);
+   EXPECT_TRUE(static_cast<bool>(error));
+}
+
+TEST_F(WindowsShortcutTest, ResolveReturnsStoredPathWhenTargetDeleted)
+{
+   // DIVERGENCE from FinderAliasTest.ResolveFailsWhenTargetDeleted: a .lnk
+   // stores its target path, and resolveWindowsShortcut deliberately skips
+   // IShellLink::Resolve (no disk/network search during listings), so
+   // resolution still succeeds after the target is deleted. Broken-shortcut
+   // detection is createFileSystemItem's exists() check on the result.
+   core::FilePath doomed = baseDir_.completeChildPath("doomed.txt");
+   core::Error error = doomed.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+   core::FilePath shortcut = makeShortcut(doomed, "doomed-shortcut.lnk");
+   error = doomed.remove();
+   ASSERT_FALSE(error) << error.asString();
+
+   core::FilePath target;
+   bool targetIsDir = true;
+   error = resolveWindowsShortcut(shortcut, &target, &targetIsDir);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(doomed.getAbsolutePath(), target.getAbsolutePath());
+   EXPECT_FALSE(target.exists());
+   EXPECT_FALSE(targetIsDir);
+}
+
+TEST_F(WindowsShortcutTest, ResolvesStoredShortPathToLongForm)
+{
+   // home aliasing (createAliasedPath) and the client's duplicate-document
+   // detection are literal string comparisons, so a target reported in 8.3
+   // short form (C:\Users\RUNNER~1\...) fails to alias even when it lives
+   // under the home directory. Resolution must return the canonical long
+   // form regardless of the form the link stores. (The shell itself often
+   // canonicalizes at SetPath/Save time; the GetLongPathName call in
+   // resolveWindowsShortcut covers links where it did not.)
+   core::FilePath target = baseDir_.completeChildPath("long-target-name.txt");
+   core::Error error = target.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+
+   std::wstring wideTarget = toNativeSeparators(target.getAbsolutePathW());
+   wchar_t shortBuf[MAX_PATH];
+   DWORD length = ::GetShortPathNameW(wideTarget.c_str(), shortBuf, MAX_PATH);
+   ASSERT_GT(length, 0u) << "GetShortPathName failed";
+   ASSERT_LT(length, static_cast<DWORD>(MAX_PATH));
+
+   std::wstring shortForm(shortBuf, length);
+   if (shortForm == wideTarget)
+      GTEST_SKIP() << "8.3 short names are unavailable on this volume";
+
+   core::FilePath shortcut =
+         makeShortcut(core::FilePath(shortForm), "short-form-shortcut.lnk");
+
+   // when the shell canonicalized the target at SetPath/Save time, the
+   // stored form is already long and the assertion below would pass even
+   // without the GetLongPathName normalization; skip so a pass always
+   // means the short-to-long seam was actually exercised
+   std::wstring storedTarget;
+   ASSERT_TRUE(readStoredShortcutTarget(shortcut, &storedTarget));
+   if (storedTarget != shortForm)
+      GTEST_SKIP() << "shell canonicalized the stored target at Save time";
+
+   core::FilePath resolved;
+   bool targetIsDir = true;
+   error = resolveWindowsShortcut(shortcut, &resolved, &targetIsDir);
+   EXPECT_FALSE(error) << error.asString();
+   EXPECT_EQ(target.getAbsolutePath(), resolved.getAbsolutePath());
+   EXPECT_FALSE(targetIsDir);
+}
+
+// --- createFileSystemItem shortcut contract -----------------------------------
+//
+// The Files pane decides navigate-vs-open from 'dir' and substitutes
+// 'alias_target' for the clicked path, so a directory shortcut must carry the
+// target's directory-ness, not the .lnk file's. Unlike the macOS fixture,
+// %TEMP% lives under the user home, so emitted paths are home-aliased --
+// compare against createAliasedPath rather than raw absolute paths.
+
+TEST_F(WindowsShortcutTest, FileSystemItemForDirectoryShortcut)
+{
+   core::FilePath shortcut = makeShortcut(targetDir_, "dir-shortcut.lnk");
+   core::json::Object item = createFileSystemItem(shortcut);
+   EXPECT_TRUE(item["dir"].getBool());
+   ASSERT_TRUE(item.hasMember("is_shortcut"));
+   EXPECT_TRUE(item["is_shortcut"].getBool());
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(createAliasedPath(targetDir_), item["alias_target"].getString());
+}
+
+TEST_F(WindowsShortcutTest, FileSystemItemForFileShortcut)
+{
+   core::FilePath shortcut = makeShortcut(targetFile_, "file-shortcut.lnk");
+   core::json::Object item = createFileSystemItem(shortcut);
+   EXPECT_FALSE(item["dir"].getBool());
+   ASSERT_TRUE(item.hasMember("is_shortcut"));
+   EXPECT_TRUE(item["is_shortcut"].getBool());
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(createAliasedPath(targetFile_), item["alias_target"].getString());
+}
+
+TEST_F(WindowsShortcutTest, FileSystemItemForRegularFileHasNoShortcutFields)
+{
+   core::json::Object item = createFileSystemItem(targetFile_);
+   EXPECT_FALSE(item.hasMember("is_shortcut"));
+   EXPECT_FALSE(item.hasMember("alias_target"));
+}
+
+TEST_F(WindowsShortcutTest, FileSystemItemForNetworkShortcutKeepsTarget)
+{
+   // shortcuts to network targets are followed without probing the target
+   // during the listing -- stat'ing a disconnected share can block the
+   // session for seconds -- so even an unreachable UNC target keeps its
+   // alias_target. Directory-ness comes from the attributes stored in the
+   // link (none for an unreachable target, so false).
+   core::FilePath uncTarget("//pw-nonexistent-host-1f3a/share/data");
+   core::FilePath shortcut = makeShortcut(uncTarget, "unc-shortcut.lnk");
+
+   core::json::Object item = createFileSystemItem(shortcut);
+   ASSERT_TRUE(item.hasMember("is_shortcut"));
+   EXPECT_TRUE(item["is_shortcut"].getBool());
+   ASSERT_TRUE(item.hasMember("alias_target"));
+   EXPECT_EQ(createAliasedPath(uncTarget), item["alias_target"].getString());
+   EXPECT_FALSE(item["dir"].getBool());
+}
+
+TEST_F(WindowsShortcutTest, FileSystemItemForBrokenShortcut)
+{
+   // deleted target: still flagged for the badge, but no alias_target and
+   // plain-file dir-ness (resolution succeeds; the exists() check filters it)
+   core::FilePath doomed = baseDir_.completeChildPath("doomed.txt");
+   core::Error error = doomed.ensureFile();
+   ASSERT_FALSE(error) << error.asString();
+   core::FilePath shortcut = makeShortcut(doomed, "doomed-shortcut.lnk");
+   error = doomed.remove();
+   ASSERT_FALSE(error) << error.asString();
+
+   core::json::Object item = createFileSystemItem(shortcut);
+   ASSERT_TRUE(item.hasMember("is_shortcut"));
+   EXPECT_TRUE(item["is_shortcut"].getBool());
+   EXPECT_FALSE(item.hasMember("alias_target"));
+   EXPECT_FALSE(item["dir"].getBool());
+}
+
+#endif // _WIN32
+
+// ----------------------------------------------------------------------------
+// isPositAssistantInstallationEnabledByAdmin
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Restores RSTUDIO_DISABLE_POSIT_ASSISTANT_INSTALLATION on scope exit, so a
+// failing assertion cannot leak managed mode into later tests.
+// core::system::EnvironmentScope is the usual tool for this, but it always
+// sets a value; one test below needs the variable absent entirely. Presence is
+// captured with the two-argument getenv so a set-but-empty variable is
+// restored as set rather than unset.
+class ScopedInstallationEnvVar
+{
+public:
+   ScopedInstallationEnvVar()
+      : name_("RSTUDIO_DISABLE_POSIT_ASSISTANT_INSTALLATION")
+   {
+      hadValue_ = core::system::getenv(name_, &original_);
+   }
+
+   ~ScopedInstallationEnvVar()
+   {
+      if (hadValue_)
+         core::system::setenv(name_, original_);
+      else
+         core::system::unsetenv(name_);
+   }
+
+   void set(const std::string& value) { core::system::setenv(name_, value); }
+   void unset() { core::system::unsetenv(name_); }
+
+private:
+   std::string name_;
+   std::string original_;
+   bool hadValue_;
+};
+
+} // anonymous namespace
+
+TEST(PositAssistantInstallationTest, EnabledWhenEnvironmentVariableIsUnset)
+{
+   ScopedInstallationEnvVar envVar;
+   envVar.unset();
+
+   // posit-assistant-installation-enabled defaults to true, so this is the
+   // default state.
+   EXPECT_TRUE(module_context::isPositAssistantInstallationEnabledByAdmin());
+}
+
+TEST(PositAssistantInstallationTest, DisabledWhenEnvironmentVariableIsSet)
+{
+   ScopedInstallationEnvVar envVar;
+   envVar.set("1");
+
+   EXPECT_FALSE(module_context::isPositAssistantInstallationEnabledByAdmin());
+}
+
+TEST(PositAssistantInstallationTest, AnyNonEmptyEnvironmentVariableValueDisables)
+{
+   // Documented as "non-empty", matching RSTUDIO_DISABLE_POSIT_ASSISTANT: even
+   // "0" and "false" disable, because only emptiness is tested.
+   ScopedInstallationEnvVar envVar;
+
+   envVar.set("0");
+   EXPECT_FALSE(module_context::isPositAssistantInstallationEnabledByAdmin());
+
+   envVar.set("false");
+   EXPECT_FALSE(module_context::isPositAssistantInstallationEnabledByAdmin());
+}
+
+TEST(PositAssistantInstallationTest, EmptyEnvironmentVariableLeavesInstallationEnabled)
+{
+   ScopedInstallationEnvVar envVar;
+   envVar.set("");
+
+   EXPECT_TRUE(module_context::isPositAssistantInstallationEnabledByAdmin());
+}
+
+// isTextFile() with file(1) unavailable, missing, or answering (#19435)
+class IsTextFileTest : public ::testing::Test
+{
+protected:
+   void TearDown() override
+   {
+      for (core::FilePath& file : tempFiles_)
+         file.removeIfExists();
+   }
+
+   core::FilePath makeTempFile(const std::string& extension,
+                               const std::string& contents)
+   {
+      core::FilePath path;
+      core::Error error = core::FilePath::tempFilePath(extension, path);
+      EXPECT_FALSE(error) << error.asString();
+      error = core::writeStringToFile(path, contents);
+      EXPECT_FALSE(error) << error.asString();
+      tempFiles_.push_back(path);
+      return path;
+   }
+
+   // a file with exactly the given name, in a fresh temp directory
+   core::FilePath makeNamedTempFile(const std::string& name,
+                                    const std::string& contents)
+   {
+      core::FilePath dir;
+      core::Error error = core::FilePath::tempFilePath(dir);
+      EXPECT_FALSE(error) << error.asString();
+      error = dir.ensureDirectory();
+      EXPECT_FALSE(error) << error.asString();
+      tempFiles_.push_back(dir);
+
+      core::FilePath path = dir.completeChildPath(name);
+      error = core::writeStringToFile(path, contents);
+      EXPECT_FALSE(error) << error.asString();
+      return path;
+   }
+
+   static std::string binaryContents()
+   {
+      std::string contents = "PK";
+      contents.push_back('\0');
+      contents.push_back('\0');
+      contents += "payload";
+      return contents;
+   }
+
+#ifndef _WIN32
+   // a stand-in for file(1) that always answers with the given mime type
+   core::FilePath makeFileCommand(const std::string& mimeType)
+   {
+      core::FilePath script = makeTempFile(".sh", "#!/bin/sh\necho '" + mimeType + "'\n");
+      core::Error error = script.changeFileMode(core::FileMode::USER_READ_WRITE_EXECUTE);
+      EXPECT_FALSE(error) << error.asString();
+      return script;
+   }
+#endif
+
+   std::vector<core::FilePath> tempFiles_;
+};
+
+TEST_F(IsTextFileTest, KnownLockFilesAreTextByName)
+{
+   // answered from the name alone: even binary contents are not inspected
+   core::FilePath renvLock = makeNamedTempFile("renv.lock", binaryContents());
+   EXPECT_TRUE(isTextFile(renvLock, core::FilePath()));
+
+   // other .lock files are inspected, as some (git's index.lock) are binary
+   core::FilePath textLock = makeNamedTempFile("other.lock", "{}\n");
+   EXPECT_TRUE(isTextFile(textLock, core::FilePath()));
+
+   core::FilePath indexLock = makeNamedTempFile("index.lock", binaryContents());
+   EXPECT_FALSE(isTextFile(indexLock, core::FilePath()));
+}
+
+TEST_F(IsTextFileTest, UnavailableFileCommandInspectsContents)
+{
+   core::FilePath text = makeTempFile(".unmapped19435", "all: build\n");
+   EXPECT_TRUE(isTextFile(text, core::FilePath()));
+
+   core::FilePath binary = makeTempFile(".unmapped19435", binaryContents());
+   EXPECT_FALSE(isTextFile(binary, core::FilePath()));
+}
+
+TEST_F(IsTextFileTest, ContentInspectionRejectsAnyNullOutsideUtf16)
+{
+   // a single null byte marks binary data; requiring two in a row let most
+   // encrypted files through
+   std::string lone = "all: build";
+   lone.push_back('\0');
+   lone += "\n";
+   core::FilePath loneNull = makeTempFile(".unmapped19435", lone);
+   EXPECT_FALSE(isTextFile(loneNull, core::FilePath()));
+
+   // UTF-16LE with a BOM: "a" then U+4E00, whose bytes straddle a null pair
+   const char utf16[] = "\xFF\xFE" "a\0" "\0\x4E" "\n\0";
+   core::FilePath utf16Text = makeTempFile(".unmapped19435", std::string(utf16, sizeof(utf16) - 1));
+   EXPECT_TRUE(isTextFile(utf16Text, core::FilePath()));
+
+   // ... but a null code unit is still binary
+   const char utf16Null[] = "\xFF\xFE" "a\0" "\0\0" "\n\0";
+   core::FilePath utf16Binary = makeTempFile(".unmapped19435", std::string(utf16Null, sizeof(utf16Null) - 1));
+   EXPECT_FALSE(isTextFile(utf16Binary, core::FilePath()));
+}
+
+#ifndef _WIN32
+
+TEST_F(IsTextFileTest, MissingFileCommandInspectsContents)
+{
+   // the command runs through the shell, which exits 127 with nothing on
+   // stdout when the program does not exist; that used to read as "binary"
+   core::FilePath missing("/nonexistent/rstudio-19435/file");
+   ASSERT_FALSE(missing.exists());
+
+   core::FilePath text = makeTempFile(".unmapped19435", "all: build\n");
+   EXPECT_TRUE(isTextFile(text, missing));
+
+   core::FilePath binary = makeTempFile(".unmapped19435", binaryContents());
+   EXPECT_FALSE(isTextFile(binary, missing));
+}
+
+// The stand-ins for file(1) are scripts in the temp directory. Where that is
+// mounted noexec they cannot answer, which would fail these tests or let them
+// pass via the content fallback, so skip them instead.
+class IsTextFileStandInTest : public IsTextFileTest
+{
+protected:
+   void SetUp() override
+   {
+      core::FilePath probe = makeFileCommand("text/plain");
+      core::system::ProcessResult result;
+      core::Error error = core::system::runCommand(
+         core::shell_utils::escape(probe),
+         core::system::ProcessOptions(),
+         &result);
+
+      if (error || result.exitStatus != 0)
+         GTEST_SKIP() << "cannot run scripts in " << probe.getParent().getAbsolutePath();
+   }
+};
+
+TEST_F(IsTextFileStandInTest, FileCommandAnswerIsHonored)
+{
+   // when file(1) does answer, its verdict wins over the content heuristic
+   core::FilePath text = makeTempFile(".unmapped19435", "all: build\n");
+   EXPECT_FALSE(isTextFile(text, makeFileCommand("application/octet-stream")));
+
+   core::FilePath binary = makeTempFile(".unmapped19435", binaryContents());
+   EXPECT_TRUE(isTextFile(binary, makeFileCommand("text/plain; charset=us-ascii")));
+}
+
+TEST_F(IsTextFileStandInTest, EmptyFileCommandAnswerInspectsContents)
+{
+   core::FilePath text = makeTempFile(".unmapped19435", "all: build\n");
+   EXPECT_TRUE(isTextFile(text, makeFileCommand("")));
+
+   core::FilePath binary = makeTempFile(".unmapped19435", binaryContents());
+   EXPECT_FALSE(isTextFile(binary, makeFileCommand("")));
+}
+
+#endif
+
+} // namespace tests
+} // namespace module_context
+} // namespace session
+} // namespace rstudio

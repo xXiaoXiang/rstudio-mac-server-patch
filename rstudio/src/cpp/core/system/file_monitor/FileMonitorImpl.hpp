@@ -1,0 +1,149 @@
+/*
+ * FileMonitorImpl.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef CORE_SYSTEM_FILE_MONITOR_IMPL_HPP
+#define CORE_SYSTEM_FILE_MONITOR_IMPL_HPP
+
+#include <string>
+#include <algorithm>
+#include <list>
+
+#include <boost/bind/bind.hpp>
+
+#include <shared_core/FilePath.hpp>
+#include <core/collection/Tree.hpp>
+
+#include <core/system/FileChangeEvent.hpp>
+
+#include <core/system/FileMonitor.hpp>
+
+using namespace boost::placeholders;
+
+namespace rstudio {
+namespace core {   
+namespace system {
+namespace file_monitor {
+namespace impl {
+
+Error processFileAdded(
+               tree<FileInfo>::iterator parentIt,
+               const FileChangeEvent& fileChange,
+               bool recursive,
+               const boost::function<bool(const FileInfo&)>& filter,
+               const boost::function<Error(const FileInfo&)>& onBeforeScanDir,
+               tree<FileInfo>* pTree,
+               std::vector<FileChangeEvent>* pFileChanges);
+
+inline Error processFileAdded(
+               tree<FileInfo>::iterator parentIt,
+               const FileChangeEvent& fileChange,
+               bool recursive,
+               const boost::function<bool(const FileInfo&)>& filter,
+               tree<FileInfo>* pTree,
+               std::vector<FileChangeEvent>* pFileChanges)
+{
+   return processFileAdded(parentIt,
+                           fileChange,
+                           recursive,
+                           filter,
+                           boost::function<Error(const FileInfo&)>(),
+                           pTree,
+                           pFileChanges);
+}
+
+void processFileModified(tree<FileInfo>::iterator parentIt,
+                         const FileChangeEvent& fileChange,
+                         tree<FileInfo>* pTree,
+                         std::vector<FileChangeEvent>* pFileChanges);
+
+void processFileRemoved(tree<FileInfo>::iterator parentIt,
+                        const FileChangeEvent& fileChange,
+                        bool recursive,
+                        tree<FileInfo>* pTree,
+                        std::vector<FileChangeEvent>* pFileChanges);
+
+// Locate a path by descending from the root, scanning one level of siblings
+// at a time. Events for paths absent from the tree (build output churn) are
+// common, so this avoids a full-tree walk per event.
+tree<FileInfo>::iterator findPath(tree<FileInfo>* pTree, const std::string& path);
+
+// Discard stale descendants when a previously observed directory is filtered.
+// Retain the directory as incomplete so a later accepted event can recover it.
+void invalidateDirectory(
+   const FileInfo& fileInfo,
+   tree<FileInfo>* pTree,
+   const boost::function<void(const std::vector<FileChangeEvent>&)>& onFilesChanged);
+
+// A recursive monitor must rebuild failed subtrees even when the current
+// event ordinarily requests only a shallow scan. While a recursive rescan
+// from the root is already pending, subtree scans are left to that rescan.
+Error discoverAndProcessFileChanges(
+   const FileInfo& fileInfo,
+   bool recursive,
+   const boost::function<bool(const FileInfo&)>& filter,
+   const boost::function<Error(const FileInfo&)>& onBeforeScanDir,
+   tree<FileInfo>* pTree,
+   const boost::function<void(const std::vector<FileChangeEvent>&)>&
+                                                            onFilesChanged,
+   bool recursiveMonitor = false,
+   bool rescanPending = false);
+
+inline Error discoverAndProcessFileChanges(
+   const FileInfo& fileInfo,
+   bool recursive,
+   const boost::function<bool(const FileInfo&)>& filter,
+   tree<FileInfo>* pTree,
+   const boost::function<void(const std::vector<FileChangeEvent>&)>&
+                                                            onFilesChanged,
+   bool recursiveMonitor = false,
+   bool rescanPending = false)
+{
+   return discoverAndProcessFileChanges(
+                                 fileInfo,
+                                 recursive,
+                                 filter,
+                                 boost::function<Error(const FileInfo&)>(),
+                                 pTree,
+                                 onFilesChanged,
+                                 recursiveMonitor,
+                                 rescanPending);
+}
+
+template <typename Iterator>
+Iterator findFile(Iterator begin, Iterator end, const std::string& path)
+{
+   return std::find_if(begin, end, boost::bind(fileInfoHasPath,
+                                               _1,
+                                               path));
+}
+
+template <typename Iterator>
+Iterator findFile(Iterator begin, Iterator end, const FileInfo& fileInfo)
+{
+   return findFile(begin, end, fileInfo.absolutePath());
+}
+
+std::list<void*> activeEventContexts();
+
+
+} // namespace impl
+} // namespace file_monitor
+} // namespace system
+} // namespace core 
+} // namespace rstudio
+
+#endif // CORE_SYSTEM_FILE_MONITOR_IMPL_HPP
+
+

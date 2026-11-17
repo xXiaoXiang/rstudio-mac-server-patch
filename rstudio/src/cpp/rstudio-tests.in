@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+
+SCRIPT="${BASH_SOURCE[0]}"
+DIR="$(dirname "${SCRIPT}")"
+
+# rsession reliably SEGFAULTs during teardown of the r-scope tests on
+# macOS when stdin isn't a TTY -- the test bodies pass but the process
+# exits 139, which reads as a real failure. Re-invoke under `script` so
+# a controlling TTY is always present. RSTUDIO_TESTS_UNDER_SCRIPT guards
+# against infinite recursion if the re-exec somehow doesn't yield a TTY.
+if [ "$(uname)" = "Darwin" ] && [ ! -t 0 ] && [ -z "${RSTUDIO_TESTS_UNDER_SCRIPT}" ]; then
+   export RSTUDIO_TESTS_UNDER_SCRIPT=1
+   exec script -q /dev/null "${SCRIPT}" "$@"
+fi
+
+# Our macOS build machines currently run on arm64, but the rsession
+# binary we produce (in the default location) is built with x86_64.
+# Ensure that an x86_64 version of R is placed on the PATH first so
+# that the correct R is used for tests.
+if [ "$(uname)" = "Darwin" ] && [ -n "${JENKINS_URL}" ]; then
+   PATH="/usr/local/bin:${PATH}"
+fi
+
+read -r -d '' USAGE <<- EOF
+Run RStudio unit tests. Available flags:
+
+--help           Show this help.
+--scope          Run only tests with the given scope (core, rserver, rsession, r).
+--filter         Run a subset of R tests, matching the requested filter.
+--only-database  Restrict the rserver scope to the database-backed fixture tests.
+EOF
+
+section () {
+    echo -e "\033[1;94m==>\033[0m \033[1;97m$1\033[0m"
+}
+
+error () {
+    echo -e "\033[1;91mERROR: $1\033[0m";
+    exit 1
+}
+
+setupSessionTestEnvironment() {
+   # Each session test scope needs fresh state, even when the caller already
+   # sets these variables for a running IDE or another test invocation.
+   local TEST_STATE_DIR
+   TEST_STATE_DIR=$(mktemp -d -t rstudio-tests-XXXXXXXXXX) ||
+      error "Unable to create temporary session test directory"
+   export RSTUDIO_DATA_HOME="${TEST_STATE_DIR}/data"
+   export RSTUDIO_CONFIG_HOME="${TEST_STATE_DIR}/config"
+   # Prevent startup from migrating the user's legacy RStudio state here.
+   mkdir -p "${RSTUDIO_DATA_HOME}/client-state" "${RSTUDIO_CONFIG_HOME}" ||
+      error "Unable to initialize temporary session test directory"
+
+   # The session binds its socket in RS_SESSION_TMP_DIR, and won't take over
+   # one that another process is listening on, so concurrent test runs each
+   # need their own. Kept short, as socket paths are limited to ~100 bytes
+   # (macOS's TMPDIR alone is ~50).
+   RS_SESSION_TMP_DIR=$(mktemp -d /tmp/rstudio-tests-XXXXXX) ||
+      error "Unable to create temporary session stream directory"
+   export RS_SESSION_TMP_DIR
+   SESSION_TMP_DIRS+=("${RS_SESSION_TMP_DIR}")
+}
+
+# session stream directories created by setupSessionTestEnvironment
+SESSION_TMP_DIRS=()
+removeSessionTmpDirs() {
+   if [ "${#SESSION_TMP_DIRS[@]}" -gt 0 ]; then
+      rm -rf "${SESSION_TMP_DIRS[@]}"
+   fi
+}
+trap removeSessionTmpDirs EXIT
+
+checkRUnitTestFailure() {
+   FAILURES=$(cat "@CMAKE_CURRENT_BINARY_DIR@/testthat-failures.log")
+   if [ "${FAILURES}" != "0" ]; then
+      echo "DIAGNOSTICS: checkRUnitTestFailure flagging a failure: FAILURES=${FAILURES}"
+      UNIT_TEST_FAILURE=true
+   fi
+}
+
+# finds libSegFault.so, and sets RSESSION_DIAGNOSTICS_LIBSEGFAULT
+# as a side effect
+findLibSegFault() {
+
+   # not available on macOS
+   if [ "$(uname)" = "Darwin" ]; then
+      return 0
+   fi
+
+   # if already set, nothing to do
+   if [ -n "${RSESSION_DIAGNOSTICS_LIBSEGFAULT}" ]; then
+      return 0
+   fi
+
+   # look in common locations
+   CANDIDATES=(
+      /usr/lib/x86_64-linux-gnu/libSegFault.so
+      /lib/x86_64-linux-gnu/libSegFault.so
+      /usr/lib/i386-linux-gnu/libSegFault.so
+      /lib/i386-linux-gnu/libSegFault.so
+      /usr/lib/aarch64-linux-gnu/libSegFault.so
+      /lib/aarch64-linux-gnu/libSegFault.so
+      /lib64/libSegFault.so
+      /lib/libSegFault.so
+   )
+
+   for CANDIDATE in "${CANDIDATES[@]}"; do
+      if [ -e "${CANDIDATE}" ]; then
+         RSESSION_DIAGNOSTICS_LIBSEGFAULT="${CANDIDATE}"
+         return 0
+      fi
+   done
+
+   echo "WARNING: Could not find libSegFault.so"
+
+}
+
+# Symbolizes module-relative offsets from libSegFault's report using the exact
+# split-debug file produced next to package-build executables. This works even
+# when a core collector such as Apport consumes or discards the core dump, and
+# resolves local/static functions that are not available through .dynsym.
+symbolizeCrashBacktrace() {
+
+   # Linux package builds are ELF; macOS crash reports use a different path.
+   if [ "$(uname)" = "Darwin" ]; then
+      return 0
+   fi
+
+   local BINARY CRASH_LOG BINARY_NAME SYMBOL_FILE
+   BINARY="${1%% *}"
+   CRASH_LOG="$2"
+   BINARY_NAME="${BINARY##*/}"
+   SYMBOL_FILE="${BINARY}.debug"
+
+   if [ ! -s "${CRASH_LOG}" ]; then
+      return 0
+   fi
+
+   if ! command -v addr2line &> /dev/null; then
+      echo "WARNING: addr2line is not available; cannot symbolize crash offsets"
+      return 0
+   fi
+
+   # Development builds are not split, so fall back to the executable itself.
+   if [ ! -r "${SYMBOL_FILE}" ]; then
+      SYMBOL_FILE="${BINARY}"
+   fi
+
+   local -a OFFSETS=()
+   while IFS= read -r OFFSET; do
+      OFFSETS+=("${OFFSET}")
+   done < <(
+      awk -v binaryName="${BINARY_NAME}" '
+         {
+            marker = binaryName "(+"
+            pos = index($0, marker)
+            if (pos == 0)
+               next
+
+            offset = substr($0, pos + length(marker))
+            sub(/\).*/, "", offset)
+            if (offset ~ /^0x[[:xdigit:]]+$/)
+               print offset
+         }
+      ' "${CRASH_LOG}"
+   )
+
+   if [ "${#OFFSETS[@]}" -eq 0 ]; then
+      return 0
+   fi
+
+   echo "Symbolized ${BINARY_NAME} backtrace (${SYMBOL_FILE}):"
+   addr2line -a -C -f -i -p -e "${SYMBOL_FILE}" "${OFFSETS[@]}" ||
+      echo "WARNING: addr2line failed to symbolize ${BINARY_NAME}"
+
+}
+
+# attempts to print a stack trace from the core dump left behind by a
+# crashed test process. libSegFault covers most crashes, but not those
+# where a signal handler cannot run (e.g. stack overflow), and it was
+# removed altogether from glibc 2.35+.
+dumpCoreBacktrace() {
+
+   # not supported on macOS (core dumps are disabled by default there;
+   # crash reports land in ~/Library/Logs/DiagnosticReports instead)
+   if [ "$(uname)" = "Darwin" ]; then
+      return 0
+   fi
+
+   local BINARY CORE_STAMP
+   BINARY="${1%% *}"   # strip arguments when passed as a single string
+   CORE_STAMP="$2"
+
+   if ! command -v gdb &> /dev/null; then
+      echo "WARNING: gdb is not available; cannot dump a core backtrace"
+      return 0
+   fi
+
+   # figure out where the kernel puts core dumps. a relative core_pattern
+   # resolves against the crashed process's working directory (our own);
+   # a piped pattern hands the dump to a collector like systemd-coredump
+   local CORE_PATTERN
+   CORE_PATTERN="$(cat /proc/sys/kernel/core_pattern 2> /dev/null)"
+
+   local SEARCH_DIRS=("${PWD}")
+   case "${CORE_PATTERN}" in
+   /*)
+      SEARCH_DIRS+=("$(dirname "${CORE_PATTERN}")")
+      ;;
+   esac
+
+   # apport extracts core dumps here on newer Ubuntu
+   if [ -d /var/lib/apport/coredump ]; then
+      SEARCH_DIRS+=(/var/lib/apport/coredump)
+   fi
+
+   local DIR CORE FOUND=false
+   for DIR in "${SEARCH_DIRS[@]}"; do
+      while IFS= read -r -d '' CORE; do
+         FOUND=true
+         echo "Crash detected. Dumping backtrace from ${CORE}..."
+         # cap the frame count; a stack overflow otherwise dumps thousands
+         gdb -q -batch -ex 'thread apply all backtrace 100' "${BINARY}" "${CORE}"
+         # remove the core so it doesn't accumulate in reused CI workspaces
+         rm -f "${CORE}"
+      done < <(find "${DIR}" -maxdepth 1 -type f \( -name 'core*' -o -name '*.core' \) -newer "${CORE_STAMP}" -print0 2> /dev/null)
+   done
+
+   if [ "${FOUND}" = "true" ]; then
+      return 0
+   fi
+
+   # cores may have been handed to systemd-coredump; give it a moment to
+   # finish processing, then report the most recent dump for this binary
+   if command -v coredumpctl &> /dev/null; then
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+         if coredumpctl -q --no-pager list "${BINARY}" &> /dev/null; then
+            echo "Crash detected. Dumping backtrace via coredumpctl..."
+            coredumpctl -q --no-pager -1 info "${BINARY}"
+            return 0
+         fi
+         sleep 1
+      done
+   fi
+
+   echo "WARNING: process crashed but no core dump was found (core_pattern: ${CORE_PATTERN})"
+
+}
+
+# attaches gdb to a hung test process and prints a backtrace of each thread
+dumpHangBacktrace() {
+
+   local PID="$1"
+
+   if ! command -v gdb &> /dev/null; then
+      echo "WARNING: gdb is not available; cannot dump a backtrace"
+      return 0
+   fi
+
+   # gdb isn't an ancestor of the test process, so under Yama ptrace
+   # restrictions attaching usually needs root; try without sudo first (root,
+   # or ptrace unrestricted).
+   # sudo -n fails rather than prompting: a password prompt nobody answers
+   # (output sent to a log, or an unattended run) would block forever.
+   # gdb exits 0 even when the attach fails, so look for a frame instead
+   local OUTPUT
+   OUTPUT="$(gdb -q -batch -ex 'thread apply all backtrace' -p "${PID}" 2>&1)"
+   if ! grep -q '^#0 ' <<< "${OUTPUT}" && [ "$(id -u)" != "0" ]; then
+      # keep the first attempt's error (e.g. the ptrace refusal) in the log
+      echo "${OUTPUT}"
+      OUTPUT="$(sudo -n gdb -q -batch -ex 'thread apply all backtrace' -p "${PID}" 2>&1)"
+   fi
+
+   echo "${OUTPUT}"
+   if ! grep -q '^#0 ' <<< "${OUTPUT}"; then
+      echo "WARNING: could not collect a backtrace"
+   fi
+
+}
+
+runWatchdogProcess() {
+
+   TIMEOUTS=(gtimeout timeout)
+   for TIMEOUT in "${TIMEOUTS[@]}"; do
+      if command -v "${TIMEOUT}" &> /dev/null; then
+         TIMEOUT_CMD="${TIMEOUT}"
+         break
+      fi
+   done
+
+   if [ -z "${TIMEOUT_CMD}" ]; then
+      echo "WARNING: 'timeout' utility is not available; hangs will not be diagnosed"
+   fi
+
+   timeout="$1"
+   shift
+
+   privileged="$1"
+   shift
+
+   command="$1"
+   shift
+
+   local PRELOAD
+   if [ "$(uname)" = "Darwin" ]; then
+      PRELOAD="DYLD_INSERT_LIBRARIES=${R_LIB_DIR}/libR.dylib"
+   else
+      PRELOAD="LD_PRELOAD=${RSESSION_DIAGNOSTICS_LIBSEGFAULT}"
+   fi
+
+   # Ask libSegFault to write its report to a file so that module-relative
+   # offsets can be resolved against the exact split-debug file after a crash.
+   # The report is echoed back to the build log before its symbolized form.
+   local CRASH_LOG
+   CRASH_LOG="$(mktemp)"
+
+   # The sh wrapper records the test process's PID (exec keeps it), so a hang
+   # is handled without searching by command line, which can miss the process
+   # or match another one started from the same binary.
+   local PID_FILE
+   PID_FILE="$(mktemp)"
+
+   # enable core dumps so we can extract a backtrace if the process crashes.
+   # SEGFAULT_USE_ALTSTACK makes libSegFault report stack-overflow crashes,
+   # which otherwise die silently (the handler cannot run on the exhausted
+   # stack without an alternate one)
+   FULL_COMMAND="ulimit -c unlimited 2> /dev/null; /bin/sh -c 'echo \$\$ > \"\$0\"; exec \"\$@\"' \"${PID_FILE}\" env SEGFAULT_SIGNALS=\"abrt segv\" SEGFAULT_USE_ALTSTACK=1 SEGFAULT_OUTPUT_NAME=\"${CRASH_LOG}\" ${PRELOAD} ${command} $*; exit"
+
+   # timestamp marker so we only examine core dumps generated by this run
+   local CORE_STAMP
+   CORE_STAMP="$(mktemp)"
+
+   # centos6 doesn't support the --foreground option for timeout
+   if [ "${OPERATING_SYSTEM}" = "centos_6" ] || [ -z "${TIMEOUT_CMD}" ]; then
+      if [ "${privileged}" = "true" ]; then
+         sudo /bin/bash -c "${FULL_COMMAND}"
+      else
+         /bin/bash -c "${FULL_COMMAND}"
+      fi
+   else
+      if [ "${privileged}" = "true" ]; then
+         sudo "${TIMEOUT_CMD}" --foreground "${timeout}" /bin/bash -c "${FULL_COMMAND}"
+      else
+         "${TIMEOUT_CMD}" --foreground "${timeout}" /bin/bash -c "${FULL_COMMAND}"
+      fi
+   fi
+
+   RETCODE="$?"
+   if [ "${RETCODE}" = "124" ]; then
+      # process is hanging - use gdb to collect a stack trace to find out why
+      echo "Hang detected. Dumping backtrace..."
+      local PID
+      PID="$(cat "${PID_FILE}")"
+      if [ -z "${PID}" ]; then
+         echo "WARNING: could not find the hung test process"
+      else
+         dumpHangBacktrace "${PID}"
+
+         # privileged runs only happen as root, so no sudo is needed here
+         kill -9 "${PID}" || echo "WARNING: could not kill hung test process ${PID}"
+      fi
+      UNIT_TEST_FAILURE=true
+   elif [ "${RETCODE}" != "0" ]; then
+      echo "DIAGNOSTICS: runWatchDogProcess flagging a failure: RETCODE=${RETCODE}"
+
+      # exit codes above 128 indicate death by signal; try to produce a
+      # symbolized trace from libSegFault, then inspect a core dump (when one
+      # survived the host's core collector) for full thread/register context
+      if [ "${RETCODE}" -gt 128 ]; then
+         if [ -s "${CRASH_LOG}" ]; then
+            cat "${CRASH_LOG}"
+         fi
+         symbolizeCrashBacktrace "${command}" "${CRASH_LOG}"
+         dumpCoreBacktrace "${command}" "${CORE_STAMP}"
+      fi
+
+      UNIT_TEST_FAILURE=true
+   fi
+
+   rm -f "${CORE_STAMP}" "${CRASH_LOG}" "${PID_FILE}"
+
+}
+
+has-scope () {
+   [ -z "${TEST_SCOPE}" ] || [ "${TEST_SCOPE}" = "$1" ]
+}
+
+while [ $# -gt 0 ]; do
+   case "$1" in
+
+   "--scope")
+
+      if [ -z "$2" ]; then
+         echo "Usage: ./rstudio-tests --scope [core|rserver|rsession|r]"
+         exit 1
+      fi
+
+      TEST_SCOPE="$2"
+      shift 2
+
+   ;;
+
+   "--filter")
+
+      # used for filtering to a subset of R testthat tests; previously
+      # implied --scope r, but only when --filter came first. Now scope
+      # is taken from --scope if given (so `--scope r --filter foo` works
+      # in either order), and we still default to r when --filter is the
+      # only narrowing option.
+      if [ -z "$2" ]; then
+         echo "Usage: ./rstudio-tests --filter <pattern>"
+         exit 1
+      fi
+
+      TEST_FILTER="$2"
+      if [ -z "${TEST_SCOPE}" ]; then
+         TEST_SCOPE="r"
+      fi
+      shift 2
+
+   ;;
+
+   "--only-database")
+      ONLY_DATABASE=true
+      shift
+
+   ;;
+
+   "--help")
+      echo "${USAGE}"
+      exit 0
+
+   ;;
+
+   *)
+      echo "Unknown argument: $1"
+      echo "${USAGE}"
+      exit 1
+
+   ;;
+
+   esac
+done
+
+# try to find libSegFault if available
+findLibSegFault
+
+## On a Debug Mac IDE build via xcodebuild, the executables
+## will be in a Debug folder
+if [ ! -e "@CMAKE_CURRENT_BINARY_DIR@/core/rstudio-core-tests" ]; then
+    RSTUDIO_CORETEST_BIN="Debug/rstudio-core-tests"
+    RSTUDIO_SESSION_BIN="Debug/rsession"
+else
+    RSTUDIO_CORETEST_BIN="rstudio-core-tests"
+    RSTUDIO_SESSION_BIN="rsession"
+fi
+
+# marker for rsession to detect that --run-tests was launched via this helper
+export RSTUDIO_TESTS_HELPER=1
+
+# set R environment variables needed by rsession tests (from CMake configuration)
+export R_HOME="@LIBR_HOME@"
+export R_DOC_DIR="@LIBR_DOC_DIR@"
+export R_LIB_DIR="@LIBR_LIB_DIR@"
+
+# ensure the configured R is found first in PATH
+export PATH="@LIBR_BIN_DIR@:${PATH}"
+
+# ensure R shared libraries can be found at runtime
+if [ "$(uname)" = "Darwin" ]; then
+   export DYLD_FALLBACK_LIBRARY_PATH="${R_LIB_DIR}:${DYLD_FALLBACK_LIBRARY_PATH}"
+else
+   export LD_LIBRARY_PATH="${R_LIB_DIR}:${LD_LIBRARY_PATH}"
+fi
+
+# Hack: on RHEL9 (docker), the reported R_DOC_DIR doesn't exist which triggers
+# test failures; create the folder if missing. Try without sudo first (root,
+# or a user-writable parent); sudo -n, as an unanswered password prompt would
+# block an unattended run
+if [ ! -e "${R_DOC_DIR}" ]; then
+   mkdir "${R_DOC_DIR}" 2> /dev/null ||
+      sudo -n mkdir "${R_DOC_DIR}" ||
+      echo "WARNING: could not create ${R_DOC_DIR}"
+fi
+
+UNIT_TEST_FAILURE=false
+
+# Run core tests
+if has-scope "core"; then
+
+   section "Running 'core' tests"
+
+   # Run only the tests that don't require root 
+   runWatchdogProcess 5m false "@CMAKE_CURRENT_BINARY_DIR@/core/${RSTUDIO_CORETEST_BIN}" 
+   
+   # Invoke the *DropPrivTests separately because they must run as root
+   # We need separate invocations because we cannot restore privs between test cases of PermanentlyDropPrivs
+   # Only run these when already running as root (skip on local dev machines to avoid sudo prompts)
+   if [ "$(id -u)" = "0" ]; then
+      runWatchdogProcess 5m true "@CMAKE_CURRENT_BINARY_DIR@/core/${RSTUDIO_CORETEST_BIN} --gtest_filter='PosixTestsRequiresPrivilege.DISABLED_PermanentlyDropPrivUsesPrimaryGroup' --gtest_also_run_disabled_tests"
+      runWatchdogProcess 5m true "@CMAKE_CURRENT_BINARY_DIR@/core/${RSTUDIO_CORETEST_BIN} --gtest_filter='PosixTestsRequiresPrivilege.DISABLED_PermanentlyDropPrivUsesAlternateGroup' --gtest_also_run_disabled_tests"
+      runWatchdogProcess 5m true "@CMAKE_CURRENT_BINARY_DIR@/core/${RSTUDIO_CORETEST_BIN} --gtest_filter='PosixTestsRequiresPrivilege.DISABLED_PermanentlyDropPrivChecksGroupMembership' --gtest_also_run_disabled_tests"
+   fi 
+
+   if [ -e "@CMAKE_CURRENT_BINARY_DIR@/server_core/rstudio-server-core-tests" ]; then
+      section "Running 'server_core' tests"
+      runWatchdogProcess 5m false "@CMAKE_CURRENT_BINARY_DIR@/server_core/rstudio-server-core-tests"
+   fi
+
+   if [ -e "@CMAKE_CURRENT_BINARY_DIR@/shared_core/rstudio-shared-core-tests" ]; then
+      section "Running 'shared_core' tests"
+      runWatchdogProcess 5m false "@CMAKE_CURRENT_BINARY_DIR@/shared_core/rstudio-shared-core-tests"
+   fi
+
+fi
+
+# Run server tests
+if has-scope "rserver"; then
+
+   if [ -e "@CMAKE_CURRENT_BINARY_DIR@/server/rserver-tests" ]; then
+      section "Running 'rserver' tests..."
+      cd server
+      # Database-backed fixture tests (named *IntegrationTest) run alongside
+      # the rest of the suite by default; --only-database narrows to just those.
+      RSERVER_TESTS_ARGS=""
+      if [ "${ONLY_DATABASE:-false}" = "true" ]; then
+         RSERVER_TESTS_ARGS="--only-database"
+      fi
+      runWatchdogProcess 5m false "@CMAKE_CURRENT_BINARY_DIR@/server/rserver-tests ${RSERVER_TESTS_ARGS}"
+      cd ..
+   fi
+
+fi
+
+# Setup for rsession tests
+if [ -e "@CMAKE_CURRENT_BINARY_DIR@/conf/rsession-dev.conf" ]; then
+   SESSION_CONF_FILE="@CMAKE_CURRENT_BINARY_DIR@/conf/rsession-dev.conf"
+else
+   SESSION_CONF_FILE="@CMAKE_CURRENT_BINARY_DIR@/conf/rdesktop-dev.conf"
+fi
+
+if has-scope "rsession"; then
+
+   setupSessionTestEnvironment
+   section "Running 'rsession' tests"
+   runWatchdogProcess 5m false                                    \
+      "@CMAKE_CURRENT_BINARY_DIR@/session/${RSTUDIO_SESSION_BIN}" \
+      --run-tests                                                 \
+      --config-file="${SESSION_CONF_FILE}"
+
+fi
+
+if has-scope "r"; then
+
+   setupSessionTestEnvironment
+   section "Running 'r' tests"
+
+   # Set process-wide environment before rsession starts any worker threads.
+   # Mutating environ later from R can race libc-internal readers (for example,
+   # gettext reading LANGUAGE while formatting an error on a worker thread).
+   if [ -n "${JENKINS_URL}" ] || [ -n "${CI}" ]; then
+      export NO_COLOR=1
+   fi
+
+   # tell testthat our source dir, binary dir
+   export TESTTHAT_TESTS_DIR="@CMAKE_CURRENT_SOURCE_DIR@/tests/testthat"
+   export TESTTHAT_OUTPUT_DIR="@CMAKE_CURRENT_BINARY_DIR@"
+
+   # set TESTTHAT_FILTER if a filter was provided
+   if [ -n "${TEST_FILTER}" ]; then
+      TESTTHAT_FILTER="${TEST_FILTER}"
+      export TESTTHAT_FILTER
+   fi
+
+   # the full suite can run past 5 minutes on slower machines without hanging
+   runWatchdogProcess 15m false                                                  \
+      "@CMAKE_CURRENT_BINARY_DIR@/session/${RSTUDIO_SESSION_BIN}"                \
+      --run-script "\"source('${TESTTHAT_TESTS_DIR}/run-tests.R'); runTests()\"" \
+      --config-file="${SESSION_CONF_FILE}"
+
+   checkRUnitTestFailure
+
+fi
+
+# if Pro unit tests are available, run those
+PRO_TESTS="${DIR}/rstudio-pro-tests"
+if [ -e "${PRO_TESTS}" ]; then
+   source "${PRO_TESTS}"
+fi
+
+# return an error exit code if any unit tests failed
+if [ "${UNIT_TEST_FAILURE}" = "true" ]; then
+   error "One or more test suites had failures."
+   exit 1
+fi
+
+# success!
+exit 0

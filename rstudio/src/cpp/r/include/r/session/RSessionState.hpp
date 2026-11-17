@@ -1,0 +1,107 @@
+/*
+ * RSessionState.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef R_R_SESSION_STATE_HPP
+#define R_R_SESSION_STATE_HPP
+
+#include <string>
+
+#include <boost/function.hpp>
+
+#include <shared_core/Error.hpp>
+#include <core/Version.hpp>
+
+namespace rstudio {
+namespace core {
+   class FilePath;
+}
+}
+
+namespace rstudio {
+namespace r {
+namespace session {
+namespace state {
+
+struct SessionStateInfo
+{
+   core::Version suspendedRVersion;
+   core::Version activeRVersion;
+};
+
+struct SessionStateCallbacks
+{
+   boost::function<void(const std::string&)> consoleWriteInput;
+};
+
+void initialize(SessionStateCallbacks callbacks);
+
+bool save(const core::FilePath& statePath,
+          const std::string& afterRestartCommand,
+          const std::string& builtPackagePath,
+          bool serverMode,
+          bool excludePackages,
+          bool disableSaveCompression,
+          bool saveGlobalEnvironment,
+          const std::string& ephemeralEnvVars);
+
+bool saveMinimal(const core::FilePath& statePath,
+                 const std::string& afterRestartCommand,
+                 const std::string& builtPackagePath,
+                 bool saveGlobalEnvironment);
+   
+bool rProfileOnRestore(const core::FilePath& statePath);
+
+bool packratModeEnabled(const core::FilePath& statePath);
+
+bool restore(const core::FilePath& statePath, 
+             bool serverMode,
+             boost::function<core::Error()>* pDeferredRestoreAction,
+             std::string* pErrorMessages);
+   
+bool destroy(const core::FilePath& statePath);
+
+// Mark the state at statePath as being restored, until restoreFinished() is
+// called. If the process ends in between (e.g. R crashes or runs out of memory
+// while loading the state, or the session is closed first),
+// setAsideUnfinishedRestore() finds the mark on the next start.
+void restoreStarted(const core::FilePath& statePath);
+void restoreFinished(const core::FilePath& statePath);
+
+// If an earlier restore of the state at statePath never finished, moves the
+// state aside so it isn't restored again (restoring it would likely fail the
+// same way), and returns where it was moved to, next to statePath. Returns an
+// empty path otherwise.
+core::FilePath setAsideUnfinishedRestore(const core::FilePath& statePath);
+
+// State set aside by setAsideUnfinishedRestore() is kept this long, so that
+// what it holds (e.g. the environment) can be recovered by hand.
+const int kSetAsideStateMaxAgeDays = 30;
+
+// Removes state that setAsideUnfinishedRestore() set aside under parentPath
+// (the directory holding the state path) more than kSetAsideStateMaxAgeDays
+// ago. Only entries named after state with the given prefix are considered,
+// since the directory may hold other things.
+void removeExpiredSetAsideState(const core::FilePath& parentPath,
+                                const std::string& statePrefix);
+
+SessionStateInfo getSessionStateInfo();
+     
+} // namespace state
+} // namespace session
+} // namespace r
+} // namespace rstudio
+
+#endif // R_R_SESSION_STATE_HPP
+

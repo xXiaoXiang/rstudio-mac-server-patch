@@ -1,0 +1,416 @@
+/*
+ * FileLock.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <core/FileLock.hpp>
+
+#include <cmath>
+
+#include <boost/algorithm/string.hpp>
+#include <boost/bind/bind.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/date_time/posix_time/posix_time_duration.hpp>
+
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+#include <shared_core/Memory.hpp>
+
+#include <core/Settings.hpp>
+#include <core/Log.hpp>
+#include <core/FileSerializer.hpp>
+#include <core/http/SocketUtils.hpp>
+#include <core/system/Environment.hpp>
+#include <core/system/Xdg.hpp>
+
+// borrowed from SessionConstants.hpp
+#define kRStudioSessionRoute "RSTUDIO_SESSION_ROUTE"
+
+using namespace boost::placeholders;
+
+namespace rstudio {
+namespace core {
+
+namespace {
+
+const char * const kLockTypeAdvisory  = "advisory";
+const char * const kLockTypeLinkBased = "linkbased";
+
+// use advisory locks on Windows by default; link-based elsewhere
+#ifdef _WIN32
+# define kLockTypeDefault      kLockTypeAdvisory
+# define kLockTypeDefaultEnum  (FileLock::LOCKTYPE_ADVISORY)
+#else
+# define kLockTypeDefault      kLockTypeLinkBased
+# define kLockTypeDefaultEnum  (FileLock::LOCKTYPE_LINKBASED)
+#endif 
+
+const char * const kLocksConfFile    = "file-locks";
+const double kDefaultRefreshRate     = 20.0;
+const double kDefaultTimeoutInterval = 30.0;
+const int kDefaultLiveOwnerGraceMultiplier = 10;
+const int kMaxLiveOwnerGraceMultiplier = 1000;
+
+// boost::posix_time::seconds narrows to a 32-bit count, and the refresh timer
+// converts to a system_clock duration; a year is far below either limit.
+const double kMaxIntervalSeconds     = 365.0 * 24.0 * 60.0 * 60.0;
+
+std::string lockTypeToString(FileLock::LockType type)
+{
+   switch (type)
+   {
+   case FileLock::LOCKTYPE_ADVISORY:  return kLockTypeAdvisory;
+   case FileLock::LOCKTYPE_LINKBASED: return kLockTypeLinkBased;
+   }
+   
+   // not reached
+   return std::string();
+}
+
+FileLock::LockType stringToLockType(const std::string& lockType,
+                                    FileLock::LockType defaultLockType)
+{
+   using namespace boost::algorithm;
+   
+   if (boost::iequals(lockType, kLockTypeAdvisory))
+      return FileLock::LOCKTYPE_ADVISORY;
+   else if (boost::iequals(lockType, kLockTypeLinkBased))
+      return FileLock::LOCKTYPE_LINKBASED;
+   
+   WLOGF("unrecognized lock type '{}'", lockType);
+   return defaultLockType;
+}
+
+double getFieldPositive(const Settings& settings,
+                        const std::string& name,
+                        double defaultValue)
+{
+   double value = settings.getDouble(name, defaultValue);
+   if (!std::isfinite(value) || value < 1 || value > kMaxIntervalSeconds)
+   {
+      WLOGF("invalid field '{}': must be between one second and one year", name);
+      return defaultValue;
+   }
+   
+   return value;
+}
+
+bool s_isInitialized = false;
+
+} // end anonymous namespace
+
+bool FileLock::isLocked(const FilePath& lockFilePath) const
+{
+   bool isLocked = true;
+   Error error = this->isLocked(lockFilePath, &isLocked);
+   if (error)
+      LOG_ERROR(error);
+
+   return isLocked;
+}
+
+Error FileLock::noLockAvailableError(const FilePath& lockFilePath)
+{
+   Error error = systemError(
+      boost::system::errc::no_lock_available,
+      ERROR_LOCATION);
+   error.addProperty("lock-file", lockFilePath);
+   return error;
+}
+
+bool FileLock::verifyInitialized()
+{
+   if (!s_isInitialized)
+   {
+      static bool s_warned = false;
+      if (s_warned)
+         return s_isInitialized;
+      
+      s_warned = true;
+      LOG_WARNING_MESSAGE(
+               "FileLock classes not yet initialized; please call "
+               "'FileLock::initialize()' and 'FileLock::cleanUp()' as appropriate");
+   }
+   
+   return s_isInitialized;
+}
+
+void FileLock::initialize(FileLock::LockType fallbackLockType)
+{
+   // Nothing to do if already initialized
+   if (s_isInitialized) return;
+
+   // read settings
+   FilePath locksConfPath = core::system::xdg::systemConfigFile(kLocksConfFile);
+
+   Settings settings;
+   if (locksConfPath.exists())
+   {
+      Error error = settings.initialize(locksConfPath);
+      if (error)
+         LOG_ERROR(error);
+   }
+   
+#ifdef _WIN32
+   // TODO: link-based locks are not yet implemented on Windows
+   FileLock::s_defaultType = LOCKTYPE_ADVISORY;
+#else
+   // default lock type
+   std::string lockTypePref = settings.get("lock-type");
+   FileLock::s_defaultType = lockTypePref.empty()
+         ? fallbackLockType
+         : stringToLockType(lockTypePref, fallbackLockType);
+#endif
+   
+   // symlinks
+   bool useSymlinks = settings.getBool("use-symlinks", false);
+   FileLock::s_useSymlinks = useSymlinks;
+   
+   // timeout interval
+   double timeoutInterval = getFieldPositive(settings, "timeout-interval", kDefaultTimeoutInterval);
+   FileLock::s_timeoutInterval = boost::posix_time::seconds(static_cast<long>(timeoutInterval));
+   
+   // refresh rate
+   double refreshRate = getFieldPositive(settings, "refresh-rate", kDefaultRefreshRate);
+   FileLock::s_refreshRate = boost::posix_time::seconds(static_cast<long>(refreshRate));
+
+   // live owner grace (a multiple of the timeout interval)
+   int graceMultiplier = settings.getInt("live-owner-grace-multiplier", kDefaultLiveOwnerGraceMultiplier);
+   if (graceMultiplier < 1 || graceMultiplier > kMaxLiveOwnerGraceMultiplier)
+   {
+      LOG_WARNING_MESSAGE(
+         "invalid field 'live-owner-grace-multiplier': must be between 1 and 1000");
+      graceMultiplier = kDefaultLiveOwnerGraceMultiplier;
+   }
+   FileLock::s_liveOwnerGraceMultiplier = graceMultiplier;
+
+   // logging
+   bool loggingEnabled = settings.getBool("enable-logging", false);
+   FileLock::s_loggingEnabled = loggingEnabled;
+   
+   // logfile
+   std::string logFile = settings.get("log-file");
+   FileLock::s_logFile = FilePath(logFile);
+   
+   std::stringstream ss;
+   ss << "(PID " << ::getpid() << "): Initialized file locks ("
+      << "lock-type=" << lockTypeToString(FileLock::s_defaultType) << ", "
+      << "use-symlinks=" << (useSymlinks ? "true" : "false") << ", "
+      << "timeout-interval=" << FileLock::s_timeoutInterval.total_seconds() << "s, "
+      << "refresh-rate=" << FileLock::s_refreshRate.total_seconds() << "s, "
+      << "live-owner-grace-multiplier=" << FileLock::s_liveOwnerGraceMultiplier << ", "
+      << "log-file=" << logFile << ")"
+      << std::endl;
+   FileLock::log(ss.str());
+
+   std::string distributedLockingOption = core::system::getenv(kRStudioDistributedLockingEnabled);
+   bool distributedLockingEnabled = (distributedLockingOption == "1");
+
+   FileLock::s_isLoadBalanced =
+         !core::system::getenv(kRStudioSessionRoute).empty() ||
+         distributedLockingEnabled;
+
+   s_isInitialized = true;
+}
+
+void FileLock::initialize()
+{
+   initialize(kLockTypeDefaultEnum);
+}
+
+void FileLock::log(const std::string& message)
+{
+   if (s_logFile.isEmpty() || !isLoggingEnabled())
+   {
+      // if we were constructed without a path, or file lock logging was not explicitly enabled
+      // (legacy option), then debug log to the in-proc logger
+      LOG_DEBUG_MESSAGE_NAMED(kFileLockingLogSection, message);
+   }
+   else
+   {
+      // avoid logging too many errors (e.g. if the user has specified
+      // a file that does not exist)
+      static int counter = 0;
+      static int max = 5;
+      
+      if (counter < max)
+      {
+         // append to logfile
+         Error error = core::writeStringToFile(
+                  s_logFile,
+                  message,
+                  string_utils::LineEndingPosix,
+                  false);
+
+         if (error)
+         {
+            if (!s_loggerBypassed)
+               LOG_ERROR(error);
+            ++counter;
+         }
+      }
+      else if (counter == max)
+      {
+         if (!s_loggerBypassed)
+            LOG_ERROR_MESSAGE("failed to write lockfile logs");
+         ++counter;
+      }
+      else
+      {
+         // do nothing
+      }
+   }
+}
+
+// definitions for static members
+// NOTE: these will be overridden when FileLock::initialize() is called
+FileLock::LockType FileLock::s_defaultType(FileLock::LOCKTYPE_LINKBASED);
+boost::posix_time::seconds FileLock::s_timeoutInterval(static_cast<long>(kDefaultTimeoutInterval));
+boost::posix_time::seconds FileLock::s_refreshRate(static_cast<long>(kDefaultRefreshRate));
+int FileLock::s_liveOwnerGraceMultiplier(kDefaultLiveOwnerGraceMultiplier);
+bool FileLock::s_loggingEnabled(false);
+bool FileLock::s_loggerBypassed(false);
+bool FileLock::s_isLoadBalanced(false);
+bool FileLock::s_useSymlinks(false);
+
+// leaked: locks are refreshed on the http listener thread (#18318)
+FilePath& FileLock::s_logFile = core::make_leaked<FilePath>();
+
+#ifdef RSTUDIO_UNIT_TESTS_ENABLED
+void FileLock::setLogFileForTesting(const FilePath& logFile)
+{
+   s_logFile = logFile;
+   s_loggingEnabled = true;
+   s_loggerBypassed = true;
+}
+#endif
+
+boost::shared_ptr<FileLock> FileLock::create(LockType type)
+{
+   verifyInitialized();
+   
+   switch (type)
+   {
+   case LOCKTYPE_ADVISORY:  return boost::shared_ptr<FileLock>(new AdvisoryFileLock());
+   case LOCKTYPE_LINKBASED: return boost::shared_ptr<FileLock>(new LinkBasedFileLock());
+   }
+   
+   // shouldn't be reached
+   return boost::shared_ptr<FileLock>(new AdvisoryFileLock());
+}
+
+boost::shared_ptr<FileLock> FileLock::createDefault()
+{
+   verifyInitialized();
+   return FileLock::create(s_defaultType);
+}
+
+void FileLock::refresh()
+{
+   verifyInitialized();
+   AdvisoryFileLock::refresh();
+   LinkBasedFileLock::refresh();
+}
+
+void FileLock::cleanUp()
+{
+   verifyInitialized();
+   AdvisoryFileLock::cleanUp();
+   LinkBasedFileLock::cleanUp();
+}
+
+namespace {
+
+void schedulePeriodicExecution(
+      const boost::system::error_code& ec,
+      boost::asio::system_timer& timer,
+      boost::posix_time::seconds interval,
+      boost::function<void()> callback)
+{
+   try
+   {
+      // bail on boost errors (these are very unexpected)
+      if (ec)
+      {
+         if (!core::isShutdownError(ec))
+            LOG_ERROR(core::Error(ec, ERROR_LOCATION));
+         return;
+      }
+      
+      // execute callback
+      callback();
+
+      // reschedule
+      try
+      {
+         timer.expires_after(std::chrono::milliseconds(interval.total_milliseconds()));
+      }
+      catch (boost::system::system_error& e)
+      {
+         log::logError(Error(e.code(), ERROR_LOCATION));
+      }
+      catch (std::exception& e)
+      {
+         log::logErrorMessage(
+            fmt::format("Unexpected exception: {}", e.what()),
+            ERROR_LOCATION);
+         return;
+      }
+      catch (...)
+      {
+         log::logErrorMessage(
+            "Unexpected exception: <no information available>",
+            ERROR_LOCATION);
+         return;
+      }
+      
+      timer.async_wait(boost::bind(
+                          schedulePeriodicExecution,
+                          boost::asio::placeholders::error,
+                          boost::ref(timer),
+                          interval,
+                          callback));
+   }
+   catch (...)
+   {
+      // swallow errors
+   }
+}
+
+} // end anonymous namespace
+
+void FileLock::refreshPeriodically(boost::asio::io_context& service,
+                                   boost::posix_time::seconds interval)
+{
+   // protect against re-entrancy
+   static bool s_isRefreshing = false;
+   if (s_isRefreshing)
+      return;
+   s_isRefreshing = true;
+   
+   verifyInitialized();
+   
+   // leaked: the timer is rescheduled on the thread running 'service' (#18318)
+   static boost::asio::system_timer& timer = core::make_leaked<boost::asio::system_timer>(
+         service,
+         std::chrono::milliseconds(interval.total_milliseconds()));
+   timer.async_wait(boost::bind(
+                       schedulePeriodicExecution,
+                       boost::asio::placeholders::error,
+                       boost::ref(timer),
+                       interval,
+                       FileLock::refresh));
+}
+
+} // end namespace core
+} // end namespace rstudio

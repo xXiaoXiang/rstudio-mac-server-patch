@@ -1,0 +1,202 @@
+/*
+ * ServerSessionProxy.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef SERVER_SESSION_PROXY_HPP
+#define SERVER_SESSION_PROXY_HPP
+
+#include <string>
+
+#include <core/http/AsyncConnection.hpp>
+#include <core/http/TcpIpAsyncClient.hpp>
+
+#include <core/r_util/RSessionContext.hpp>
+
+#include "ServerSessionManager.hpp"
+
+#ifdef RSTUDIO_UNIT_TESTS_ENABLED
+#include <core/system/System.hpp>
+#endif
+
+namespace rstudio {
+namespace core {
+   class Error;
+}
+}
+
+namespace rstudio {
+namespace server {
+namespace session_proxy {
+
+struct RequestType
+{
+   enum
+   {
+      Rpc,
+      Content,
+      Events,
+      ClientInit,
+      Jupyter,
+      VSCode
+   };
+};
+
+typedef boost::function<void (const core::http::Response&,
+                              const std::string& baseAddress,
+                              boost::shared_ptr<core::http::IAsyncClient>)> LocalhostResponseHandler;
+
+typedef boost::function<void(const boost::shared_ptr<core::http::IAsyncClient>&)> ClientHandler;
+
+core::Error initialize();
+
+core::Error runVerifyInstallationSession();
+
+void proxyContentRequest(
+      const std::string& username,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+
+bool proxyUploadRequest(
+      const std::string& username,
+      const std::string& userIdentifier,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const std::string& formData,
+      bool keepGoing);
+
+void proxyRpcRequest(
+      const std::string& username,
+      const std::string& userIdentifier,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+
+void proxyEventsRequest(
+      const std::string& username,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+
+void proxyLocalhostRequest(
+      bool ipv6,
+      const std::string& username,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+
+void proxyJupyterRequest(
+      const std::string& username,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+
+void proxyVSCodeRequest(
+      const std::string& username,
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection);
+   
+bool requiresSession(const core::http::Request& request);
+
+// Invariant: If a filter returns false, it should not mutate and must not
+// retain the provided Request. It continues to be used and is later moved
+// to the default proxy forwarder.
+
+typedef boost::function<bool(
+    boost::shared_ptr<core::http::AsyncConnection>,
+    boost::shared_ptr<core::http::Request>,
+    const core::r_util::SessionContext&,
+    const ClientHandler&
+    )> ProxyFilter;
+void setProxyFilter(ProxyFilter filter);
+
+typedef boost::function<void(core::http::Request*)> ProxyRequestFilter;
+void setProxyRequestFilter(ProxyRequestFilter filter);
+
+typedef boost::function<bool(
+    boost::shared_ptr<core::http::AsyncConnection>,
+    const std::string&,
+    core::r_util::SessionContext*)> SessionContextSource;
+void setSessionContextSource(SessionContextSource source);
+
+core::http::Headers getAuthCookies(const core::http::Response& response);
+
+bool checkForValidUserSession(const std::string& username);
+
+void socketConnectionClosed(const std::string& username);
+
+bool applyProxyFilter(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      boost::shared_ptr<core::http::Request> pRequest,
+      const core::r_util::SessionContext& context,
+      const ClientHandler& clientHandler = ClientHandler());
+
+#ifdef RSTUDIO_UNIT_TESTS_ENABLED
+// Test-only hook -- see definition in ServerSessionProxy.cpp for rationale.
+// Exposes the uid-resolution decision inputs used to enforce localhost-proxy
+// destination-port ownership (rstudio-pro#11470).
+core::Error userIdForUsernameForTest(const std::string& username, UidType* pUID);
+
+// Exercises the complete rewrite path used for buffered localhost responses.
+void prepareLocalhostResponseForTest(
+      const core::http::Request& originalRequest,
+      const std::string& port,
+      const std::string& baseAddress,
+      bool ipv6,
+      const core::http::Response& response,
+      core::http::Response* pPreparedResponse);
+
+// Exposes the /p/ buffering policy (shouldBufferLocalhostResponse) -- which
+// responses proxyLocalhostRequest holds whole rather than streams.
+bool shouldBufferLocalhostResponseForTest(const core::http::Response& response);
+
+// Exercises handleLocalhostResponse()'s normal (non-websocket-upgrade)
+// branch, which writes the /p/ response to the client connection.
+void handleLocalhostResponseForTest(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const std::string& port,
+      const std::string& baseAddress,
+      bool ipv6,
+      const core::http::Response& response);
+
+// Exposes the /s/ buffering policy (shouldBufferLocalStreamResponse) -- which
+// responses proxyRequest holds whole rather than streams.
+bool shouldBufferLocalStreamResponseForTest(const core::http::Response& response);
+
+// Exposes the /s/ content, RPC and events error handlers (handleContentError,
+// handleRpcError, handleEventsError) that proxyRequest installs on the
+// upstream client. The content and RPC handlers also report the request's
+// outcome to the session manager (#18963).
+void handleContentErrorForTest(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const core::r_util::SessionContext& context,
+      const core::Error& error);
+
+void handleRpcErrorForTest(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const core::r_util::SessionContext& context,
+      const core::http::Headers& authCookies,
+      const core::Error& error);
+
+void handleEventsErrorForTest(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const core::r_util::SessionContext& context,
+      const core::http::Headers& authCookies,
+      const core::Error& error);
+
+// Exposes the /p/ error handler (handleLocalhostError) that
+// proxyLocalhostRequest installs on the upstream client.
+void handleLocalhostErrorForTest(
+      boost::shared_ptr<core::http::AsyncConnection> ptrConnection,
+      const core::Error& error);
+
+// Exposes the license-error mapping (handleLicenseError) the error handlers
+// above consult; returns whether it recognized error and populated *pResponse.
+bool handleLicenseErrorForTest(const core::Error& error,
+                               core::http::Response* pResponse);
+#endif
+
+} // namespace session_proxy
+} // namespace server
+} // namespace rstudio
+
+#endif // SERVER_SESSION_PROXY_HPP

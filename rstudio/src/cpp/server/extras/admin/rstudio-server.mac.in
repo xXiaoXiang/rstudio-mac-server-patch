@@ -1,0 +1,254 @@
+#!/bin/bash
+
+SERVICE_LABEL=com.rstudio.launchd.rserver
+SERVICE_TARGET="system/$SERVICE_LABEL"
+SERVER_PREFIX="${CMAKE_INSTALL_PREFIX}/${RSTUDIO_INSTALL_SUPPORTING}"
+SERVER_CONTROL="$SERVER_PREFIX/../../MacOS/RStudioServer"
+SERVER_CONFIG_DIR=/etc/rstudio
+SERVER_CONFIG_FILE="$SERVER_CONFIG_DIR/rserver.conf"
+
+requireRoot() {
+ if [ "$EUID" -ne 0 ]; then
+    echo "This command changes system Server settings; run it with sudo." >&2
+    return 1
+ fi
+}
+
+startServer() {
+ testConfig || return $?
+ # ServiceManagement preserves the macOS administrator's startup approval.
+ "$SERVER_CONTROL" --enable-service
+}
+
+stopServer() {
+ "$SERVER_CONTROL" --disable-service
+}
+
+restartServer() {
+ requireRoot || return $?
+ testConfig || return $?
+ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+    launchctl kickstart -k "$SERVICE_TARGET"
+ else
+    startServer
+ fi
+}
+
+installService() {
+ requireRoot || return $?
+ "$SERVER_PREFIX/bin/rstudio-server-install" install
+}
+
+renderNetworkConfig() {
+ /usr/bin/awk '!/^[[:space:]]*(www-address|www-port)[[:space:]]*=/' "$1" || return $?
+ printf '\nwww-address=%s\nwww-port=%s\n' "$2" "$3"
+}
+
+configureNetwork() (
+ requireRoot || return $?
+ [ "$#" -eq 2 ] || { echo "Usage: rstudio-server configure-network ADDRESS PORT" >&2; return 2; }
+ "$SERVER_CONTROL" --validate-network "$1" "$2" || return $?
+ [ ! -L "$SERVER_CONFIG_DIR" ] && [ -d "$SERVER_CONFIG_DIR" ] &&
+    [ "$(/usr/bin/stat -f '%u' "$SERVER_CONFIG_DIR")" = 0 ] || {
+    echo "Complete install-service first; the configuration directory must be root-owned." >&2; return 1
+ }
+ local mode candidate
+ mode=$(/usr/bin/stat -f '%Lp' "$SERVER_CONFIG_DIR") || return $?
+ (( (8#$mode & 0022) == 0 )) || { echo "Configuration directory must not be group/world-writable." >&2; return 1; }
+ [ -f "$SERVER_CONFIG_FILE" ] && [ ! -L "$SERVER_CONFIG_FILE" ] &&
+    [ ! -L "$SERVER_CONFIG_FILE.previous" ] &&
+    { [ ! -e "$SERVER_CONFIG_FILE.previous" ] || [ -f "$SERVER_CONFIG_FILE.previous" ]; } || {
+    echo "Expected a regular installed rserver.conf, without configuration/backup symlinks." >&2; return 1
+ }
+ [ "$(/usr/bin/stat -f '%u' "$SERVER_CONFIG_FILE")" = 0 ] || {
+    echo "rserver.conf must be root-owned before editing system settings." >&2; return 1
+ }
+ mode=$(/usr/bin/stat -f '%Lp' "$SERVER_CONFIG_FILE") || return $?
+ (( (8#$mode & 0022) == 0 )) || {
+    echo "rserver.conf must not be group/world-writable." >&2; return 1
+ }
+ # Serialize concurrent settings changes. Lock failure never removes another
+ # command's lock, and a failed parse leaves the installed config untouched.
+ /bin/mkdir "$SERVER_CONFIG_DIR/.network-settings-lock" 2>/dev/null || {
+    echo "Another settings change is running (or an interrupted change left .network-settings-lock)." >&2; return 1
+ }
+ candidate=$(/usr/bin/mktemp "$SERVER_CONFIG_DIR/.rserver.conf.XXXXXX") || {
+    /bin/rmdir "$SERVER_CONFIG_DIR/.network-settings-lock"; return 1
+ }
+ trap '/bin/rm -f "$candidate"; /bin/rmdir "$SERVER_CONFIG_DIR/.network-settings-lock"' EXIT
+ renderNetworkConfig "$SERVER_CONFIG_FILE" "$1" "$2" > "$candidate" || return $?
+ "$SERVER_PREFIX/bin/rserver" --config-file "$candidate" --test-config || return $?
+ mode=$(/usr/bin/stat -f '%Lp' "$SERVER_CONFIG_FILE") || return $?
+ /bin/cp -p "$SERVER_CONFIG_FILE" "$SERVER_CONFIG_FILE.previous" &&
+ /usr/sbin/chown 0:0 "$candidate" && /bin/chmod "$mode" "$candidate" &&
+ /bin/mv -f "$candidate" "$SERVER_CONFIG_FILE" || return $?
+ echo "Saved $SERVER_CONFIG_FILE (previous version: $SERVER_CONFIG_FILE.previous)."
+ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+    launchctl kickstart -k "$SERVICE_TARGET" || {
+       echo "Settings were saved, but restart failed. Check service status before reconnecting." >&2; return 1
+    }
+    echo "Restart requested with the saved configuration."
+ else
+    echo "Server is stopped. The saved configuration will be applied on its next start."
+ fi
+)
+
+manageUsers() {
+ "$SERVER_PREFIX/bin/rstudio-server-users" "$@"
+}
+
+testConfig() {
+ "$SERVER_PREFIX/bin/rserver" --test-config
+}
+
+checkConfig() {
+ "$SERVER_PREFIX/bin/rserver" --check-config
+}
+
+setupDb() {
+ "$SERVER_PREFIX/bin/rserver" --setup-db "$@"
+}
+
+verifyInstallation() {
+ "$SERVER_PREFIX/bin/rserver" --verify-installation=1 --server-daemonize=0 "$@"
+}
+
+isServerRunning() {
+ pgrep -x rserver &> /dev/null
+}
+
+
+case "$1" in
+
+    install-service)
+        installService
+        ;;
+
+    uninstall-service)
+        requireRoot && "$SERVER_PREFIX/bin/rstudio-server-install" uninstall
+        ;;
+
+    configure-network)
+        shift
+        configureNetwork "$@"
+        ;;
+
+    create-user|delete-user|set-user-visibility)
+        manageUsers "$@"
+        ;;
+
+    user-help)
+        manageUsers help
+        ;;
+
+    status)
+        launchctl print "$SERVICE_TARGET"
+        ;;
+
+    start)
+        startServer
+        ;;
+
+    stop)
+        stopServer
+        ;;
+
+    restart)
+        restartServer
+        ;;
+
+    test-config)
+        testConfig
+        ;;
+
+    check-config)
+        checkConfig
+        ;;
+
+    setup-db)
+        shift
+        setupDb "$@"
+        ;;
+
+    verify-installation)
+        if isServerRunning ; then
+           echo "Server is running and must be stopped before running verify-installation"
+           exit 1
+        fi
+
+        # we call stop here even though the service should already be stopped		
+        # just in case (we don't want the service running when invoking verify-installation)
+        stopServer || exit $?
+
+        shift
+        verifyInstallation "$@"
+        ;;
+
+    suspend-session)
+        if [ -n "$2" ]; then
+           kill -USR1 $3 $4 $5 $6 $7 $8 $9 $2
+        else
+           echo "Must specify PID of session to suspend"
+           exit 1
+        fi
+        ;;
+
+    suspend-all)
+        killall -USR1 $2 $3 $4 $5 $6 $7 $8 $9 rsession 2>/dev/null
+        killall -USR1 $2 $3 $4 $5 $6 $7 $8 $9 rworkspaces 2>/dev/null
+        ;;
+
+    force-suspend-session)
+        if [ -n "$2" ]; then
+           kill -USR2 $3 $4 $5 $6 $7 $8 $9 $2
+        else
+           echo "Must specify PID of session to force suspend"
+           exit 1
+        fi
+        ;;
+
+    force-suspend-all)
+        killall -USR2 $2 $3 $4 $5 $6 $7 $8 $9  rsession 2>/dev/null
+        killall -USR2 $2 $3 $4 $5 $6 $7 $8 $9  rworkspaces 2>/dev/null
+        ;;
+
+    kill-session)
+        if [ -n "$2" ]; then
+           kill -KILL $3 $4 $5 $6 $7 $8 $9 $2
+        else
+           echo "Must specify PID of session to kill"
+           exit 1
+        fi
+        ;;
+
+    kill-all)
+        killall -KILL $2 $3 $4 $5 $6 $7 $8 $9  rsession 2>/dev/null
+        killall -KILL $2 $3 $4 $5 $6 $7 $8 $9  rworkspaces 2>/dev/null
+        ;;
+
+    offline)
+        requireRoot || exit $?
+        mkdir -p /var/lib/rstudio-server || exit $?
+        touch /var/lib/rstudio-server/offline || exit $?
+        restartServer
+        ;;
+
+    online)
+        requireRoot || exit $?
+        mkdir -p /var/lib/rstudio-server || exit $?
+        rm -f /var/lib/rstudio-server/offline || exit $?
+        restartServer
+        ;;
+
+    active-sessions)
+        ps axo pid,cputime,args | grep [r]session
+        ;;
+
+    version)
+        echo "${CPACK_PACKAGE_VERSION} (${RSTUDIO_RELEASE_NAME})"
+        ;;
+
+    *)
+        echo $"Usage: rstudio-server {install-service|uninstall-service|configure-network ADDRESS PORT|user-help|create-user|delete-user|set-user-visibility|status|start|stop|restart|test-config|check-config|setup-db|verify-installation|suspend-session|suspend-all|force-suspend-session|force-suspend-all|kill-session|kill-all|offline|online|active-sessions|version}"
+        exit 2
+esac

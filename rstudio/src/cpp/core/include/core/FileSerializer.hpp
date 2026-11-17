@@ -1,0 +1,497 @@
+/*
+ * FileSerializer.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef CORE_FILE_SERIALIZER_HPP
+#define CORE_FILE_SERIALIZER_HPP
+
+#include <ctime>
+#include <string>
+#include <map>
+#include <iterator>
+#include <istream>
+#include <sstream>
+
+#include <boost/iostreams/copy.hpp>
+#include <boost/iostreams/concepts.hpp>
+#include <boost/iostreams/filtering_stream.hpp>
+
+#include <boost/function.hpp>
+#include <boost/algorithm/string/trim.hpp>
+
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+#include <core/StringUtils.hpp>
+#include <core/Algorithm.hpp>
+
+namespace rstudio {
+namespace core {
+
+// lineEnding is the type of line ending you want to end up on disk
+//
+// maxOpenRetrySeconds indicates whether or not we should retry attempts to open the file
+// when it is in use by another process (common when using backup software), and if so
+// how many seconds of elapsed time should we wait for the file to become available
+// note: this only has an effect on Windows
+//
+// durable, when true, flushes the contents all the way to physical storage
+// (fsync / FlushFileBuffers) before returning. This is required to reliably
+// detect a full disk (ENOSPC) or an exceeded quota (EDQUOT) -- with delayed
+// allocation a write into the page cache succeeds even on a full disk, and the
+// failure only surfaces when the pages are flushed -- but it is relatively
+// expensive, so it defaults off. Enable it on paths where a silently dropped
+// write would lose user data (e.g. saving an editor document).
+Error writeStringToFile(const core::FilePath& filePath,
+                        const std::string& str,
+                        string_utils::LineEnding lineEnding = string_utils::LineEndingPassthrough,
+                        bool truncate = true,
+                        int maxOpenRetrySeconds = 0,
+                        bool logError = true,
+                        bool durable = false);
+
+struct AtomicWriteOptions
+{
+   // Flush the new contents and the rename to physical storage before
+   // returning, so that the write survives a power loss and a full disk is
+   // reliably reported. This is expensive (especially on network filesystems),
+   // so it is only worth it for files that are rarely written.
+   bool durable = false;
+
+   // Give the file mode 0600, whatever the mode of the file it replaces.
+   // Ignored on Windows.
+   bool ownerOnly = false;
+
+   // How long to keep retrying when the file can't be replaced because another
+   // process has it open (e.g. an indexer or antivirus scanner). Only applies
+   // on Windows.
+   int maxRetrySeconds = 1;
+
+   // When no temporary file can be created next to the file (the directory
+   // isn't writable), or the file can't be replaced because it is a mount
+   // point, truncate and rewrite the file in place instead of failing. Turn
+   // this off for files whose contents must survive a failed write, since an
+   // in-place write that fails partway leaves the file truncated.
+   bool allowInPlaceFallback = true;
+};
+
+// Writes a string to a file atomically: the contents are written to a
+// temporary file in the same directory, which is then renamed over the file.
+// If the process crashes or the write fails, the old contents stay in place;
+// the file is never left empty or truncated.
+//
+// When the file already exists, its permission bits (and, where the process
+// is allowed to set them, its owner and group) are carried over to the new
+// file. ACLs and extended attributes are not. If filePath is a symlink, the
+// file it points to is replaced and the link is kept.
+//
+// If a temporary file can't be created next to the file (e.g. the directory
+// isn't writable, or is on a read-only filesystem), or the file can't be
+// renamed over because it is itself a mount point (a single file bind-mounted
+// into a container), the file is written in place instead, unless
+// AtomicWriteOptions::allowInPlaceFallback is off. No other failure touches
+// the file.
+//
+// The first time a process writes into a directory this way, temporary files
+// that an earlier, interrupted write left there are removed (see
+// removeStaleAtomicWriteTempFiles()).
+//
+// A failure names the file in the error's "path" property; the temporary file
+// involved, if any, is in "temp-path".
+//
+// Use this for state files RStudio owns. Files that belong to the user
+// (documents, .Rhistory) should normally be written in place with
+// writeStringToFile(), which keeps the file's identity (inode, hard links,
+// ACLs, other programs' file watches).
+Error writeStringToFileAtomic(const core::FilePath& filePath,
+                              const std::string& str,
+                              string_utils::LineEnding lineEnding = string_utils::LineEndingPassthrough,
+                              const AtomicWriteOptions& options = AtomicWriteOptions());
+
+#if defined(RSTUDIO_UNIT_TESTS_ENABLED) && !defined(_WIN32)
+// Make the next steps of writeStringToFileAtomic() fail with the given errno,
+// to test the paths that a real filesystem can't be made to take: writing the
+// temporary file's contents (a failure after the file exists) and renaming it
+// over the target (a bind-mounted target). 0 turns the failure off.
+void setAtomicWriteWriteFailureForTesting(int errnoValue);
+void setAtomicWriteRenameFailureForTesting(int errnoValue);
+#endif
+
+// Returns true if filePath names a temporary file created by
+// writeStringToFileAtomic(). Code that treats every file in a directory as
+// data should skip these.
+bool isAtomicWriteTempFile(const core::FilePath& filePath);
+
+// Removes temporary files left in dir by an interrupted
+// writeStringToFileAtomic() (e.g. after a crash). Only files older than
+// maxAgeSeconds are removed, so that a write in progress in another process
+// is left alone. Not recursive. writeStringToFileAtomic() does this itself
+// on its first write into a directory, so this is only needed for a
+// directory that is read without being written.
+void removeStaleAtomicWriteTempFiles(const core::FilePath& dir,
+                                     std::time_t maxAgeSeconds = 3600);
+
+// Writes one line per element of the collection. The file is replaced
+// atomically (see writeStringToFileAtomic()) unless atomic is false, which
+// rewrites it in place; use that for files that belong to the user.
+template <typename CollectionType>
+Error writeCollectionToFile(
+         const core::FilePath& filePath,
+         const CollectionType& collection,
+         boost::function<std::string(
+                                 const typename CollectionType::value_type&)>
+                         stringifyFunction,
+         bool atomic = true)
+{
+   // build the whole file first, so that write errors are reported by the
+   // write itself rather than lost in a stream's destructor
+   std::string contents;
+   for (typename CollectionType::const_iterator
+         it = collection.begin();
+         it != collection.end();
+         ++it)
+   {
+      contents.append(stringifyFunction(*it));
+      contents.push_back('\n');
+   }
+
+   if (atomic)
+   {
+      return writeStringToFileAtomic(filePath,
+                                     contents,
+                                     string_utils::LineEndingPassthrough,
+                                     AtomicWriteOptions());
+   }
+   else
+   {
+      return writeStringToFile(filePath,
+                               contents,
+                               string_utils::LineEndingPassthrough,
+                               true /* truncate */,
+                               0 /* maxOpenRetrySeconds */,
+                               false /* logError */,
+                               false /* durable */);
+   }
+}
+
+enum ReadCollectionAction
+{
+   ReadCollectionAddLine,
+   ReadCollectionIgnoreLine,
+   ReadCollectionTerminate
+};
+   
+template <typename CollectionType>
+Error readCollectionFromStream(
+         std::istream& is,
+         CollectionType* pCollection,
+         boost::function<ReadCollectionAction(const std::string& line,
+                                 typename CollectionType::value_type* pValue)>
+                         parseFunction,
+                         bool trimAndIgnoreBlankLines=true)
+{
+   using namespace boost::system::errc;
+
+   // create insert iterator
+   std::insert_iterator<CollectionType> insertIterator(*pCollection,
+                                                       pCollection->begin());
+
+   try
+   {
+      // read each line
+      std::string nextLine;
+      while (true)
+      {
+         // read the next line
+         std::getline(is, nextLine);
+
+         if (is.eof())
+         {
+            // only exit here if we have nothing to process
+            // otherwise, exit after we have processed the data
+            if (nextLine.empty())
+               break;
+         }
+         else if (is.fail())
+            return systemError(io_error, ERROR_LOCATION);
+
+         // trim whitespace then ignore it if it is a blank line
+         if (trimAndIgnoreBlankLines)
+         {
+            boost::algorithm::trim(nextLine);
+            if (nextLine.empty())
+               continue;
+         }
+
+         // parse it and add it to the collection
+         typename CollectionType::value_type value;
+         ReadCollectionAction action = parseFunction(nextLine, &value);
+         if (action == ReadCollectionAddLine)
+         {
+            *insertIterator++ = value;
+         }
+         else if (action == ReadCollectionIgnoreLine)
+         {
+            // do nothing
+         }
+         else if (action == ReadCollectionTerminate)
+         {
+            break; // exit read loop
+         }
+
+         // if we've hit the end of the file, we're done reading
+         if (is.eof())
+            break;
+      }
+   }
+   catch(const std::exception& e)
+   {
+      Error error = systemError(boost::system::errc::io_error,
+                                ERROR_LOCATION);
+      error.addProperty("what", e.what());
+      return error;
+   }
+
+   return Success();
+}
+
+template <typename CollectionType>
+Error readCollectionFromFile(
+         const core::FilePath& filePath,
+         CollectionType* pCollection,
+         boost::function<ReadCollectionAction(const std::string& line,
+                                 typename CollectionType::value_type* pValue)>
+                         parseFunction,
+                         bool trimAndIgnoreBlankLines=true)
+{
+   // open the file stream
+   std::shared_ptr<std::istream> pIfs;
+   Error error = filePath.openForRead(pIfs);
+   if (error)
+      return error;
+
+   error = readCollectionFromStream(*pIfs,
+                                    pCollection,
+                                    parseFunction,
+                                    trimAndIgnoreBlankLines);
+   if (error)
+      error.addProperty("path", filePath.getAbsolutePath());
+
+   return error;
+}
+
+template <typename ContentType>
+Error appendToFile(const core::FilePath& filePath,
+                       const ContentType& content)
+{
+   using namespace boost::system::errc;
+   
+   // open the file stream
+   std::shared_ptr<std::ostream> pOfs;
+   Error error = filePath.openForWrite(pOfs, false);
+   if (error)
+      return error;
+
+   try
+   {
+      pOfs->seekp(0, std::ios_base::end);
+
+      // append the content
+      *pOfs << content;
+      if (pOfs->fail())
+         return systemError(io_error, ERROR_LOCATION);
+   }
+   catch(const std::exception& e)
+   {
+      Error error = systemError(boost::system::errc::io_error,
+                                ERROR_LOCATION);
+      error.addProperty("what", e.what());
+      error.addProperty("path", filePath.getAbsolutePath());
+      return error;
+   }
+
+   return Success();
+}
+
+template <typename T>
+Error appendStructToFile(const core::FilePath& filePath,
+                         const T& data)
+{
+   using namespace boost::system::errc;
+
+   // open the file stream
+   std::shared_ptr<std::ostream> pOfs;
+   Error error = filePath.openForWrite(pOfs, false);
+   if (error)
+      return error;
+
+   try
+   {
+      pOfs->seekp(0, std::ios_base::end);
+
+      // append the content
+      pOfs->write((const char*)&data, sizeof(T));
+      if (pOfs->fail())
+         return systemError(io_error, ERROR_LOCATION);
+   }
+   catch(const std::exception& e)
+   {
+      Error error = systemError(boost::system::errc::io_error,
+                                ERROR_LOCATION);
+      error.addProperty("what", e.what());
+      error.addProperty("path", filePath.getAbsolutePath());
+      return error;
+   }
+
+   return Success();
+}
+
+template <typename T>
+Error readStructVectorFromFile(const core::FilePath& filePath,
+                               std::vector<T>* pVector)
+{
+   using namespace boost::system::errc;
+
+   // open the file stream
+   std::shared_ptr<std::istream> pIfs;
+   Error error = filePath.openForRead(pIfs);
+   if (error)
+      return error;
+
+   try
+   {
+      while(true)
+      {
+         T data;
+         pIfs->read((char*)&data, sizeof(T));
+         if (pIfs->eof())
+            break;
+         else if (pIfs->fail())
+            return systemError(io_error, ERROR_LOCATION);
+         else
+            pVector->push_back(data);
+      }
+   }
+   catch(const std::exception& e)
+   {
+      error = systemError(boost::system::errc::io_error,
+                                ERROR_LOCATION);
+      error.addProperty("what", e.what());
+      error.addProperty("path", filePath.getAbsolutePath());
+      return error;
+   }
+
+   return Success();
+}
+
+
+
+// convenience methods for simple string collections
+ReadCollectionAction parseString(const std::string& line, std::string* pStr);
+std::string stringifyString(const std::string& str);
+
+      
+Error writeStringMapToFile(const core::FilePath& filePath,
+                           const std::map<std::string,std::string>& map);
+
+Error readStringMapFromFile(const core::FilePath& filePath,
+                            std::map<std::string,std::string>* pMap);
+   
+Error writeStringVectorToFile(const core::FilePath& filePath,
+                              const std::vector<std::string>& vector,
+                              bool atomic = true);
+   
+Error readStringVectorFromFile(const core::FilePath& filePath,
+                               std::vector<std::string>* pVector,
+                               bool trimAndIgnoreBlankLines=true);
+
+// Returns true if the given error indicates that a write failed because the
+// disk is full (ENOSPC) or a disk quota was exceeded (EDQUOT), including the
+// Windows equivalents. Useful for translating a raw write failure into a
+// recovery-oriented message for the user.
+bool isDiskSpaceError(const core::Error& error);
+
+// lineEnding is the type of line ending you want the resulting string to have
+Error readStringFromFile(const core::FilePath& filePath,
+                         std::string* pStr,
+                         string_utils::LineEnding lineEnding = string_utils::LineEndingPassthrough,
+                         int startLine = 0,
+                         int endLine = 0,
+                         int startCharacter = 0,
+                         int endCharacter = 0);
+
+// read a string from a file with a filter
+template <typename Filter>
+Error readStringFromFile(
+   const core::FilePath& filePath,
+   const Filter& filter,
+   std::string* pContents,
+   string_utils::LineEnding lineEnding = string_utils::LineEndingPassthrough)
+{
+   try
+   {
+      // open the file stream (report errors with exceptions)
+      std::shared_ptr<std::istream> pIfs;
+      Error error = filePath.openForRead(pIfs);
+      if (error)
+         return error;
+      pIfs->exceptions(std::istream::failbit | std::istream::badbit);
+
+      // output string stream (report errors with exceptions)
+      std::stringstream ostr;
+      ostr.exceptions(std::ostream::failbit | std::ostream::badbit);
+
+      // do the copy
+      boost::iostreams::filtering_ostream filteringOStream;
+      filteringOStream.push(filter);
+      filteringOStream.push(ostr);
+      boost::iostreams::copy(*pIfs, filteringOStream, 128);
+
+      // return contents with requested line endings
+      *pContents = ostr.str();
+      string_utils::convertLineEndings(pContents, lineEnding);
+
+      return Success();
+   }
+   catch(const std::exception& e)
+   {
+      Error error = systemError(boost::system::errc::io_error,
+                                ERROR_LOCATION);
+      error.addProperty("what", e.what());
+      error.addProperty("path", filePath.getAbsolutePath());
+      return error;
+   }
+
+    return Success();
+}
+
+inline core::Error readLinesFromFile(const core::FilePath& filePath, std::vector<std::string>* pLines)
+{
+   std::string contents;
+   Error error = core::readStringFromFile(filePath, &contents);
+   if (error)
+      return error;
+
+   string_utils::convertLineEndings(&contents, string_utils::LineEndingPosix);
+   core::algorithm::append(pLines, core::algorithm::split(contents, "\n"));
+   return Success();
+}
+
+
+bool stripBOM(std::string* pStr);
+
+} // namespace core
+} // namespace rstudio
+
+
+#endif // CORE_FILE_SERIALIZER_HPP

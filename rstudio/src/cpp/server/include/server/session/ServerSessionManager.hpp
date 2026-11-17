@@ -1,0 +1,234 @@
+/*
+ * ServerSessionManager.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef SERVER_SESSION_MANAGER_HPP
+#define SERVER_SESSION_MANAGER_HPP
+
+#include <string>
+#include <vector>
+#include <map>
+
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/function.hpp>
+#include <boost/optional.hpp>
+
+#include <boost/asio/io_context.hpp>
+
+#include <core/BoostSignals.hpp>
+#include <core/http/AsyncClient.hpp>
+#include <core/http/Request.hpp>
+#include <core/Thread.hpp>
+#include <core/json/JsonRpc.hpp>
+
+#include <core/system/PosixSystem.hpp>
+#include <core/system/PosixChildProcessTracker.hpp>
+
+#include <core/r_util/RSessionContext.hpp>
+#include <core/r_util/RSessionLaunchProfile.hpp>
+
+namespace rstudio {
+namespace core {
+   class Error;
+}
+}
+
+namespace rstudio {
+namespace server {
+
+// singleton
+class SessionManager;
+SessionManager& sessionManager();
+
+
+// Session manager for launching managed sessions. This includes
+// automatically waiting for other pending launches (rather than
+// attempting to launch the same session twice) as well as reaping
+// of session child processes
+class SessionManager
+{
+public:
+   struct Config
+   {
+      boost::posix_time::time_duration launchWindow = boost::posix_time::minutes(1);
+      boost::posix_time::time_duration stalePendingLaunchAge = boost::posix_time::minutes(3);
+      boost::function<boost::posix_time::ptime()> now =
+         [] { return boost::posix_time::microsec_clock::universal_time(); };
+      boost::function<bool(PidType)> isProcessRunning =
+         [](PidType pid) { return core::system::isProcessRunning(pid); };
+   };
+
+private:
+   // singleton
+   SessionManager();
+   friend SessionManager& sessionManager();
+
+public:
+   // a standalone manager (the server uses the sessionManager() singleton)
+   explicit SessionManager(const Config& config);
+
+   // launching
+   core::Error launchSession(boost::asio::io_context& ioContext,
+                             const core::r_util::SessionContext& context,
+                             const core::json::JsonRpcRequest& jsonRequest,
+                             const core::http::Request& request,
+                             bool &launched,
+                             core::system::Options environment,
+                             const core::http::ResponseHandler& onLaunch = core::http::ResponseHandler(),
+                             const core::http::ErrorHandler& onError = core::http::ErrorHandler(),
+                             const std::string& openFile = "",
+                             const core::system::Options extraArgs = core::system::Options());
+   // report the outcome of a request for the context. peerPid is the process
+   // that produced it (from the connection's peer credentials) or -1 when
+   // unknown, e.g. no connection was made or the session is reached over TCP
+   void removePendingLaunch(const core::r_util::SessionContext& context, const bool success = true, const std::string& errorMsg = std::string(), PidType peerPid = -1);
+
+   void removePendingSessionLaunch(const std::string& username, const std::string& sessionId, const bool success = true, const std::string& errorMsg = std::string(), PidType peerPid = -1);
+
+   // associate the launched process with its pending launch so a launch whose
+   // process dies before a client connection can be detected and cleared
+   // (rather than suppressing relaunch attempts until it ages out)
+   void notePendingLaunchPid(const core::r_util::SessionContext& context, PidType pid);
+
+   // the pid recorded on the context's pending launch (-1 if none has been
+   // recorded yet), or none when the context has no pending launch
+   boost::optional<PidType> pendingLaunchPid(const core::r_util::SessionContext& context);
+
+   std::size_t pendingLaunchCount();
+
+   // remove the pending launch if it still belongs to the given (now exited)
+   // process; a no-op when the context has no pending launch or the pending
+   // launch was recorded for a different process
+   void removePendingLaunchForPid(const core::r_util::SessionContext& context, PidType pid, int exitStatus);
+
+   // set a custom session launcher
+   typedef boost::function<core::Error(
+                           boost::asio::io_context&,
+                           const core::r_util::SessionLaunchProfile&,
+                           const core::json::JsonRpcRequest& jsonRequest,
+                           const core::http::Request&,
+                           const core::http::ResponseHandler& onLaunch,
+                           const core::http::ErrorHandler& onError)>
+                                                  SessionLaunchFunction;
+   void setSessionLaunchFunction(const SessionLaunchFunction& launchFunction);
+
+   // set a launch profile filter
+   typedef boost::function<void(
+                           core::r_util::SessionLaunchProfile*)>
+                                                  SessionLaunchProfileFilter;
+   void addSessionLaunchProfileFilter(const SessionLaunchProfileFilter& filter);
+
+   // get current session launch profile filters
+   const std::vector<SessionLaunchProfileFilter>& getSessionLaunchProfileFilters() { return sessionLaunchProfileFilters_; }
+
+   // notification that a SIGCHLD was received
+   void notifySIGCHLD();
+
+private:
+   // default session launcher -- runs the process then uses the
+   // ChildProcessTracker to track it's pid for later reaping
+   core::Error launchAndTrackSession(
+                        boost::asio::io_context&,
+                        const core::r_util::SessionLaunchProfile& profile);
+
+   int cleanStalePendingLaunches();
+
+private:
+   // pending launches; pid is -1 until the launched process is known (custom
+   // session launchers may never report one)
+   struct PendingLaunch
+   {
+      boost::posix_time::ptime launchTime;
+      PidType pid = -1;
+
+      // set while the session launch function runs: a request for the
+      // context that ends meanwhile was answered (or failed) without this
+      // launch's process, which isn't listening yet
+      bool launching = false;
+   };
+
+   // the launch function made at launchTime has returned
+   void endLaunching(const core::r_util::SessionContext& context,
+                     const boost::posix_time::ptime& launchTime);
+
+   // what a request outcome did to a pending launch
+   enum class PendingLaunchOutcome
+   {
+      NotFound,      // the context had no pending launch
+      Removed,       // the outcome ended the launch
+      KeptLaunching, // kept: the launch is still being made
+      KeptOtherPid,  // kept: a process other than the launched one produced it
+      KeptLivePid    // kept: unattributed error, and the launched process is alive
+   };
+
+   struct PendingLaunchResolution
+   {
+      PendingLaunchOutcome outcome = PendingLaunchOutcome::NotFound;
+
+      // the process that produced the outcome (KeptOtherPid) or the launched
+      // process (KeptLivePid)
+      PidType pid = -1;
+
+      // when the launch was made (Removed)
+      boost::posix_time::ptime launchTime;
+   };
+
+   typedef std::map<core::r_util::SessionContext, PendingLaunch> LaunchMap;
+
+   // applies a request outcome to the entry (caller holds launchesMutex_),
+   // erasing it when the outcome ends the launch
+   PendingLaunchResolution resolvePendingLaunch(LaunchMap::const_iterator it,
+                                                bool success,
+                                                PidType peerPid);
+
+   // logs why an outcome left a pending launch in place, if it did
+   void logKeptPendingLaunch(const PendingLaunchResolution& resolution,
+                             const std::string& username,
+                             const std::string& sessionId,
+                             bool success,
+                             const std::string& errorMsg);
+
+   boost::mutex launchesMutex_;
+   LaunchMap pendingLaunches_;
+
+   Config config_;
+
+   // session launch function
+   SessionLaunchFunction sessionLaunchFunction_;
+
+   // session launch profile filters
+   std::vector<SessionLaunchProfileFilter> sessionLaunchProfileFilters_;
+
+   // child process tracker
+   core::system::ChildProcessTracker processTracker_;
+};
+
+// set a process config filter
+void setProcessConfigFilter(const core::system::ProcessConfigFilter& filter);
+
+// Lower-level global functions for launching sessions. These are used
+// internally by the SessionManager as well as for verify-installation
+core::Error launchSession(const core::r_util::SessionContext& context,
+                          const core::system::Options& extraArgs,
+                          PidType* pPid);
+
+core::r_util::SessionLaunchProfile createSessionLaunchProfile(const core::r_util::SessionContext& context,
+                                                              const core::system::Options& extraArgs);
+
+
+} // namespace server
+} // namespace rstudio
+
+#endif // SERVER_SESSION_MANAGER_HPP
+

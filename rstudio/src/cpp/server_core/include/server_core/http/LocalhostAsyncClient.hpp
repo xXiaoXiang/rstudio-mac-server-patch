@@ -1,0 +1,180 @@
+/*
+ * LocalhostAsyncClient.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef SERVER_CORE_LOCALHOST_ASYNC_CLIENT_HPP
+#define SERVER_CORE_LOCALHOST_ASYNC_CLIENT_HPP
+
+#include <core/Log.hpp>
+
+#include <core/http/TcpIpAsyncClient.hpp>
+#include <core/http/TcpIpAsyncClientSsl.hpp>
+
+#include <server_core/SocketOwnership.hpp>
+
+namespace rstudio {
+namespace server_core {
+namespace http {
+
+namespace {
+
+// detect when we've got the whole response and force a response and a
+// close of the socket (this is because the current version of httpuv
+// expects a close from the client end of the socket). however, don't
+// do this for Jetty (as it often doesn't send a Content-Length header).
+// AsyncClient only asks this for a buffered, non-chunked body.
+bool stopReadingAndRespondImpl(const core::http::Response& response)
+{
+   std::string server = response.headerValue("Server");
+   if (boost::algorithm::contains(server, "Jetty"))
+      return false;
+
+   return response.body().length() >= response.contentLength();
+}
+
+// ensure that we don't close the connection when a websockets
+// upgrade is taking place
+bool keepConnectionAliveImpl(const core::http::Response& response)
+{
+   return response.statusCode() == core::http::status::SwitchingProtocols;
+}
+
+// shared post-connect ownership check for the plain and SSL localhost client
+// variants below; socket is the underlying TCP-layer socket (next_layer() for
+// the SSL client). returns true to allow the request write to proceed.
+bool verifyConnectedPeerImpl(boost::asio::ip::tcp::socket& socket,
+                             uid_t expectedPeerUid,
+                             core::Error* pError)
+{
+   if (expectedPeerUid == static_cast<uid_t>(-1))
+      return true; // no ownership check requested for this client
+
+   if (server_core::socket_utils::probeOwnershipCheckMode() ==
+       server_core::socket_utils::OwnershipCheckMode::Disabled)
+      return true; // capability absent (logged once at probe) -> degrade to
+                   // no-enforcement rather than break proxying
+
+   int appPort = socket.remote_endpoint().port();       // target/listen port
+   int ephemeralPort = socket.local_endpoint().port();  // our client port
+   core::Error error = server_core::socket_utils::verifyPeerUid(
+                          socket.local_endpoint().address(),
+                          socket.remote_endpoint().address(),
+                          appPort, ephemeralPort, expectedPeerUid);
+   if (error)
+   {
+      WLOGF("Refusing localhost proxy to port {}: {} ({})", appPort, error.getSummary(), error.getProperty("description"));
+      *pError = error;
+      return false;
+   }
+
+   return true;
+}
+
+} // anonymous namespace
+
+class LocalhostAsyncClient : public core::http::TcpIpAsyncClient
+{
+public:
+   LocalhostAsyncClient(boost::asio::io_context& ioContext,
+                        const std::string& address,
+                        const std::string& port,
+                        const boost::posix_time::time_duration& connectionTimeout =
+                                               boost::posix_time::time_duration(boost::posix_time::pos_infin))
+      : core::http::TcpIpAsyncClient(ioContext, address, port, connectionTimeout)
+   {
+   }
+
+   // When set (default: no check), verifyConnectedPeer() enforces that the
+   // established peer socket is owned by expectedPeerUid (rstudio-pro#11470).
+   void setExpectedPeerUid(uid_t uid) { expectedPeerUid_ = uid; }
+
+   // Restricts resolution of this client's (ambiguous, e.g. "localhost")
+   // destination hostname to the given address family, matching which of
+   // /p/ or /p6/ the original request used (rstudio-pro#12142).
+   void setIpv6(bool ipv6)
+   {
+      setIpFamily(ipv6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4());
+   }
+
+private:
+   uid_t expectedPeerUid_ = static_cast<uid_t>(-1);
+
+   virtual bool verifyConnectedPeer(core::Error* pError)
+   {
+      return verifyConnectedPeerImpl(socket(), expectedPeerUid_, pError);
+   }
+
+   virtual bool stopReadingAndRespond()
+   {
+      return stopReadingAndRespondImpl(response_);
+   }
+
+   virtual bool keepConnectionAlive()
+   {
+      return keepConnectionAliveImpl(response_);
+   }
+};
+
+class LocalhostAsyncClientSsl : public core::http::TcpIpAsyncClientSsl
+{
+public:
+   LocalhostAsyncClientSsl(boost::asio::io_context& ioContext,
+                           const std::string& address,
+                           const std::string& port,
+                           bool verifySslCerts,
+                           const std::string& certificateAuthority = std::string(),
+                           const boost::posix_time::time_duration& connectionTimeout =
+                                      boost::posix_time::time_duration(boost::posix_time::pos_infin),
+                           const std::string& hostname = std::string(),
+                           const std::string& verifyAddress = std::string())
+      : core::http::TcpIpAsyncClientSsl(ioContext, address, port, verifySslCerts, certificateAuthority, connectionTimeout, hostname, verifyAddress)
+   {
+   }
+
+   // When set (default: no check), verifyConnectedPeer() enforces that the
+   // established peer socket is owned by expectedPeerUid (rstudio-pro#11470).
+   void setExpectedPeerUid(uid_t uid) { expectedPeerUid_ = uid; }
+
+   // Restricts resolution of this client's (ambiguous, e.g. "localhost")
+   // destination hostname to the given address family, matching which of
+   // /p/ or /p6/ the original request used (rstudio-pro#12142).
+   void setIpv6(bool ipv6)
+   {
+      setIpFamily(ipv6 ? boost::asio::ip::tcp::v6() : boost::asio::ip::tcp::v4());
+   }
+
+private:
+   uid_t expectedPeerUid_ = static_cast<uid_t>(-1);
+
+   virtual bool verifyConnectedPeer(core::Error* pError)
+   {
+      return verifyConnectedPeerImpl(socket().next_layer(), expectedPeerUid_, pError);
+   }
+
+   virtual bool stopReadingAndRespond()
+   {
+      return stopReadingAndRespondImpl(response_);
+   }
+
+   virtual bool keepConnectionAlive()
+   {
+      return keepConnectionAliveImpl(response_);
+   }
+};
+
+} // namespace http
+} // namespace server_core
+} // namespace rstudio
+
+#endif // SERVER_CORE_LOCALHOST_ASYNC_CLIENT_HPP

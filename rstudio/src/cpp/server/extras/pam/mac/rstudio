@@ -1,0 +1,8 @@
+# login: auth account password session
+auth       required       pam_opendirectory.so
+# Account visibility in loginwindow is an independent administrator setting.
+# A web session does not require an interactive login shell. Keep account
+# policy and home-directory validation, including for RStudio-only accounts.
+account    required       pam_opendirectory.so no_check_shell
+password   required       pam_deny.so
+session    required       pam_permit.so

@@ -1,0 +1,204 @@
+#!/bin/bash
+# Copyright (C) 2026 by Posit Software, PBC
+# Licensed under the GNU Affero General Public License, version 3.
+set -e
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+
+SCRIPT_DIR=$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)
+# Shared directory and identity checks. Sourcing never runs an account command.
+source "$SCRIPT_DIR/rstudio-server-users"
+PREFIX=$(cd "$SCRIPT_DIR/.." && /bin/pwd -P)
+BUNDLE=$(cd "$PREFIX/../../.." && /bin/pwd -P)
+CONTROL="$BUNDLE/Contents/MacOS/RStudioServer"
+STATE=/var/db/rstudio-server
+SERVICE=rstudio-server
+INSTALL_LOCK=
+
+attribute() {
+ /usr/bin/dscl -plist /Local/Default -read "$1" "$2" |
+    /usr/bin/plutil -extract "dsAttrTypeStandard:$2.0" raw -o - -
+}
+
+initializeState() {
+ secureDirectory /var/db
+ if [ ! -d "$STATE" ]; then /bin/mkdir -m 700 "$STATE"; fi
+ [ ! -L "$STATE" ] || { fail "Refusing symlinked installation state."; return 1; }
+ secureDirectory "$STATE"
+ /bin/mkdir "$STATE/.install-lock" 2>/dev/null || {
+    fail "Another install/uninstall is running. Inspect $STATE/.install-lock after an interrupted run."; return 1
+ }
+ INSTALL_LOCK="$STATE/.install-lock"
+ trap '[ -z "$INSTALL_LOCK" ] || /bin/rmdir "$INSTALL_LOCK"' EXIT
+}
+
+createServiceAccount() {
+ local uid gid group_uuid user_uuid
+ if directoryService -read "/Users/$SERVICE" >/dev/null 2>&1; then
+    uid=$(attribute "/Users/$SERVICE" UniqueID)
+    [ "$uid" -gt 0 ] && [ "$uid" -lt 500 ] || {
+       fail "Existing $SERVICE is not a system account; inspect it before installing."; return 1
+    }
+    echo "Preserving existing service account $SERVICE (UID $uid)."
+    return
+ fi
+ if /usr/bin/id "$SERVICE" >/dev/null 2>&1 || directoryService -read "/Groups/$SERVICE" >/dev/null 2>&1; then
+    fail "An unmanaged service user/group already uses $SERVICE; inspect it before installing."; return 1
+ fi
+ uid=499
+ while [ "$uid" -ge 200 ]; do
+    if ! /usr/bin/id -nu "$uid" >/dev/null 2>&1 &&
+       ! /usr/bin/dscacheutil -q group -a gid "$uid" | /usr/bin/grep -q .; then break; fi
+    uid=$((uid - 1))
+ done
+ [ "$uid" -ge 200 ] || { fail "No unused system UID/GID is available."; return 1; }
+ gid=$uid
+ # Keep a record of partial setup for inspection after interruption. Never
+ # claim an unrelated pre-existing account. UUIDs are added once Directory
+ # Service supplies them; no GeneratedUID values are replaced.
+ printf '%s\n' "$uid" "$gid" > "$STATE/service-pending"
+ /usr/sbin/dseditgroup -o create -n /Local/Default -i "$gid" -r 'RStudio Server service' "$SERVICE"
+ group_uuid=$(attribute "/Groups/$SERVICE" GeneratedUID)
+ printf '%s\n' "$group_uuid" >> "$STATE/service-pending"
+ directoryService -create "/Users/$SERVICE"
+ user_uuid=$(attribute "/Users/$SERVICE" GeneratedUID)
+ printf '%s\n' "$user_uuid" >> "$STATE/service-pending"
+ directoryService -create "/Users/$SERVICE" UniqueID "$uid"
+ directoryService -create "/Users/$SERVICE" PrimaryGroupID "$gid"
+ directoryService -create "/Users/$SERVICE" NFSHomeDirectory /var/empty
+ directoryService -create "/Users/$SERVICE" UserShell /usr/bin/false
+ directoryService -create "/Users/$SERVICE" RealName 'RStudio Server service'
+ directoryService -create "/Users/$SERVICE" IsHidden 1
+ directoryService -create "/Users/$SERVICE" Password '*'
+ directoryService -create "/Users/$SERVICE" AuthenticationAuthority ';DisabledUser;'
+ /bin/mv "$STATE/service-pending" "$STATE/service-account"
+ echo "Created non-interactive service account $SERVICE (UID/GID $uid)."
+}
+
+installFileOnce() {
+ local source="$1" target="$2" marker="$3"
+ if [ -e "$target" ] || [ -L "$target" ]; then
+    [ -f "$target" ] && [ ! -L "$target" ] || { fail "Refusing non-regular configuration: $target"; return 1; }
+    echo "Preserving $target"
+ else
+    /usr/bin/install -o root -g wheel -m 644 "$source" "$target"
+    /usr/bin/shasum -a 256 "$target" | /usr/bin/awk '{ print $1 }' > "$STATE/$marker"
+ fi
+}
+
+installSystem() {
+ local dir
+ [ ! -e "$STATE/service-pending" ] || {
+    fail "An interrupted service-account creation needs inspection: $STATE/service-pending"; return 1
+ }
+ createServiceAccount
+ for dir in /etc/rstudio /var/lib/rstudio-server /var/log/rstudio /var/log/rstudio/rstudio-server; do
+    [ ! -L "$dir" ] || { fail "Refusing symlinked system directory: $dir"; return 1; }
+    if [ ! -d "$dir" ]; then
+       /usr/bin/install -d -o root -g wheel -m 755 "$dir"
+       printf '%s\n' "$dir" >> "$STATE/created-directories"
+    fi
+ done
+ secureDirectory /etc/rstudio
+ installFileOnce "$PREFIX/extras/pam/rstudio" /etc/pam.d/rstudio pam-sha256
+ installFileOnce "$PREFIX/extras/conf/rserver.conf" /etc/rstudio/rserver.conf config-sha256
+ # rserver initializes/chowns its database and runtime socket directories before
+ # dropping effective privileges. No end-user home or existing configuration is
+ # recursively changed here.
+ echo 'System setup complete. Open RStudioServer.app to enable startup and approve background activity.'
+}
+
+removeInstalledFile() {
+ local target="$1" marker="$2" expected actual
+ [ -f "$STATE/$marker" ] || return 0
+ if [ -f "$target" ] && [ ! -L "$target" ]; then
+    expected=$(cat "$STATE/$marker")
+    actual=$(/usr/bin/shasum -a 256 "$target" | /usr/bin/awk '{ print $1 }')
+    if [ "$actual" = "$expected" ]; then /bin/rm "$target";
+    else echo "Preserving administrator-modified file: $target"; fi
+ fi
+ /bin/rm "$STATE/$marker"
+}
+
+removeServiceAccount() {
+ local uid gid group_uuid user_uuid dir
+ [ -f "$STATE/service-account" ] || return 0
+ { IFS= read -r uid; IFS= read -r gid; IFS= read -r group_uuid; IFS= read -r user_uuid; } < "$STATE/service-account"
+ if ! directoryService -read "/Users/$SERVICE" >/dev/null 2>&1; then
+    echo 'Service account is already absent; retaining its identity record for inspection.'; return
+ fi
+ [ "$(attribute "/Users/$SERVICE" UniqueID)" = "$uid" ] &&
+ [ "$(attribute "/Users/$SERVICE" GeneratedUID)" = "$user_uuid" ] || {
+    fail 'Service-account identity changed; refusing to remove it.'; return 1
+ }
+ if userHasProcesses "$uid"; then
+    fail 'Service-account processes remain; wait for shutdown, then rerun the uninstaller.'; return 1
+ fi
+ # Retained server data stays private even if a system UID is reused. On a
+ # later install rserver assigns ownership to the configured service account.
+ for dir in /var/lib/rstudio-server /var/log/rstudio/rstudio-server; do
+    if [ -d "$dir" ] && [ ! -L "$dir" ]; then
+       /usr/sbin/chown 0:0 "$dir"
+       /bin/chmod -N "$dir"
+       /bin/chmod 700 "$dir"
+    fi
+ done
+ directoryService -delete "/Users/$SERVICE"
+ if [ "$(attribute "/Groups/$SERVICE" PrimaryGroupID)" = "$gid" ] &&
+    [ "$(attribute "/Groups/$SERVICE" GeneratedUID)" = "$group_uuid" ]; then
+    directoryService -delete "/Groups/$SERVICE"
+ fi
+ /bin/rm "$STATE/service-account"
+}
+
+uninstallSystem() {
+ local dir
+ if /usr/bin/pgrep -f "$PREFIX/bin/rsession" >/dev/null; then
+    fail 'Quit all RStudio Server sessions before uninstalling; their homes will be preserved.'; return 1
+ fi
+ "$CONTROL" --disable-service
+ # unregister is asynchronous; wait briefly for the system job to disappear.
+ for ((attempt=0; attempt<30; attempt++)); do
+    /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1 || break
+    /bin/sleep 0.2
+ done
+ if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
+    fail 'The service has not stopped yet; rerun uninstall after shutdown completes.'; return 1
+ fi
+ removeServiceAccount
+ removeInstalledFile /etc/pam.d/rstudio pam-sha256
+ removeInstalledFile /etc/rstudio/rserver.conf config-sha256
+ if [ -f "$STATE/created-directories" ]; then
+    # Reverse installation order; rmdir only ever removes empty directories.
+    /usr/bin/tail -r "$STATE/created-directories" | while IFS= read -r dir; do
+       case "$dir" in /etc/rstudio|/var/lib/rstudio-server|/var/log/rstudio|/var/log/rstudio/rstudio-server)
+          /bin/rmdir "$dir" 2>/dev/null || true ;;
+       esac
+    done
+    /bin/rm "$STATE/created-directories"
+ fi
+ echo 'Service removed. User accounts/homes, modified configuration, logs and database are preserved.'
+ if [ "${1:-}" = --remove-app ]; then
+    [ "$BUNDLE" = /Applications/RStudioServer.app ] || {
+       fail 'Automatic app removal is limited to /Applications/RStudioServer.app.'; return 1
+    }
+    /usr/sbin/pkgutil --forget org.rstudio.RStudioServer.pkg >/dev/null 2>&1 || true
+    echo "Removing $BUNDLE"
+    /bin/rm -rf "$BUNDLE"
+ fi
+}
+
+main() {
+ [ "$EUID" -eq 0 ] || { fail 'Run this installer/uninstaller with sudo.'; return 1; }
+ initializeState
+ case "${1:-}" in
+    install) [ "$#" -eq 1 ]; installSystem ;;
+    uninstall)
+       [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = --remove-app ]; }
+       uninstallSystem "${2:-}" ;;
+    *) fail 'Usage: rstudio-server-install install|uninstall [--remove-app]'; return 2 ;;
+ esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

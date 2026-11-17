@@ -1,0 +1,279 @@
+#!/bin/bash
+# Copyright (C) 2026 by Posit Software, PBC
+# Licensed under the GNU Affero General Public License, version 3.
+# Native macOS account administration; no Python or Homebrew is required.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+
+USER_STATE=/var/db/rstudio-server/accounts
+LOCK_DIR=
+CREATING_USER=
+CREATING_HOME=
+
+fail() { printf '%s\n' "$*" >&2; return 1; }
+directoryService() { /usr/bin/dscl /Local/Default "$@"; }
+userHasProcesses() {
+ /usr/bin/pgrep -u "$1" >/dev/null || /usr/bin/pgrep -U "$1" >/dev/null
+}
+userAttribute() {
+ /usr/bin/dscl -plist /Local/Default -read "/Users/$1" "$2" |
+    /usr/bin/plutil -extract "dsAttrTypeStandard:$2.0" raw -o - -
+}
+
+userHelp() {
+ cat <<'HELP'
+Usage:
+  sudo rstudio-server create-user NAME --home /absolute/new/home [--hidden|--visible]
+  sudo rstudio-server delete-user NAME
+  sudo rstudio-server set-user-visibility NAME hidden|visible
+
+Create the storage parent once, for example:
+  sudo /bin/mkdir -m 755 /Users/RStudioHomes
+
+The home must be NEW. Its parent must already exist, and the storage path must
+be root-owned and not writable by other users. External volumes must be mounted
+with ownership enabled; mount them before creating accounts or starting sessions.
+Creation prompts securely for a password in Terminal. The account is a standard
+local account with a non-login shell (/usr/bin/false), a unique UID and a private
+0700 home. Accounts are visible unless --hidden is specified.
+
+Only accounts created by this tool can be deleted or have visibility changed by
+this tool. Quit all of the user's sessions before deletion; running processes
+prevent deletion. Deletion preserves the home, makes its top directory root-owned
+and private, and does not remove RStudio's database/authentication history.
+
+IsHidden only controls login-window presentation. A non-login shell does not
+guarantee that all macOS graphical or remote login mechanisms are disabled.
+HELP
+}
+
+validateUserName() {
+ [[ "$1" =~ ^[a-z][a-z0-9_]{0,30}$ ]] ||
+    fail "Use a lowercase account name beginning with a letter (maximum 31 characters)."
+}
+
+secureDirectory() {
+ local dir="$1" owner mode
+ [ -d "$dir" ] || { fail "Storage directory does not exist: $dir"; return 1; }
+ # Check the complete resolved ancestry to prevent another user swapping a
+ # privileged home/state path. Administrators prepare the storage explicitly.
+ dir=$(cd "$dir" && /bin/pwd -P) || return 1
+ while :; do
+    owner=$(/usr/bin/stat -f '%u' "$dir") || return 1
+    mode=$(/usr/bin/stat -f '%Lp' "$dir") || return 1
+    if [ "$owner" != 0 ] || (( (8#$mode & 0022) != 0 )); then
+       fail "Storage must be root-owned and not group/world-writable: $dir"
+       return 1
+    fi
+    [ "$dir" = / ] && break
+    dir=$(/usr/bin/dirname "$dir")
+ done
+}
+
+validateHome() {
+ local requested="$1" parent leaf volume
+ case "$requested" in
+    /*) ;;
+    *) fail "--home must be an absolute path."; return 1 ;;
+ esac
+ case "$requested" in
+    *$'\n'*|*$'\r'*|*$'\t'*|*/|*/.|*/..)
+       fail "Use a new home path without control characters, trailing slash, . or ..."; return 1 ;;
+ esac
+ if [ -e "$requested" ] || [ -L "$requested" ]; then
+    fail "Home already exists; existing directories are never adopted or changed: $requested"
+    return 1
+ fi
+ case "$requested" in
+    /Volumes/*)
+       volume=${requested#/Volumes/}; volume=${volume%%/*}
+       if [ ! -d "/Volumes/$volume" ] ||
+          [ "$(/usr/bin/stat -f '%d' "/Volumes/$volume")" = "$(/usr/bin/stat -f '%d' /Volumes)" ]; then
+          fail "Mount the external volume first: /Volumes/$volume"; return 1
+       fi ;;
+ esac
+ parent=$(/usr/bin/dirname "$requested")
+ secureDirectory "$parent" || return 1
+ parent=$(cd "$parent" && /bin/pwd -P) || return 1
+ leaf=$(/usr/bin/basename "$requested")
+ ACCOUNT_HOME="${parent%/}/$leaf"
+}
+
+prepareState() {
+ local parent=/var/db/rstudio-server
+ if [ ! -d "$parent" ]; then
+    secureDirectory /var/db || return 1
+    /bin/mkdir -m 755 "$parent" || return 1
+ fi
+ secureDirectory "$parent" || return 1
+ [ ! -L "$USER_STATE" ] || { fail "Refusing a symlink for account state."; return 1; }
+ if [ ! -d "$USER_STATE" ]; then
+    /bin/mkdir -m 700 "$USER_STATE" || return 1
+ fi
+ secureDirectory "$USER_STATE" || return 1
+ /bin/mkdir -m 700 "$USER_STATE/.lock" 2>/dev/null || {
+    fail "Another account command is running. After an interrupted run, inspect $USER_STATE/.lock before removing the empty lock directory."
+    return 1
+ }
+ LOCK_DIR="$USER_STATE/.lock"
+}
+
+allocateUid() {
+ local records maximum previous=500
+ records=$(directoryService -list /Users UniqueID) || return 1
+ maximum=$(printf '%s\n' "$records" | /usr/bin/awk 'BEGIN { max=500 } $NF > max && $NF < 2147483647 { max=$NF } END { print max }')
+ if [ -e "$USER_STATE/last-uid" ]; then
+    IFS= read -r previous < "$USER_STATE/last-uid"
+    [[ "$previous" =~ ^[0-9]+$ ]] || { fail "Invalid account UID allocation state."; return 1; }
+ fi
+ [ "$previous" -le "$maximum" ] || maximum=$previous
+ ACCOUNT_UID=$((maximum + 1))
+ while /usr/bin/id -nu "$ACCOUNT_UID" >/dev/null 2>&1; do
+    ACCOUNT_UID=$((ACCOUNT_UID + 1))
+ done
+ [ "$ACCOUNT_UID" -lt 2147483647 ] || { fail "No usable local UID remains."; return 1; }
+ # Never automatically reuse this tool's retired UIDs, including failed creates.
+ printf '%s\n' "$ACCOUNT_UID" > "$USER_STATE/last-uid"
+}
+
+createUser() {
+ local name="$1" home= visibility=0 option record uuid
+ shift
+ validateUserName "$name" || return 1
+ while [ "$#" -gt 0 ]; do
+    option="$1"; shift
+    case "$option" in
+       --home)
+          [ "$#" -gt 0 ] && [ -z "$home" ] || { fail "Specify --home exactly once."; return 1; }
+          home="$1"; shift ;;
+       --hidden) visibility=1 ;;
+       --visible) visibility=0 ;;
+       *) fail "Unknown create-user option: $option"; return 1 ;;
+    esac
+ done
+ [ -n "$home" ] || { fail "Specify the new account's home using --home PATH."; return 1; }
+ validateHome "$home" || return 1
+ record="/Users/$name"
+ if /usr/bin/id "$name" >/dev/null 2>&1 || directoryService -read "$record" >/dev/null 2>&1; then
+    fail "Account already exists; it will not be modified: $name"; return 1
+ fi
+ [ -t 0 ] || { fail "Run create-user in Terminal so macOS can securely prompt for the password."; return 1; }
+ prepareState || return 1
+ [ ! -e "$USER_STATE/$name" ] || { fail "Managed account state already exists: $name"; return 1; }
+ allocateUid || return 1
+ /bin/mkdir -m 700 "$ACCOUNT_HOME" || return 1
+ CREATING_HOME="$ACCOUNT_HOME"
+ # POSIX mode alone does not remove inherited macOS ACL grants.
+ /bin/chmod -N "$ACCOUNT_HOME" && /bin/chmod 700 "$ACCOUNT_HOME" || return 1
+ directoryService -create "$record" || return 1
+ CREATING_USER="$name"
+ directoryService -create "$record" UniqueID "$ACCOUNT_UID" &&
+ directoryService -create "$record" PrimaryGroupID 20 &&
+ directoryService -create "$record" NFSHomeDirectory "$ACCOUNT_HOME" &&
+ directoryService -create "$record" UserShell /usr/bin/false &&
+ directoryService -create "$record" RealName "RStudio Server ($name)" &&
+ directoryService -create "$record" IsHidden "$visibility" || return 1
+ # Open Directory creates GeneratedUID; do not overwrite that protected identity.
+ uuid=$(userAttribute "$name" GeneratedUID) || return 1
+ /usr/sbin/chown "$ACCOUNT_UID:20" "$ACCOUNT_HOME" || return 1
+ [ "$(/usr/bin/stat -f '%u' "$ACCOUNT_HOME")" = "$ACCOUNT_UID" ] || {
+    fail "This storage does not enforce file ownership. Enable ownership or choose another volume."; return 1
+ }
+ (cd / && /usr/bin/sudo -n -H -u "$name" /bin/sh -c 'cd "$HOME" && test -w .') || {
+    fail "The account cannot access its home; check volume and ancestor permissions."; return 1
+ }
+ printf 'Set the RStudio login password for %s (input is hidden).\n' "$name"
+ directoryService -passwd "$record" < /dev/tty || return 1
+ printf '%s\n' "$ACCOUNT_UID" "$uuid" "$ACCOUNT_HOME" > "$USER_STATE/$name" || return 1
+ CREATING_USER=; CREATING_HOME=
+ printf 'Created %s (UID %s, hidden=%s).\nHome: %s\nSign in at the Server URL with this account and password.\n' \
+    "$name" "$ACCOUNT_UID" "$visibility" "$ACCOUNT_HOME"
+}
+
+loadManagedUser() {
+ local name="$1" current_uid current_uuid
+ validateUserName "$name" || return 1
+ prepareState || return 1
+ [ -f "$USER_STATE/$name" ] && [ ! -L "$USER_STATE/$name" ] || {
+    fail "This account was not created by this tool; it will not be modified: $name"; return 1
+ }
+ { IFS= read -r ACCOUNT_UID; IFS= read -r ACCOUNT_UUID; IFS= read -r ACCOUNT_HOME; } < "$USER_STATE/$name" || return 1
+ [[ "$ACCOUNT_UID" =~ ^[0-9]+$ ]] && [ "$ACCOUNT_UID" -ge 501 ] || return 1
+ current_uid=$(userAttribute "$name" UniqueID) || return 1
+ current_uuid=$(userAttribute "$name" GeneratedUID) || return 1
+ [ "$current_uid" = "$ACCOUNT_UID" ] && [ "$current_uuid" = "$ACCOUNT_UUID" ] || {
+    fail "Account identity changed; refusing to modify it: $name"; return 1
+ }
+}
+
+deleteUser() {
+ local name="$1" current_home
+ loadManagedUser "$name" || return 1
+ if userHasProcesses "$ACCOUNT_UID"; then
+    fail "The account still has running processes. Quit its RStudio sessions before deletion."; return 1
+ fi
+ current_home=$(userAttribute "$name" NFSHomeDirectory) || return 1
+ [ "$current_home" = "$ACCOUNT_HOME" ] && [ -d "$ACCOUNT_HOME" ] && [ ! -L "$ACCOUNT_HOME" ] &&
+    [ "$(/usr/bin/stat -f '%u' "$ACCOUNT_HOME")" = "$ACCOUNT_UID" ] || {
+    fail "The home has changed or its volume is unavailable; inspect it before deletion."; return 1
+ }
+ secureDirectory "$(/usr/bin/dirname "$ACCOUNT_HOME")" || return 1
+ /usr/sbin/chown 0:0 "$ACCOUNT_HOME" && /bin/chmod -N "$ACCOUNT_HOME" && /bin/chmod 700 "$ACCOUNT_HOME" || return 1
+ # Release macOS's home-directory registration before removing the account.
+ if ! directoryService -create "/Users/$name" NFSHomeDirectory /var/empty ||
+    ! directoryService -delete "/Users/$name"; then
+    directoryService -create "/Users/$name" NFSHomeDirectory "$ACCOUNT_HOME"
+    /usr/sbin/chown "$ACCOUNT_UID:20" "$ACCOUNT_HOME"
+    fail "Account removal failed; its home was preserved."; return 1
+ fi
+ /bin/rm -f "$USER_STATE/$name" || return 1
+ printf 'Deleted account %s. Home preserved, root-owned and private: %s\n' "$name" "$ACCOUNT_HOME"
+}
+
+setVisibility() {
+ local name="$1" hidden
+ case "$2" in
+    hidden) hidden=1 ;;
+    visible) hidden=0 ;;
+    *) fail "Choose hidden or visible."; return 1 ;;
+ esac
+ loadManagedUser "$name" || return 1
+ directoryService -create "/Users/$name" IsHidden "$hidden"
+}
+
+cleanup() {
+ local status=$?
+ if [ -n "$CREATING_USER" ]; then
+    directoryService -create "/Users/$CREATING_USER" NFSHomeDirectory /var/empty >/dev/null 2>&1
+    directoryService -delete "/Users/$CREATING_USER" || printf 'Inspect incomplete account: %s\n' "$CREATING_USER" >&2
+ fi
+ if [ -n "$CREATING_HOME" ]; then
+    /usr/sbin/chown 0:0 "$CREATING_HOME"
+    /bin/rmdir "$CREATING_HOME" || printf 'Home was preserved for inspection: %s\n' "$CREATING_HOME" >&2
+ fi
+ [ -z "$LOCK_DIR" ] || /bin/rmdir "$LOCK_DIR"
+ return "$status"
+}
+
+main() {
+ local action="${1:-help}"
+ [ "$#" -eq 0 ] || shift
+ case "$action" in help|--help|-h) userHelp; return ;; esac
+ [ "$EUID" -eq 0 ] || { fail "Run this account command with sudo in your Terminal."; return 1; }
+ [ "$(/usr/bin/uname -s)" = Darwin ] || { fail "This tool requires macOS."; return 1; }
+ trap cleanup EXIT
+ trap 'exit 130' INT
+ trap 'exit 143' TERM HUP
+ case "$action" in
+    create-user) [ "$#" -ge 1 ] && createUser "$@" ;;
+    delete-user) [ "$#" -eq 1 ] && deleteUser "$1" ;;
+    set-user-visibility) [ "$#" -eq 2 ] && setVisibility "$@" ;;
+    *) userHelp; return 2 ;;
+ esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+ main "$@"
+fi

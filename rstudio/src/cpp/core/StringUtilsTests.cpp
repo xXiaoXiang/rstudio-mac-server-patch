@@ -1,0 +1,611 @@
+/*
+ * StringUtils.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <gtest/gtest.h>
+
+#include <boost/scope_exit.hpp>
+
+#include <clocale>
+#include <string>
+#include <vector>
+
+#include <core/Algorithm.hpp>
+#include <core/StringUtils.hpp>
+
+#define kLatexStyleLineCommentRegex ("^%+\\s*")
+
+namespace rstudio {
+namespace core {
+namespace string_utils {
+
+using namespace algorithm;
+
+TEST(StringTest, StringsCanBeSplitOnNULBytes)
+{
+   std::string text("a\0b\0c", 5);
+   std::string delim("\0", 1);
+   std::vector<std::string> splat = split(text, delim);
+   EXPECT_EQ(3u, splat.size());
+   EXPECT_EQ(std::string("a"), splat[0]);
+   EXPECT_EQ(std::string("b"), splat[1]);
+   EXPECT_EQ(std::string("c"), splat[2]);
+}
+
+TEST(StringTest, RawDelimitersContainingNullBytesCanBeSplit)
+{
+   std::string text("a\0b\0c", 5);
+   std::vector<std::string> splat = split(text, "\0");
+   EXPECT_EQ(3u, splat.size());
+   EXPECT_EQ(std::string("a"), splat[0]);
+   EXPECT_EQ(std::string("b"), splat[1]);
+   EXPECT_EQ(std::string("c"), splat[2]);
+}
+
+TEST(StringTest, IsSubsequenceWorks)
+{
+   EXPECT_TRUE(isSubsequence("", ""));
+   EXPECT_TRUE(isSubsequence("annnbnnnc", "abc"));
+   EXPECT_FALSE(isSubsequence("abcdef", "abdcef"));
+   EXPECT_TRUE(isSubsequence("abcdef", "AeF", true));
+   EXPECT_TRUE(isSubsequence("a1d2", "12"));
+}
+
+TEST(StringTest, StrippedOfBackQuotesWorks)
+{
+   std::string string = "`abc`";
+   std::string stripped = strippedOfBackQuotes(string);
+   EXPECT_EQ(std::string("abc"), stripped);
+
+   EXPECT_EQ(std::string("abc"), strippedOfBackQuotes("abc"));
+}
+
+TEST(StringTest, SubstringWorks)
+{
+   std::string string("  abc  ");
+   EXPECT_EQ(std::string("abc"), substring(string, 2, 5));
+   EXPECT_EQ(std::string(""), substring(string, 2, 2));
+   EXPECT_EQ(std::string("abc  "), substring(string, 2, std::string::npos));
+
+   // an inverted range returns the rest of the string
+   EXPECT_EQ(std::string("abc  "), substring(string, 2, 1));
+}
+
+TEST(StringTest, TrimWhitespaceWorks)
+{
+   std::string string("   abc   ");
+   EXPECT_EQ(std::string("abc"), trimWhitespace(string));
+   EXPECT_EQ(std::string("abc"), trimWhitespace("abc"));
+   EXPECT_EQ(std::string(""), trimWhitespace(""));
+}
+
+TEST(StringTest, CountNewLinesWorksWithEmptyString)
+{
+   std::string str("");
+   EXPECT_EQ(0u, countNewlines(str));
+}
+
+TEST(StringTest, CountNewLinesWorksWithLineFeed)
+{
+   std::string str("\n\n\n");
+   EXPECT_EQ(3u, countNewlines(str));
+}
+
+TEST(StringTest, CountNewLinesWorksWithCarriageReturnLineFeed)
+{
+   std::string str("\r\n\r\n");
+   EXPECT_EQ(2u, countNewlines(str));
+}
+
+TEST(StringTest, CommentHeadersCanBeExtracted)
+{
+   std::string text(
+            "% This is a header.\n"
+            "% Let's hope the text is extracted.\n"
+            "\n"
+            "This should be ignored.");
+
+   std::string extracted;
+   bool success = extractCommentHeader(text, kLatexStyleLineCommentRegex, &extracted);
+   std::string expected(
+            "This is a header.\n"
+            "Let's hope the text is extracted.\n");
+
+   EXPECT_TRUE(success);
+   EXPECT_EQ(expected, extracted);
+}
+
+TEST(StringTest, CommentHeadersWithNoTrailingNewlineAreHandled)
+{
+   std::string text("% Hello\n% World");
+
+   std::string extracted;
+   bool success = extractCommentHeader(text, kLatexStyleLineCommentRegex, &extracted);
+   std::string expected("Hello\nWorld\n");
+
+   EXPECT_TRUE(success);
+   EXPECT_EQ(expected, extracted);
+}
+
+TEST(StringTest, CommentHeaderEdgeCasesAreHandled)
+{
+   std::string extracted;
+   EXPECT_FALSE(extractCommentHeader("", kLatexStyleLineCommentRegex, &extracted));
+
+   std::string text(
+            "There is a comment\n"
+            "% but not at the start of the document.\n");
+   EXPECT_FALSE(extractCommentHeader(text, kLatexStyleLineCommentRegex, &extracted));
+}
+
+TEST(StringTest, JavaScriptLiteralsAreEscaped)
+{
+   EXPECT_EQ(std::string("\\\"hello\\\""), jsLiteralEscape("\"hello\""));
+   EXPECT_EQ(std::string("\\'goodbye\\'"), jsLiteralEscape("'goodbye'"));
+   EXPECT_EQ(std::string("\\074/script>"), jsLiteralEscape("</script>"));
+}
+
+TEST(StringTest, HtmlTagsInJsonAreEscaped)
+{
+   EXPECT_EQ(std::string("\\u003ch1\\u003e"), jsonHtmlEscape("<h1>"));
+   EXPECT_EQ(std::string("\\u003cscript\\u003ealert!"), jsonHtmlEscape("<script>alert!"));
+}
+
+TEST(StringTest, SomeSimpleStringsCanBeFormatted)
+{
+   std::string s;
+
+   s = string_utils::sprintf("%s, %s!", "Hello", "world");
+   EXPECT_EQ(std::string("Hello, world!"), s);
+
+   s = string_utils::sprintf("%i + %i == %i", 2, 2, 2 + 2);
+   EXPECT_EQ(std::string("2 + 2 == 4"), s);
+}
+
+TEST(StringTest, PositionInEmptyStringIsAlwaysZeroZero)
+{
+   std::string text("");
+   collection::Position pos = offsetToPosition(text, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(text, 100);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+}
+
+TEST(StringTest, PositionCanBeComputedForSingleLineString)
+{
+   std::string text("012345");
+   collection::Position pos = offsetToPosition(text, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(text, 4);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(text, 100);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(6u, pos.column);
+}
+
+TEST(StringTest, PositionCanBeComputedForTwoLineString)
+{
+   std::string textPosix("0123456\n89");
+   collection::Position pos = offsetToPosition(textPosix, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textPosix, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   pos = offsetToPosition(textPosix, 8);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   std::string textWindows("0123456\r\n90");
+   pos = offsetToPosition(textWindows, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textWindows, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   pos = offsetToPosition(textWindows, 9);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textWindows, 10);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(1u, pos.column);
+
+   std::string textOldMac("0123456\r89");
+   pos = offsetToPosition(textOldMac, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 8);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 9);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(1u, pos.column);
+}
+
+TEST(StringTest, PositionCanBeComputedForMultiLineString)
+{
+   std::string textPosix("01234\n67\n9012345\n");
+   collection::Position pos = offsetToPosition(textPosix, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textPosix, 4);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(textPosix, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   pos = offsetToPosition(textPosix, 6);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textPosix, 7);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(1u, pos.column);
+
+   pos = offsetToPosition(textPosix, 13);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(textPosix, 16);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(7u, pos.column);
+
+   std::string textWindows("01234\r\n78\r\n1234567\r\n");
+   pos = offsetToPosition(textWindows, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textWindows, 4);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(textWindows, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   // ensure we can point at the \n in a \r\n sequence
+   pos = offsetToPosition(textWindows, 6);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(6u, pos.column);
+
+   pos = offsetToPosition(textWindows, 7);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textWindows, 13);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(2u, pos.column);
+
+   pos = offsetToPosition(textWindows, 18);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(7u, pos.column);
+
+   pos = offsetToPosition(textWindows, 19);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(8u, pos.column);
+
+   std::string textOldMac("01234\r67\r9012345\r");
+   pos = offsetToPosition(textOldMac, 0);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 4);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 5);
+   EXPECT_EQ(0u, pos.row);
+   EXPECT_EQ(5u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 6);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(0u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 7);
+   EXPECT_EQ(1u, pos.row);
+   EXPECT_EQ(1u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 13);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(4u, pos.column);
+
+   pos = offsetToPosition(textOldMac, 16);
+   EXPECT_EQ(2u, pos.row);
+   EXPECT_EQ(7u, pos.column);
+}
+
+TEST(StringTest, HeredocStripsCommonIndent)
+{
+   std::string text = heredoc(R"(
+      library(knitr)
+      knit('example.Rmd')
+   )");
+   EXPECT_EQ(std::string("library(knitr)\nknit('example.Rmd')"), text);
+}
+
+TEST(StringTest, HeredocPreservesRelativeIndent)
+{
+   std::string text = heredoc(R"(
+      if (x) {
+         f()
+      }
+   )");
+   EXPECT_EQ(std::string("if (x) {\n   f()\n}"), text);
+}
+
+TEST(StringTest, HeredocHandlesBlankInteriorLines)
+{
+   std::string text = heredoc(R"(
+      a
+
+      b
+   )");
+   EXPECT_EQ(std::string("a\n\nb"), text);
+}
+
+TEST(StringTest, HeredocLeavesUnindentedTextUnchanged)
+{
+   EXPECT_EQ(std::string("a\nb"), heredoc("a\nb"));
+}
+
+TEST(StringTest, HeredocHandlesEmptyInput)
+{
+   EXPECT_EQ(std::string(""), heredoc(""));
+}
+
+TEST(StringTest, SingleQuotedStrEscapeLeavesPlainTextUnchanged)
+{
+   EXPECT_EQ(std::string("hello"), singleQuotedStrEscape("hello"));
+   EXPECT_EQ(std::string(""), singleQuotedStrEscape(""));
+}
+
+TEST(StringTest, SingleQuotedStrEscapeEscapesQuotesAndBackslashes)
+{
+   // a single quote is escaped so it cannot terminate the enclosing literal
+   EXPECT_EQ(std::string("it\\'s"), singleQuotedStrEscape("it's"));
+
+   // a backslash is doubled so it cannot escape the following character
+   EXPECT_EQ(std::string("a\\\\b"), singleQuotedStrEscape("a\\b"));
+}
+
+TEST(StringTest, SingleQuotedStrEscapeNeutralizesInjectionPayload)
+{
+   // a filename crafted to break out of a single-quoted R literal and inject
+   // code has every quote escaped, so the payload cannot close the literal
+   EXPECT_EQ(std::string("\\'); system(\\'rm -rf /\\'); #"),
+             singleQuotedStrEscape("'); system('rm -rf /'); #"));
+}
+
+TEST(StringTest, Utf8IncompleteSuffixLengthHandlesCompleteText)
+{
+   // empty, pure ASCII, and text ending on a character boundary are complete
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength(""));
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("hello"));
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("a\xE2\x94\x80"));       // a + U+2500
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("\xC3\xA9"));            // U+00E9
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("\xF0\x9F\x98\x80"));    // U+1F600
+}
+
+TEST(StringTest, Utf8IncompleteSuffixLengthDetectsTruncatedSequences)
+{
+   // 2-byte sequence missing its continuation byte
+   EXPECT_EQ(1u, utf8IncompleteSuffixLength("abc\xC3"));
+
+   // 3-byte sequence truncated after one and two bytes
+   EXPECT_EQ(1u, utf8IncompleteSuffixLength("abc\xE2"));
+   EXPECT_EQ(2u, utf8IncompleteSuffixLength("abc\xE2\x94"));
+
+   // 4-byte sequence truncated after one, two, and three bytes
+   EXPECT_EQ(1u, utf8IncompleteSuffixLength("abc\xF0"));
+   EXPECT_EQ(2u, utf8IncompleteSuffixLength("abc\xF0\x9F"));
+   EXPECT_EQ(3u, utf8IncompleteSuffixLength("abc\xF0\x9F\x98"));
+
+   // a truncated sequence with no preceding text
+   EXPECT_EQ(2u, utf8IncompleteSuffixLength("\xE2\x94"));
+}
+
+TEST(StringTest, Utf8IncompleteSuffixLengthIgnoresInvalidSequences)
+{
+   // a stray continuation byte is invalid, not truncated
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("abc\x80"));
+
+   // invalid lead bytes (0xF8-0xFF) cannot start a sequence
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("abc\xFE"));
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("abc\xFF\x80"));
+
+   // continuation bytes with no lead byte in reach are invalid
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("a\x80\x80\x80\x80"));
+
+   // a complete sequence followed by nothing more is not truncated, even
+   // though its last bytes are continuation bytes
+   EXPECT_EQ(0u, utf8IncompleteSuffixLength("\xE2\x94\x80"));
+}
+
+TEST(StringTest, Utf8ValidationFollowsRfc3629)
+{
+   struct Case
+   {
+      const char* name;
+      std::string text;
+      bool valid;
+      std::size_t firstLength; // utf8SequenceLength at 0; unused for empty text
+   };
+
+   const std::vector<Case> cases = {
+      {"empty", "", true, 0},
+      {"ASCII", "hello", true, 1},
+      {"two bytes", "\xC3\xA9", true, 2},                   // U+00E9
+      {"three bytes", "\xE2\x82\xAC", true, 3},             // U+20AC
+      {"four bytes", "\xF0\x9F\x98\x80", true, 4},          // U+1F600
+      {"last code point", "\xF4\x8F\xBF\xBF", true, 4},     // U+10FFFF
+      {"last before surrogates", "\xED\x9F\xBF", true, 3},  // U+D7FF
+      {"embedded NUL", std::string("a\0b", 3), false, 1},
+      {"past U+10FFFF", "\xF4\x90\x80\x80", false, 0},
+      {"surrogate", "\xED\xA0\x80", false, 0},              // U+D800
+      {"overlong two bytes", "\xC0\xAF", false, 0},
+      {"overlong three bytes", "\xE0\x80\xAF", false, 0},
+      {"overlong four bytes", "\xF0\x80\x80\xAF", false, 0},
+      {"stray continuation", "\x80", false, 0},
+      {"truncated", "\xE2\x82", false, 0},
+      {"bad continuation", "\xE2\x28\xA1", false, 0},
+      {"invalid lead", "\xF5\x80\x80\x80", false, 0},
+      {"invalid byte after valid text", "abc\xFF", false, 1},
+   };
+
+   for (const Case& testCase : cases)
+   {
+      SCOPED_TRACE(testCase.name);
+      EXPECT_EQ(isValidUtf8(testCase.text), testCase.valid);
+      if (!testCase.text.empty())
+         EXPECT_EQ(utf8SequenceLength(testCase.text, 0), testCase.firstLength);
+   }
+}
+
+TEST(StringTest, CleanUtf8StringKeepsValidTextAndReplacesEachBadByte)
+{
+   struct Case
+   {
+      const char* name;
+      std::string input;
+      std::string expected;
+   };
+
+   const std::string replacement = "\xEF\xBF\xBD"; // U+FFFD
+   const std::vector<Case> cases = {
+      {"empty", "", ""},
+      {"valid text unchanged", "caf\xC3\xA9 \xF0\x9F\x98\x80", "caf\xC3\xA9 \xF0\x9F\x98\x80"},
+      {"NUL dropped", std::string("a\0b\0", 4), "ab"},
+      {"invalid byte replaced", "a\xFF" "b", "a" + replacement + "b"},
+      {"each byte replaced on its own", "\xFF\xFE", replacement + replacement},
+      {"surrogate replaced byte by byte", "\xED\xA0\x80", replacement + replacement + replacement},
+      {"truncated sequence at the end", "ab\xE2\x82", "ab" + replacement + replacement},
+      {"valid text after a bad byte survives", "\xC0" "caf\xC3\xA9", replacement + "caf\xC3\xA9"},
+   };
+
+   for (const Case& testCase : cases)
+   {
+      SCOPED_TRACE(testCase.name);
+      const std::string cleaned = cleanUtf8String(testCase.input);
+      EXPECT_EQ(cleaned, testCase.expected);
+      EXPECT_TRUE(isValidUtf8(cleaned));
+   }
+}
+
+TEST(StringTest, HtmlUnescapeReversesHtmlEscape)
+{
+   // round-trips the full entity set htmlEscape emits
+   std::string raw = "object 'y' not found in R/foo.R <a> & \"b\"";
+   EXPECT_EQ(raw, htmlUnescape(htmlEscape(raw)));
+
+   // a literal entity in the source survives the round trip
+   std::string literal = "use &lt; to mean less-than";
+   EXPECT_EQ(literal, htmlUnescape(htmlEscape(literal)));
+
+   // decoding does not cascade: an escaped entity decodes to the entity, not
+   // to the character it names
+   EXPECT_EQ("&lt;", htmlUnescape("&amp;lt;"));
+   EXPECT_EQ("&amp;", htmlUnescape("&amp;amp;"));
+
+   // text with no entities is returned unchanged
+   EXPECT_EQ("nothing to decode", htmlUnescape("nothing to decode"));
+
+   // an unrecognized or truncated entity is left alone rather than eaten
+   EXPECT_EQ("a & b", htmlUnescape("a & b"));
+   EXPECT_EQ("&nbsp;", htmlUnescape("&nbsp;"));
+   EXPECT_EQ("&lt", htmlUnescape("&lt"));
+
+   // adjacent entities decode independently, and matching is case-sensitive
+   EXPECT_EQ("<>", htmlUnescape("&lt;&gt;"));
+   EXPECT_EQ("&LT;", htmlUnescape("&LT;"));
+}
+
+TEST(StringTest, HtmlToTextDropsTagsThenDecodesEntities)
+{
+   // remove tags, including attributes
+   EXPECT_EQ("foo bar baz", htmlToText("<a href=\"a\">foo</a> <b>bar</b> <span class='c'>baz</span>"));
+
+   // entities are decoded once and only once
+   EXPECT_EQ("<b>foo</b>", htmlToText("&lt;b&gt;foo&lt;&#x2F;b&gt;"));
+
+   // stray < doesn't eat the whole message
+   EXPECT_EQ("a < b", htmlToText("a < b"));
+}
+
+#ifdef _WIN32
+
+TEST(StringTest, Utf8ToCodepageHonorsAnExplicitCodePage)
+{
+   // U+00C7 (C with cedilla) and U+0131 (dotless i): the first is
+   // representable in CP1252, the second is not
+   std::string utf8("\xC3\x87\xC4\xB1");
+
+   const wchar_t* pLocale = ::_wsetlocale(LC_CTYPE, nullptr);
+   ASSERT_NE(nullptr, pLocale);
+   std::wstring locale(pLocale);
+   BOOST_SCOPE_EXIT(&locale)
+   {
+      ::_wsetlocale(LC_CTYPE, locale.c_str());
+   }
+   BOOST_SCOPE_EXIT_END
+
+   // converting for a UTF-8 code page leaves the text alone no matter what
+   // the C runtime locale happens to be. this is what keeps console input
+   // intact when something has clobbered the process locale (#18139); the
+   // wctomb() path this replaces would mangle it in the "C" locale
+   ASSERT_NE(nullptr, ::_wsetlocale(LC_CTYPE, L"C"));
+   EXPECT_EQ(utf8, utf8ToCodepage(utf8, 65001, true));
+
+   // an unrepresentable character is escaped for R rather than transliterated
+   // into a lookalike that means something else
+   EXPECT_EQ(std::string("\xC7") + "\\u131", utf8ToCodepage(utf8, 1252, true));
+
+   // GB18030 rejects WC_NO_BEST_FIT_CHARS. A failed first conversion must be
+   // retried with supported arguments rather than escaping even ASCII.
+   EXPECT_EQ("x <- 1", utf8ToCodepage("x <- 1", 54936, true));
+
+   // Supplementary characters must be converted as a surrogate pair. GB18030
+   // can represent this character, while CP1252 should emit one scalar escape
+   // rather than two invalid surrogate escapes.
+   std::string emoji("\xF0\x9F\x98\x80");
+   EXPECT_EQ(std::string("\x94\x39\xFC\x36"),
+             utf8ToCodepage(emoji, 54936, true));
+   EXPECT_EQ("\\U0001f600", utf8ToCodepage(emoji, 1252, true));
+}
+
+#endif
+
+} // end namespace string_utils
+} // end namespace core
+} // end namespace rstudio

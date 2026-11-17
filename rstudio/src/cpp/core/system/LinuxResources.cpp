@@ -1,0 +1,1290 @@
+/*
+ * LinuxResources.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+#include <shared_core/Memory.hpp>
+#include <shared_core/SafeConvert.hpp>
+
+#include <core/Algorithm.hpp>
+#include <core/FileSerializer.hpp>
+#include <core/Log.hpp>
+#include <core/StringUtils.hpp>
+#include <core/Thread.hpp>
+#include <core/Truncating.hpp>
+#include <core/system/Container.hpp>
+#include <core/system/Resources.hpp>
+#include <core/system/PosixSystem.hpp>
+
+#include <boost/regex.hpp>
+#include <boost/scope_exit.hpp>
+
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <map>
+#include <sstream>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <sys/sysinfo.h>
+
+using namespace rstudio::core;
+
+namespace rstudio {
+namespace core {
+namespace system {
+namespace {
+
+// The mode used to compute and report memory usage. Set from the
+// "memory-usage-mode" option via setMemoryUsageMode().
+MemoryUsageMode s_memoryUsageMode = MemoryUsageModeAuto;
+
+// Returns the effective memory usage mode, resolving the "auto" mode to the
+// container mode when running inside a container and the historical default
+// otherwise.
+MemoryUsageMode effectiveMemoryUsageMode()
+{
+   if (s_memoryUsageMode == MemoryUsageModeAuto)
+      return container::isRunningInContainer() ? MemoryUsageModeContainer : MemoryUsageModeDefault;
+   return s_memoryUsageMode;
+}
+
+// More than any of the procfs files read here holds. A descriptor that never
+// reports end-of-file would otherwise be read until memory ran out.
+const std::size_t kMaxProcFileSize = 1024 * 1024;
+
+// The lines of /proc/<pid>/status that give the parent and the size of a process.
+const std::vector<std::string>& processStatusKeys()
+{
+   // leaked: memory usage is queried from the offline service thread (#18318)
+   static const std::vector<std::string>& s_keys = core::make_leaked<std::vector<std::string>>(
+         std::initializer_list<std::string>{"PPid", "VmRSS", "VmSwap"});
+   return s_keys;
+}
+
+// Reads the number that follows the colon of a "Key: value" line. Blanks may
+// come before it, and a unit after it.
+bool readProcFileValue(const std::string& contents, std::size_t pos, std::size_t lineEnd, long* pValue)
+{
+   while (pos < lineEnd && (contents[pos] == ' ' || contents[pos] == '\t'))
+      pos++;
+
+   // strtol skips whitespace of its own, which could take it to the next line
+   if (pos == lineEnd || contents[pos] < '0' || contents[pos] > '9')
+      return false;
+
+   errno = 0;
+   *pValue = ::strtol(contents.c_str() + pos, nullptr, 10);
+   return errno == 0;
+}
+
+// Looks up the values of "Key: value" lines in a single pass over the
+// contents of a procfs file. A key that isn't there is left without a value.
+// So is one whose value can't be read, which is reported as an error once
+// the other keys have been looked up.
+Error scanProcFileKeys(const std::string& contents,
+                       const std::vector<std::string>& keys,
+                       std::vector<boost::optional<long>>* pValues)
+{
+   // /proc/meminfo and /proc/<pid>/status contain lines that look like this:
+   //
+   // MemTotal: 8124360 kB
+   pValues->assign(keys.size(), boost::none);
+
+   Error scanError;
+   std::size_t numFound = 0;
+   std::size_t lineStart = 0;
+   while (numFound < keys.size() && lineStart < contents.size())
+   {
+      std::size_t lineEnd = contents.find('\n', lineStart);
+      if (lineEnd == std::string::npos)
+         lineEnd = contents.size();
+
+      for (std::size_t i = 0; i < keys.size(); i++)
+      {
+         // The first line for a key is the one that counts. A repeated line
+         // must not be counted in place of a key that is yet to be found.
+         const std::string& key = keys[i];
+         std::size_t keyEnd = lineStart + key.size();
+         bool isKeyOfLine = !(*pValues)[i] &&
+                            keyEnd < lineEnd &&
+                            contents[keyEnd] == ':' &&
+                            contents.compare(lineStart, key.size(), key) == 0;
+         if (!isKeyOfLine)
+            continue;
+
+         long value = 0;
+         if (readProcFileValue(contents, keyEnd + 1, lineEnd, &value))
+         {
+            (*pValues)[i] = value;
+            numFound++;
+         }
+         else if (!scanError)
+         {
+            std::string line = contents.substr(lineStart, lineEnd - lineStart);
+            scanError = systemError(boost::system::errc::protocol_error,
+                                    fmt::format("Could not read proc value '{}' from line '{}'", key, line),
+                                    ERROR_LOCATION);
+         }
+
+         break;
+      }
+
+      lineStart = lineEnd + 1;
+   }
+
+   return scanError;
+}
+
+// Reads a procfs file, and hands its contents to a parser. An error from the
+// parser is given the path of the file.
+template <typename Parser>
+Error parseProcFile(const std::string& procPath, Parser parser)
+{
+   std::string contents;
+   Error error = readProcFile(procPath, &contents);
+   if (error)
+      return error;
+
+   error = parser(contents);
+   if (error)
+      error.addProperty("path", procPath);
+   return error;
+}
+
+// Reads /proc/meminfo to look up specific memory stats.
+Error readProcFileKeys(const std::string& procPath, const std::vector<std::string>& keys, std::vector<long>* pValues)
+{
+   return parseProcFile(procPath, [&](const std::string& contents)
+   {
+      return parseProcFileKeys(contents, keys, pValues);
+   });
+}
+
+// Reads the parent and the size of a process from its /proc/<pid>/status.
+Error readProcessStatus(const std::string& statusPath, ProcessStatus* pStatus)
+{
+   return parseProcFile(statusPath, [&](const std::string& contents)
+   {
+      return parseProcessStatus(contents, pStatus);
+   });
+}
+
+// Whether a procfs read failed because the process has since exited: ENOENT
+// if it was gone before the open, ESRCH if it was reaped before the read.
+bool isProcessGone(const Error& error)
+{
+   return isNotFoundError(error) || error == systemError(ESRCH, ErrorLocation());
+}
+
+// Returns the RSS + swap for the specified process, in kb.
+// The goal here is to choose values that are specific to a given process,
+// that are using real resources on the system. Including swap so that processes
+// that overflow main memory continue are measured based on their complete size.
+long getProcessSize(PidType pid)
+{
+   ProcessStatus status;
+   Error error = readProcessStatus("/proc/" + std::to_string(pid) + "/status", &status);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return 0;
+   }
+
+   return status.sizeKb;
+}
+
+bool isChildOfParent(const std::map<PidType, ProcessStatus>& processes, PidType parentPid, PidType childPid)
+{
+   if (childPid == parentPid)
+      return true;
+   do
+   {
+      auto it = processes.find(childPid);
+      if (it == processes.end())
+         return false;
+      PidType nextParent = it->second.parentPid;
+      if (nextParent == parentPid)
+         return true;
+      childPid = nextParent;
+   } while (true);
+}
+
+long getProcessSizeOfChildren(PidType parentPid, UidType userId)
+{
+   DIR *pDir = nullptr;
+   long childRssSize = 0;
+   std::map<PidType, ProcessStatus> processes;
+
+   try
+   {
+      // open the /proc directory
+      pDir = ::opendir("/proc");
+      if (pDir == nullptr)
+         return 0;
+
+      struct dirent *pDirEnt;
+      while ( (pDirEnt = ::readdir(pDir)) )
+      {
+         if (pDirEnt->d_type != DT_DIR)
+            continue;
+
+         // If the name is not an int, it's not a process
+         PidType pid = safe_convert::stringTo<PidType>(pDirEnt->d_name, -1);
+         if (pid <= 0)
+            continue;
+
+         // The parent's size is the caller's to read, and its own parent
+         // has no bearing on which processes descend from it
+         if (pid == parentPid)
+            continue;
+
+         FilePath procDir = FilePath("/proc").completeChildPath(pDirEnt->d_name);
+
+         // Check that the process is owned by the same user
+         uid_t fileUid;
+         Error error = procDir.getFileOwner(fileUid);
+         if (error || fileUid != userId)
+            continue;
+
+         // Take the parent and the size from a single read of the status
+         // file. Processes come and go while /proc is scanned, so one that
+         // has exited since it was listed is expected, and is left out.
+         ProcessStatus status;
+         error = readProcessStatus("/proc/" + std::string(pDirEnt->d_name) + "/status", &status);
+         if (error)
+         {
+            if (!isProcessGone(error))
+               log::logErrorAsDebug(error);
+
+            // A process whose parent is known keeps its place in the process
+            // tree, without a size, so that its descendants are still counted
+            if (status.parentPid == -1)
+               continue;
+         }
+
+         // Sanity check that the child is not already a parent of this new parent
+         // to avoid cycles in the process tree
+         if (!isChildOfParent(processes, pid, status.parentPid))
+            processes[pid] = status;
+      }
+      ::closedir(pDir);
+      pDir = nullptr;
+   }
+   catch (...)
+   {
+      if (pDir != nullptr)
+         ::closedir(pDir);
+      return 0;
+   }
+
+   for (const auto& entry : processes)
+   {
+      const ProcessStatus& status = entry.second;
+      if (isChildOfParent(processes, parentPid, status.parentPid))
+         childRssSize += status.sizeKb;
+   }
+   return childRssSize;
+}
+
+/**
+ * LinuxMemoryProvider is an abstract class that provides memory usage stats on
+ * Linux. As there are several ways of limiting and measuring memory usage on
+ * Linux, we figure out the most appropriate one at runtime and create the 
+ * corresponding provider (see getMemoryProvider factory)
+ */
+class LinuxMemoryProvider
+{
+public:
+
+   virtual ~LinuxMemoryProvider()
+   {
+   }
+
+   virtual Error getTotalMemoryUsed(long *pUsedKb, MemoryProvider *pProvider) = 0;
+
+   virtual Error getTotalMemory(long *pTotalKb, MemoryProvider *pProvider) = 0;
+
+   virtual Error getProcessMemoryLimit(long *pLimitKb, MemoryProvider *pProvider)
+   {
+      RLimitType softMemLimit, hardMemLimit;
+      Error error = getResourceLimit(MemoryLimit, &softMemLimit, &hardMemLimit);
+      if (error)
+         return error;
+      if (softMemLimit != RLIM_INFINITY)
+      {
+         *pLimitKb = softMemLimit/1024;
+         *pProvider = MemoryProviderLinuxUlimit;
+      }
+      else if (hardMemLimit != RLIM_INFINITY)
+      {
+         *pLimitKb = hardMemLimit/1024;
+         *pProvider = MemoryProviderLinuxUlimit;
+      }
+      else
+      {
+         *pLimitKb = 0;
+         *pProvider = MemoryProviderUnknown;
+      }
+      return Success();
+   }
+
+   virtual Error getProcessMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+   {
+      PidType pid = ::getpid();
+      long resident = getProcessSize(pid);
+
+      long childSizeKb = getProcessSizeOfChildren(pid, ::geteuid());
+
+      *pUsedKb = resident + childSizeKb;
+      *pProvider = MemoryProviderLinuxProcFs;
+
+      return Success();
+   }
+
+   virtual Error getProcessCpuLimit(double *pNumCpus, MemoryProvider *pProvider)
+   {
+      *pNumCpus = 0.0;
+      *pProvider = MemoryProviderUnknown;
+      return Success();
+   }
+
+   virtual Error setProcessMemoryLimit(long memHighKb, long memMaxKb, MemoryProvider *pProvider)
+   {
+      *pProvider = MemoryProviderLinuxUlimit;
+      return setResourceLimit(MemoryLimit, memHighKb * 1024);
+   }
+
+   virtual Error setProcessCpuLimit(double numCpus, MemoryProvider *pProvider)
+   {
+      // No way to set cpu limits in this config. Requires cgroups v2 and a non-shared cgroup
+      return Success();
+   }
+};
+
+/**
+ * MemInfoMemoryProvider is a class supplying Linux memory statistics using the
+ * contents of the file /proc/meminfo.
+ */
+class MemInfoMemoryProvider : public LinuxMemoryProvider
+{
+public:
+   MemInfoMemoryProvider(): memTotal_(0)
+   {
+      // Read total memory only once (it doesn't change)
+      Error error = readMemInfoKey("MemTotal", &memTotal_);
+      if (error)
+      {
+         LOG_ERROR(error);
+      }
+   }
+
+   Error getTotalMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+   {
+      std::vector<std::string> keys = {"MemAvailable", "SwapTotal", "SwapFree"};
+      std::vector<long> values = {0, 0, 0};
+      Error error = readProcFileKeys("/proc/meminfo", keys, &values);
+      if (error)
+      {
+         return error;
+      }
+      long availableKb = values[0];
+      long swapTotalKb = values[1];
+      long swapFreeKb = values[2];
+      // Want to compute the total memory used by processes. So this is
+      // how much swap space is used plus the total memory minus the mem
+      // available.
+      *pUsedKb = memTotal_ + (swapTotalKb - swapFreeKb) - availableKb;
+      *pProvider = MemoryProviderLinuxProcMeminfo;
+
+      return Success();
+   }
+
+   Error getTotalMemory(long *pTotalKb, MemoryProvider *pProvider)
+   {
+      *pTotalKb = memTotal_;
+      *pProvider = MemoryProviderLinuxProcMeminfo;
+      return Success();
+   }
+
+private:
+   Error readMemInfoKey(const std::string& key, long* pValue)
+   {
+      std::vector<std::string> keys(1);
+      keys[0] = key;
+      std::vector<long> values(1);
+      Error error = readProcFileKeys("/proc/meminfo", keys, &values);
+      if (!error)
+         *pValue = values[0];
+      return error;
+   }
+
+   long memTotal_;
+};
+
+/**
+ * CGroupsMemoryProvider is a class supplying Linux memory statistics using the
+ * contents of the virtual cgroups filesystem at /sys/fs/cgroup.
+ */
+class CGroupsMemoryProvider : public MemInfoMemoryProvider
+{
+public:
+   CGroupsMemoryProvider(const std::string& path) : isV2_(false)
+   {
+      // In some cgroup v1 environments with pam_systemd, user scoped memory stats are available in e.g.,
+      //
+      // /sys/fs/cgroup/memory/user.slice/user-1000.slice/user@1000.service/memory/memory.usage_in_bytes
+      //
+      // In others, it will be a shared group that we can't use:
+      //
+      // either:
+
+      // /sys/fs/cgroup/memory/system.slice/launcher.service
+      //
+      // or:
+      //
+      // /sys/fs/cgroup/memory/memory.usage_in_bytes
+      //
+      // For those using cgroups v2 using pam_systemd, stats are under the same unified
+      // hierarchy, e.g.
+      //
+      // /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.max
+      //
+      // With local launcher cgroups, the path is:
+      // /sys/fs/cgroup/system.slice/rstudio-launcher.service/jobs/MlxEEgj0TeFsfIwX9ojxWg==
+      //
+      // Check to see whether the path we read from the process's cgroup file
+      // exists. If it does, we can read scoped memory stats.
+      if (FilePath("/sys/fs/cgroup/memory" + path).exists())
+      {
+         // Use scoped memory stats
+         path_ = FilePath("/sys/fs/cgroup/memory" + path);
+      }
+      else if (FilePath("/sys/fs/cgroup" + path).exists())
+      {
+         // Use cgroups v2 stats
+         path_ = FilePath("/sys/fs/cgroup" + path);
+         isV2_ = true;
+      }
+      else
+      {
+         // Container runtimes using cgroups v1 do not use namespacing, so the
+         // cgroup path entries in /proc/self/cgroup will not exist. When this
+         // occurs, we default to /sys/fs/cgroup/memory, which is the mount path
+         // of the v1 memory cgroup most container runtimes use.
+         path_ = FilePath("/sys/fs/cgroup/memory");
+      }
+   }
+
+   // Reports the "process" memory figure for this session.
+   //
+   // In container mode the cgroup is shared by every session in the launcher
+   // container, so the cgroup usage is a container-wide aggregate, not this
+   // session's footprint. In meminfo mode the cgroup usage is deliberately
+   // avoided at the admin's request. In both of those modes, return this session's own
+   // process-tree RSS (procfs) so the IDE gauge / "Session memory used" figure
+   // reflects the individual session's real usage. getTotalMemoryUsed() reports
+   // the container-wide cgroup usage via getCgroupMemoryUsed() so the
+   // shared-pressure line stays accurate.
+   //
+   // In the other cgroup-backed modes the cgroup is scoped to the session (or is
+   // being reported deliberately), so keep the cgroup usage. Reading it is also
+   // more efficient than accumulating RSS across the process tree.
+   //
+   // If we do add user and group based cgroups, we'll need to identify which mode is used and return the cgroup
+   // values in the appropriate category.
+   virtual Error getProcessMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+   {
+      MemoryUsageMode mode = effectiveMemoryUsageMode();
+      if (mode == MemoryUsageModeContainer || mode == MemoryUsageModeMemInfo)
+         return LinuxMemoryProvider::getProcessMemoryUsed(pUsedKb, pProvider);
+
+      // Other cgroup-backed modes: use the cgroup usage, falling back to
+      // process-tree RSS if the cgroup memory controller isn't available.
+      Error error = getCgroupMemoryUsed(pUsedKb, pProvider);
+      if (error)
+         return LinuxMemoryProvider::getProcessMemoryUsed(pUsedKb, pProvider);
+      return Success();
+   }
+
+   // Reads the cgroup's memory usage (container-wide in container mode,
+   // session-scoped otherwise), excluding reclaimable page cache. Returns an
+   // error if the cgroup memory controller isn't available; callers choose an
+   // appropriate fallback (process-tree RSS for the per-session figure, node
+   // /proc/meminfo for the container-wide one).
+   //
+   // The raw memory.current (v2) / memory.usage_in_bytes (v1) includes page
+   // cache charged to the cgroup. The kernel doesn't reclaim that cache until
+   // the cgroup nears memory.high, so an I/O-heavy session (e.g. grepping a
+   // large NFS tree) will sit at its limit even though its processes use very
+   // little memory. We subtract the file LRU pages so the figure reflects what
+   // the kernel can't reclaim. If memory.stat can't be read, fall back to the
+   // raw usage.
+   Error getCgroupMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+   {
+      long currentKb = 0;
+      Error error = getCgroupMemoryStat(isV2_ ? "memory.current" : "memory.usage_in_bytes", &currentKb);
+      if (error)
+         return error;
+
+      std::string memoryStat;
+      error = readStringFromFile(path_.completePath("memory.stat"), &memoryStat);
+      if (!error)
+         error = computeCgroupMemoryUsedKb(currentKb, memoryStat, isV2_, pUsedKb);
+      if (error)
+      {
+         LOG_DEBUG_MESSAGE("Unable to exclude page cache from cgroup memory usage, using raw usage: " +
+                           error.asString());
+         *pUsedKb = currentKb;
+      }
+
+      *pProvider = MemoryProviderLinuxCgroups;
+      return Success();
+   }
+
+   virtual Error getTotalMemory(long *pTotalKb, MemoryProvider *pProvider)
+   {
+      MemoryUsageMode mode = effectiveMemoryUsageMode();
+      if (mode == MemoryUsageModeContainer || mode == MemoryUsageModeCgroup)
+         return getCgroupsMemoryLimit(pTotalKb, pProvider);
+      return MemInfoMemoryProvider::getTotalMemory(pTotalKb, pProvider);
+   }
+
+   virtual Error getTotalMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+   {
+      MemoryUsageMode mode = effectiveMemoryUsageMode();
+      if (mode == MemoryUsageModeContainer || mode == MemoryUsageModeCgroup)
+      {
+         // The container-wide "used" must not collapse to a single session's
+         // RSS, so on a cgroup read failure fall back to node /proc/meminfo
+         // rather than to process-tree RSS.
+         Error error = getCgroupMemoryUsed(pUsedKb, pProvider);
+         if (error)
+            return MemInfoMemoryProvider::getTotalMemoryUsed(pUsedKb, pProvider);
+         return Success();
+      }
+      return MemInfoMemoryProvider::getTotalMemoryUsed(pUsedKb, pProvider);
+   }
+
+   // Returns a value of 0 if there's no limit
+   virtual Error getProcessMemoryLimit(long *pTotalKb, MemoryProvider *pProvider)
+   {
+      long linuxLimitKb;
+      MemoryProvider linuxMemProvider;
+      bool hasLinuxLimit = false;
+
+      // Do we have a ulimit based limit?
+      Error error = LinuxMemoryProvider::getProcessMemoryLimit(&linuxLimitKb, &linuxMemProvider);
+      if (!error && linuxLimitKb != 0)
+      {
+         hasLinuxLimit = true;
+      }
+
+      error = getCgroupsMemoryLimit(pTotalKb, pProvider);
+
+      if (!error)
+      {
+	 // pick the smaller of the two limits
+         if (hasLinuxLimit && (*pTotalKb == LONG_MAX || *pTotalKb > linuxLimitKb))
+         {
+            *pProvider = linuxMemProvider;
+            *pTotalKb = linuxLimitKb;
+         }
+         else
+         {
+            if (*pTotalKb == LONG_MAX)
+               *pTotalKb = 0;
+         }
+      }
+      else if (hasLinuxLimit)
+      {
+         *pProvider = linuxMemProvider;
+         *pTotalKb = linuxLimitKb;
+      }
+      else // no limit
+      {
+         *pProvider = MemoryProviderUnknown;
+         *pTotalKb = 0;
+      }
+
+      return Success();
+   }
+
+   // Returns LONG_MAX if there is no limit set
+   Error getCgroupsMemoryLimit(long *pTotalKb, MemoryProvider *pProvider)
+   {
+      Error error;
+
+      if (!isV2_)
+      {
+         error = getCgroupMemoryStat("memory.limit_in_bytes", pTotalKb);
+      }
+      else
+      {
+         // cgroups v2 furnishes both a soft and a hard memory limit; we need to
+         // check them both.
+         error = getCgroupMemoryStat("memory.high", pTotalKb);
+         if (error)
+         {
+           return error;
+         }
+         if (*pTotalKb == LONG_MAX) // check the hard limit
+         {
+            error = getCgroupMemoryStat("memory.max", pTotalKb);
+         }
+      }
+      if (!error)
+      {
+         *pProvider = MemoryProviderLinuxCgroups;
+      }
+      return error;
+   }
+
+   virtual Error getProcessCpuLimit(double *pNumCpus, MemoryProvider *pProvider)
+   {
+      if (!isV2_)
+      {
+         *pNumCpus = 0.0;
+         *pProvider = MemoryProviderUnknown;
+      }
+      else
+      {
+         Error error = getCgroupV2NumCpus(pNumCpus, pProvider);
+         if (error)
+         {
+            *pNumCpus = 0.0;
+            *pProvider = MemoryProviderUnknown;
+         }
+         else
+         {
+            *pProvider = MemoryProviderLinuxCgroups;
+         }
+      }
+      return Success();
+   }
+
+   virtual Error setProcessMemoryLimit(long highMemKb, long maxMemKb, MemoryProvider *pProvider)
+   {
+      Error error;
+      *pProvider = MemoryProviderLinuxCgroups;
+      if (!isV2_)
+         error = setCgroupMemoryStat("memory.limit_in_bytes", maxMemKb * 1024);
+      else
+      {
+         error = setCgroupMemoryStat("memory.high", highMemKb * 1024);
+         if (!error)
+            error = setCgroupMemoryStat("memory.max", maxMemKb * 1024);
+      }
+
+      if (error)
+      {
+         // The cgroup limit could not be written (for example, a read-only
+         // cgroup fs); log the underlying error and fall back to ulimit-based
+         // settings so the limit is still enforced.
+         LOG_ERROR(error);
+         return MemInfoMemoryProvider::setProcessMemoryLimit(highMemKb, maxMemKb, pProvider);
+      }
+      return error;
+   }
+
+   virtual Error setProcessCpuLimit(double numCpus, MemoryProvider *pProvider)
+   {
+      *pProvider = MemoryProviderLinuxCgroups;
+
+      if (isV2_)
+      {
+         int period = getCgroupV2CpuPeriod(); // 100ms
+         // cpu.max = 'quota period'
+         Error error = setCgroupCpuStat("cpu.max", std::to_string(static_cast<int>(numCpus * period)) + " " + std::to_string(period));
+         if (error)
+            LOG_DEBUG_MESSAGE("Error setting cpu.max: " + error.asString());
+      }
+      // else pam_systemd does not provision cpu cgroups on v1 so can't set them here
+
+      return Success();
+   }
+
+private:
+   // Gets a memory statistic from cgroup virtual file
+   Error getCgroupMemoryStat(const std::string& key, long *pValue)
+   {
+      // Attempt to read the statistic from the file.
+      FilePath statPath = path_.completePath(key);
+      std::string val;
+      Error error = readStringFromFile(statPath, &val);
+      if (error)
+      {
+         return error;
+      }
+
+      // Remove whitespace; these virtual files usually end with a newline
+      val = string_utils::trimWhitespace(val);
+
+      if (val == "9223372036854771712" || val == "max")
+      {
+         // The number above is a special value indicating no memory limit (it
+         // is roughly the maximum int64 value), which is used for cgroups v1.
+         // Under cgroups v2, the value will be the literal string "max"
+         // instead.
+         *pValue = LONG_MAX;
+         return Success();
+      }
+
+      // Attempt to convert the file's contents to a stat
+      boost::optional<long> stat = safe_convert::stringTo<long>(val);
+      if (!stat)
+      {
+         error = systemError(boost::system::errc::protocol_error, 
+               "Could not read cgroup memory stat " 
+               "'" + key + "'"
+               " from " 
+               "'" + val + "'",
+               ERROR_LOCATION);
+         return error;
+      }
+
+      // Convert to kb for return value
+      *pValue = *stat / 1024;
+      return Success();
+   }
+
+   Error setCgroupMemoryStat(const std::string& key, long val)
+   {
+      FilePath statPath = path_.completePath(key);
+      // Do not log an error in writeStringToFile - let higher level code handle it
+      Error error = writeStringToFile(statPath, std::to_string(val), string_utils::LineEndingPassthrough,
+                                      true /* truncate */, 0 /* retry secs */, false /* logError */);
+      if (error)
+         return error;
+      return Success();
+   }
+
+   // Gets the cpu.max value - returning 0.0 if no limit.
+   Error getCgroupV2NumCpus(double *pNumCpus, MemoryProvider *pProvider)
+   {
+      // Attempt to read the statistic from the file.
+      FilePath statPath = path_.completePath("cpu.max");
+      std::string cpuMaxValue;
+      Error error = readStringFromFile(statPath, &cpuMaxValue);
+      if (error)
+      {
+         return error;
+      }
+
+      // Remove whitespace; these virtual files usually end with a newline
+      std::istringstream iss(cpuMaxValue);
+      std::string limitStr, periodStr;
+      if (!(iss >> limitStr >> periodStr))
+      {
+         return systemError(boost::system::errc::invalid_argument, "Failed to parse cpu.max: " + cpuMaxValue, ERROR_LOCATION);
+      }
+      if (limitStr == "max")
+      {
+         *pNumCpus = 0.0;
+      }
+      else
+      {
+         int limitInt = safe_convert::stringTo<int>(limitStr, 0);
+         int periodInt = safe_convert::stringTo<int>(periodStr, 0);
+         if (limitInt == 0 || periodInt == 0)
+         {
+            LOG_DEBUG_MESSAGE("Failed to convert cpu.max: " + limitStr + " " + periodStr);
+            *pNumCpus = 0.0;
+            *pProvider = MemoryProviderUnknown;
+            return Success();
+         }
+         *pNumCpus = static_cast<double>(limitInt) / periodInt;
+      }
+
+      *pProvider = MemoryProviderLinuxCgroups;
+
+      return Success();
+   }
+
+   Error setCgroupCpuStat(const std::string& key, std::string val)
+   {
+      FilePath statPath = path_.completePath(key);
+      Error error = writeStringToFile(statPath, val, string_utils::LineEndingPassthrough,
+                                      true /* truncate */, 0 /* retry secs */, false /* logError */);
+      if (error)
+      {
+         error.addProperty("description", "Failed to set cgroup cpu stat: " + key + " to: " +
+                           val + " path: " + statPath.getAbsolutePath());
+         return error;
+      }
+      return Success();
+   }
+
+   // The system is configured with a specific time period so use that when computing cpu limits.
+   int getCgroupV2CpuPeriod()
+   {
+      std::string cpuMaxValue;
+      int defaultPeriod = 100000;
+      FilePath cpuMaxFile = path_.completePath("cpu.max");
+
+      core::Error error = core::readStringFromFile(cpuMaxFile, &cpuMaxValue);
+      if (error)
+      {
+         LOG_DEBUG_MESSAGE("Failed to read cpu.max: " + error.asString());
+         return defaultPeriod;
+      }
+
+      std::istringstream iss(cpuMaxValue);
+      std::string limit, period;
+      if (!(iss >> limit >> period))
+      {
+         LOG_DEBUG_MESSAGE("Failed to parse cpu.max: " + cpuMaxValue);
+         return defaultPeriod;
+      }
+      return safe_convert::stringTo<int>(period, defaultPeriod);
+   }
+
+   FilePath path_;
+   bool isV2_;
+};
+
+bool isSharedCgroup(const std::string& path, uid_t uid)
+{
+   boost::regex systemRegex(R"(^/system\.slice/[^/]+\.service$)");
+   boost::regex userRegex(R"(^/user\.slice/user-(\d+)\.slice/.*$)");
+   boost::regex launcherPattern(R"(^/system\.slice/rstudio-launcher\.service/jobs/.*$)");
+
+   // don't use cgroups for: /system.slice/launcher.service (shared by all users)
+   if (boost::regex_match(path, systemRegex))
+   {
+      return true;
+   }
+
+   boost::smatch match;
+   // use cgroups for: /user.slice/user-<uid>.slice if uid is the current user
+   // Did pam_systemd step that creates this run for the session user or the system user?
+   if (boost::regex_match(path, match, userRegex))
+   {
+      uid_t cgroupUid = static_cast<uid_t>(std::stoul(match[1]));
+      return cgroupUid != uid;
+   }
+
+   // Use it if it's created from the job launcher
+   if (boost::regex_match(path, launcherPattern))
+   {
+      return false;
+   }
+
+   // Kubernetes pod - this is the cgroup
+   if (path == "/")
+      return false;
+
+   LOG_DEBUG_MESSAGE("Unrecognized cgroup pattern, assuming a shared group and using /proc/meminfo for memory usage: " + path);
+
+   // By default, assume it's a shared cgroup and don't use it
+   return true;
+}
+
+// Returns the memory cgroup path.
+std::string getMemoryCgroup(uid_t uid)
+{
+   FilePath cgroup("/proc/self/cgroup");
+   if (!cgroup.exists())
+   {
+      // No problem, likely no cgroup support on this host. We'll use a different method to check
+      // memory usage.
+      return std::string();
+   }
+
+   std::string contents;
+   Error error = readProcFile(cgroup.getAbsolutePath(), &contents);
+   if (error)
+   {
+      // Can't read cgroup file (unexpected)
+      LOG_ERROR(error);
+      return std::string();
+   }
+
+   return parseMemoryCgroup(contents, uid);
+}
+
+// Factory for memory provider instantiation
+boost::shared_ptr<LinuxMemoryProvider> getMemoryProvider(bool writeLimit, uid_t uid)
+{
+   // leaked: memory usage is queried from the offline service thread (#18318)
+   static boost::mutex& s_mutex = core::make_leaked<boost::mutex>();
+   static boost::shared_ptr<LinuxMemoryProvider>& s_readLimitProvider =
+         core::make_leaked<boost::shared_ptr<LinuxMemoryProvider>>();
+   static boost::shared_ptr<LinuxMemoryProvider>& s_writeLimitProvider =
+         core::make_leaked<boost::shared_ptr<LinuxMemoryProvider>>();
+
+   // Return memory provider if we have one
+   if (writeLimit && s_writeLimitProvider)
+   {
+      return s_writeLimitProvider;
+   }
+   else if (!writeLimit && s_readLimitProvider)
+   {
+      return s_readLimitProvider;
+   }
+
+   // Otherwise, try to create one
+   LOCK_MUTEX(s_mutex)
+   {
+      std::string cgroup = getMemoryCgroup(uid);
+
+      if (!cgroup.empty())
+      {
+         // We got a cgroup. Does it have a limit?
+         boost::shared_ptr<CGroupsMemoryProvider> provider = 
+            boost::make_shared<CGroupsMemoryProvider>(cgroup);
+
+         // Check memory limit. Use the raw cgroup limit (not getTotalMemory,
+         // whose reported total varies with the memory-usage mode) so that we
+         // bind the cgroup provider for reads only when a finite cgroup limit
+         // is actually in effect.
+         long totalKb;
+         MemoryProvider tmpProvider;
+         Error error = provider->getCgroupsMemoryLimit(&totalKb, &tmpProvider);
+
+         if (error)
+         {
+            LOG_ERROR(error);
+         }
+         else if (totalKb != LONG_MAX) // i.e. no limitation via cgroups
+         {
+            s_readLimitProvider = provider;
+         }
+         s_writeLimitProvider = provider;
+      }
+
+      // Fall back on the default if we don't have a provider at this point.
+      if (!s_readLimitProvider)
+      {
+         s_readLimitProvider.reset(new MemInfoMemoryProvider());
+      }
+      if (!s_writeLimitProvider)
+      {
+         s_writeLimitProvider.reset(new MemInfoMemoryProvider());
+      }
+   }
+   END_LOCK_MUTEX;
+
+   return writeLimit ? s_writeLimitProvider : s_readLimitProvider;
+}
+
+} // anonymous namespace
+
+
+
+Error getTotalMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(false, ::geteuid());
+   if (provider)
+   {
+      return provider->getTotalMemoryUsed(pUsedKb, pProvider);
+   }
+
+   *pUsedKb = 0;
+   *pProvider = MemoryProviderUnknown;
+   return Success();
+}
+
+Error getProcessMemoryUsed(long *pUsedKb, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(false, ::geteuid());
+   if (provider)
+   {
+      return provider->getProcessMemoryUsed(pUsedKb, pProvider);
+   }
+
+   *pUsedKb = 0;
+   *pProvider = MemoryProviderUnknown;
+   return Success();
+}
+
+Error getTotalMemory(long *pTotalKb, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(false, ::geteuid());
+   if (provider)
+   {
+      return provider->getTotalMemory(pTotalKb, pProvider);
+   }
+
+   *pTotalKb = 0;
+   *pProvider = MemoryProviderUnknown;
+   return Success();
+}
+
+Error getProcessMemoryLimit(long *pTotalKb, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(false, ::geteuid());
+   if (provider)
+   {
+      return provider->getProcessMemoryLimit(pTotalKb, pProvider);
+   }
+
+   *pTotalKb = 0;
+   *pProvider = MemoryProviderUnknown;
+   return Success();
+}
+
+Error getProcessCpuLimit(double *pNumCpus, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(false, ::geteuid());
+   if (provider)
+   {
+      return provider->getProcessCpuLimit(pNumCpus, pProvider);
+   }
+
+   *pNumCpus = 0;
+   *pProvider = MemoryProviderUnknown;
+   return Success();
+}
+
+void setMemoryUsageMode(MemoryUsageMode mode)
+{
+   s_memoryUsageMode = mode;
+}
+
+Error readProcFile(const std::string& procPath, std::string* pContents)
+{
+   int fd = -1;
+   Error error = posix::posixCall<int>(
+      [&]() { return ::open(procPath.c_str(), O_RDONLY | O_CLOEXEC); },
+      ERROR_LOCATION,
+      &fd);
+   if (error)
+   {
+      error.addProperty("path", procPath);
+      return error;
+   }
+
+   // The contents are allocated as they are read, which can throw
+   BOOST_SCOPE_EXIT(fd)
+   {
+      ::close(fd);
+   }
+   BOOST_SCOPE_EXIT_END
+
+   error = readProcFileDescriptor(fd, pContents);
+   if (error)
+      error.addProperty("path", procPath);
+   return error;
+}
+
+Error readProcFileDescriptor(int fd, std::string* pContents)
+{
+   pContents->clear();
+
+   char buffer[4096];
+   while (true)
+   {
+      ssize_t bytesRead = posix::posixCall<ssize_t>([&]() { return ::read(fd, buffer, sizeof(buffer)); });
+      if (bytesRead == -1)
+         return systemError(errno, ERROR_LOCATION);
+
+      if (bytesRead == 0)
+         return Success();
+
+      pContents->append(buffer, static_cast<std::size_t>(bytesRead));
+      if (pContents->size() > kMaxProcFileSize)
+      {
+         return systemError(boost::system::errc::file_too_large,
+                            fmt::format("Proc file is larger than {} bytes", kMaxProcFileSize),
+                            ERROR_LOCATION);
+      }
+   }
+}
+
+Error parseProcFileKeys(const std::string& contents, const std::vector<std::string>& keys, std::vector<long>* pValues)
+{
+   std::vector<boost::optional<long>> found;
+   Error error = scanProcFileKeys(contents, keys, &found);
+   if (error)
+      return error;
+
+   std::vector<long> values;
+   for (std::size_t i = 0; i < keys.size(); i++)
+   {
+      if (!found[i])
+      {
+         return systemError(boost::system::errc::invalid_argument,
+                            fmt::format("Proc file has no value for key '{}'", keys[i]),
+                            ERROR_LOCATION);
+      }
+
+      values.push_back(*found[i]);
+   }
+
+   pValues->swap(values);
+   return Success();
+}
+
+Error parseProcessStatus(const std::string& contents, ProcessStatus* pStatus)
+{
+   *pStatus = ProcessStatus();
+
+   std::vector<boost::optional<long>> values;
+   Error error = scanProcFileKeys(contents, processStatusKeys(), &values);
+
+   // The parent is given even if a memory line couldn't be read, so that the
+   // process can still be placed in the process tree
+   if (values[0])
+      pStatus->parentPid = static_cast<pid_t>(*values[0]);
+
+   if (error)
+      return error;
+
+   if (!values[0])
+   {
+      return systemError(boost::system::errc::invalid_argument,
+                         "Process status has no PPid",
+                         ERROR_LOCATION);
+   }
+
+   // A memory line that is missing counts as 0. A process without an address
+   // space has neither, and gVisor's procfs reports VmRSS without VmSwap.
+   pStatus->sizeKb = values[1].get_value_or(0) + values[2].get_value_or(0);
+   return Success();
+}
+
+std::string parseMemoryCgroup(const std::string& contents, uid_t uid)
+{
+   // Loop through lines in cgroup file. We're trying to figure out where our memory entry is.
+   // It looks like this:
+   // 9:memory:/user.slice/user-1000.slice/user@1000.service
+   //
+   // When using cgroups v2, it looks instead like this:
+   // 0::/user.slice/user-1000.slice/user@1000.service
+   try
+   {
+      std::istringstream stream(contents);
+      std::string line;
+      while (std::getline(stream, line))
+      {
+         // We expect 3 fields; from the example above they'd be:
+         // 0. "9"
+         // 1. "memory"
+         // 2. "/user.slice/user-1000.slice/user@1000.service"
+         //
+         // Only the first two colons separate fields, as the path can
+         // contain colons of its own.
+         std::size_t idEnd = line.find(':');
+         if (idEnd == std::string::npos)
+            continue;
+
+         std::size_t controllersEnd = line.find(':', idEnd + 1);
+         if (controllersEnd == std::string::npos)
+            continue;
+
+         std::string id = line.substr(0, idEnd);
+         std::string controllers = line.substr(idEnd + 1, controllersEnd - idEnd - 1);
+         std::string path = line.substr(controllersEnd + 1);
+
+         // cgroups v2 has everything under one hierarchy. Otherwise, we are
+         // only interested in the "memory" entry.
+         if (id == "0" || controllers == "memory")
+         {
+            if (isSharedCgroup(path, uid))
+               return std::string();
+
+            return path;
+         }
+      }
+
+      // If we got this far, we hit the end of the file without finding a memory entry.
+      LOG_INFO_MESSAGE("No memory control group found in /proc/self/cgroup");
+   }
+   catch (...)
+   {
+      LOG_WARNING_MESSAGE("Could not parse /proc/self/cgroup, will not use cgroup memory statistics");
+   }
+
+   return std::string();
+}
+
+Error computeCgroupMemoryUsedKb(long currentKb, const std::string& memoryStat, bool isV2, long *pUsedKb)
+{
+   // memory.stat lines look like "active_file 9056256", with values in bytes.
+   // v1 prefixes the hierarchical (self + descendants) totals with "total_",
+   // which is what matches memory.usage_in_bytes.
+   //
+   // Shmem/tmpfs pages are swap-backed and live on the anon LRU, so they're not
+   // in active_file/inactive_file and stay counted. Mlocked file pages are on
+   // the unevictable LRU and also stay counted.
+   const std::string activeKey = isV2 ? "active_file" : "total_active_file";
+   const std::string inactiveKey = isV2 ? "inactive_file" : "total_inactive_file";
+
+   boost::optional<long> activeFile, inactiveFile;
+   std::istringstream stream(memoryStat);
+   std::string key;
+   long value;
+   while (stream >> key >> value)
+   {
+      if (key == activeKey)
+         activeFile = value;
+      else if (key == inactiveKey)
+         inactiveFile = value;
+   }
+
+   if (!activeFile || !inactiveFile)
+   {
+      return systemError(boost::system::errc::protocol_error,
+                         "Missing " + activeKey + " or " + inactiveKey + " in cgroup memory.stat",
+                         ERROR_LOCATION);
+   }
+
+   // memory.current and memory.stat aren't read atomically, so clamp.
+   long reclaimableKb = (*activeFile + *inactiveFile) / 1024;
+   *pUsedKb = std::max(0L, currentKb - reclaimableKb);
+   return Success();
+}
+
+Error setProcessMemoryLimit(long highMemKb, long maxMemKb, uid_t uid, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(true, uid);
+   if (provider)
+   {
+      return provider->setProcessMemoryLimit(highMemKb, maxMemKb, pProvider);
+   }
+
+   *pProvider = MemoryProviderUnknown;
+   return systemError(boost::system::errc::not_supported,
+                      "Process memory limit not supported",
+                      ERROR_LOCATION);
+}
+
+Error setProcessCpuLimit(double numCpus, uid_t uid, MemoryProvider *pProvider)
+{
+   boost::shared_ptr<LinuxMemoryProvider> provider = getMemoryProvider(true, uid);
+   if (provider)
+   {
+      return provider->setProcessCpuLimit(numCpus, pProvider);
+   }
+   *pProvider = MemoryProviderUnknown;
+   return systemError(boost::system::errc::not_supported,
+                      "Process cpu limit not supported",
+                      ERROR_LOCATION);
+}
+
+long getProcessSize()
+{
+   return getProcessSize(::getpid());
+}
+
+} // namespace system
+} // namespace core
+} // namespace rstudio
+
