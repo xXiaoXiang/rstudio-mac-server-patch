@@ -1,0 +1,134 @@
+import { test, expect } from '@fixtures/rstudio.fixture';
+import { executeInConsole, CONSOLE_OUTPUT } from '@pages/console_pane.page';
+import { dismissBlockingModals } from '@pages/modals.page';
+import { waitForSessionRestart } from '@utils/project';
+import { rStringLiteral } from '@utils/r';
+import { executeCommand } from '@utils/commands';
+import { TIMEOUTS } from '@utils/constants';
+import type { Page } from 'playwright';
+
+async function captureResult(page: Page, rExpression: string): Promise<string> {
+  const marker = `__SUSP_${Date.now()}__`;
+  // { wait: true } gates on R reporting idle, which is the deterministic
+  // post-condition for "cat() has finished writing both markers".
+  await executeInConsole(
+    page,
+    `cat(${rStringLiteral(marker)}, ${rExpression}, ${rStringLiteral(marker)})`,
+    { wait: true },
+  );
+
+  const pattern = new RegExp(`${marker}\\s+(.*?)\\s+${marker}`, 's');
+  const output = await page.locator(CONSOLE_OUTPUT).innerText();
+  const match = output.match(pattern);
+  if (!match) throw new Error(`captureResult: markers not found for "${rExpression}"`);
+  return match[1].trim();
+}
+
+async function suspendAndResume(page: Page): Promise<void> {
+  await executeCommand(page, 'suspendSession');
+  await waitForSessionRestart(page);
+
+  // Defensive: a stray modal that pops up during resume renders a
+  // gwt-PopupPanelGlass overlay that then blocks the console tab and wedges the
+  // next executeInConsole with an opaque pointer-intercept timeout. The one
+  // trigger we know of -- reticulate's unguarded here::here() throwing "No root
+  // directory found" from the rootless sandbox HOME (rstudio/reticulate#1909),
+  // surfacing as an "Error Listing Packages" dialog on resume -- is prevented at
+  // the source by the `.here` marker seeded into the sandbox home (see
+  // fixtures/sandbox-setup.ts). This clear stays as a cheap safety net for any
+  // other out-of-band dialog, since these tests exercise search-path
+  // preservation, not whatever pane raised it.
+  await dismissBlockingModals(page);
+}
+
+// Suspend/resume relies on the Server reconnection path. Desktop has no
+// equivalent flow, so these tests are tagged @server_only.
+test.describe.serial('Session suspend/resume', { tag: ['@server_only'] }, () => {
+  test('loaded packages are preserved on suspend + resume', async ({ rstudioPage: page }) => {
+    await executeInConsole(page, 'library(tools)', { wait: true });
+
+    await suspendAndResume(page);
+
+    const stillLoaded = await captureResult(page, '"tools" %in% loadedNamespaces()');
+    expect(stillLoaded, 'tools should still be loaded after resume').toBe('TRUE');
+  });
+
+  test('multi-byte console output is preserved on suspend + resume', async ({ rstudioPage: page }) => {
+    // A single output line longer than the 512-byte chunk size used by the
+    // console actions buffer (kChunkSize, private to RConsoleActions.cpp, so
+    // nothing catches drift): 400 x U+2588 = 1200 bytes of 3-byte UTF-8
+    // characters. Before rstudio/rstudio#18382 a character was torn at a
+    // chunk boundary, and the saved console actions then failed to parse on
+    // resume ("Error restoring session (console_actions)"), losing the
+    // console replay entirely. The trailing "\n" is load-bearing: the
+    // chunking loop only processes complete lines, so without it the whole
+    // line goes out as a single action and the boundary logic never runs.
+    await executeInConsole(page, 'cat(strrep("\\u2588", 400), "\\n")', { wait: true });
+
+    await suspendAndResume(page);
+
+    // Suspend/resume keeps the browser page (and its console DOM) alive, so
+    // reload: the console is then re-rendered purely from the console actions
+    // restored from the suspended session state, which is the surface this
+    // regression corrupts.
+    await page.reload();
+    await page.waitForFunction(() => window.rstudio?.ready === true, null, {
+      timeout: TIMEOUTS.sessionRestart,
+      polling: 50,
+    });
+
+    // After the reload the console renders either the replayed output or the
+    // restore-error banner (the REprintf in RInit.cpp runs after
+    // restoreSession, so the error itself is captured into the replay). Wait
+    // for one of the two, so the decisive assertions below inspect settled
+    // output rather than burning a retry timeout on a console that has not
+    // rendered yet.
+    await expect(page.locator(CONSOLE_OUTPUT)).toContainText(
+      /█{20}|Error restoring session/,
+    );
+
+    // Check the failure mode first: if restore failed, this is the
+    // actionable message, and the missing block characters below are just a
+    // downstream symptom.
+    const output = await page.locator(CONSOLE_OUTPUT).innerText();
+    expect(
+      output,
+      'resume should not report a session restore error',
+    ).not.toContain('Error restoring session');
+
+    // The replayed output contains actual U+2588 block characters; the
+    // command echo only ever contains the R escape sequence, so it cannot
+    // false-pass this assertion.
+    expect(
+      output,
+      'replayed console output should retain the multi-byte line',
+    ).toContain('█'.repeat(20));
+  });
+
+  test('attached datasets are preserved on suspend + resume', async ({ rstudioPage: page }) => {
+    await executeInConsole(
+      page,
+      'attach(list(apple = 1, banana = 2, cherry = 3), name = "my-attached-dataset")',
+      { wait: true },
+    );
+
+    await suspendAndResume(page);
+
+    try {
+      const inSearch = await captureResult(
+        page,
+        '"my-attached-dataset" %in% search()',
+      );
+      expect(inSearch, 'attached dataset should remain on the search path').toBe('TRUE');
+
+      const sum = await captureResult(page, 'apple + banana + cherry');
+      expect(sum, 'attached values should still resolve').toBe('6');
+    } finally {
+      await executeInConsole(
+        page,
+        'try(detach("my-attached-dataset"), silent = TRUE)',
+        { wait: true },
+      );
+    }
+  });
+});

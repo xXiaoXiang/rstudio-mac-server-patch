@@ -1,0 +1,361 @@
+import type { Page } from 'playwright';
+import { sleep } from '../utils/constants';
+import { ConsolePaneActions } from './console_pane.actions';
+import { SourcePaneActions } from './source_pane.actions';
+
+export const COMPLETION_POPUP = '#rstudio_popup_completions';
+
+// How long to let the request that typing itself schedules produce a popup
+// before forcing one, and how long a forced request gets. The implicit budget
+// only has to cover code_completion_delay plus one round trip; it is spent in
+// full only when the typed text triggers no implicit request at all.
+const IMPLICIT_COMPLETION_TIMEOUT_MS = 3000;
+const EXPLICIT_COMPLETION_TIMEOUT_MS = 10000;
+
+// Settle applied when the popup is already up before we start waiting, to let
+// a replacement request land -- see waitForCompletionPopup.
+const STALE_POPUP_SETTLE_MS = 500;
+
+/** Whether the popup becomes visible within `timeoutMs`. */
+async function popupAppears(page: Page, timeoutMs: number): Promise<boolean> {
+  return await page
+    .locator(COMPLETION_POPUP)
+    .waitFor({ state: 'visible', timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/**
+ * Wait for the completion popup after typing, forcing a request with
+ * Ctrl+Space only if the implicit one never produces one.
+ *
+ * Typing already schedules a completion request -- RStudio issues one
+ * `code_completion_delay` ms (250 by default) after the
+ * `code_completion_characters`-th character, and immediately after a
+ * trigger like `$` or `(`. Pressing Ctrl+Space while that is in flight is
+ * destructive rather than helpful: `RCompletionManager.beginSuggest` starts
+ * by invalidating pending requests, so the in-flight response is discarded
+ * on arrival, and if the popup has just opened the keypress instead falls
+ * through the popup-showing branch to `invalidatePendingRequests()`, which
+ * hides it. Either way the completion session is stranded and no popup ever
+ * appears.
+ *
+ * Sampling visibility once shortly after typing raced exactly that window:
+ * on CI the request round trip pushed the popup past the sample, the
+ * fallback fired into the gap, and the test then waited out its timeout on a
+ * session it had just cancelled. So wait out the implicit request first, and
+ * force one only once nothing is in flight -- retrying once, since a slow
+ * enough response can still land in the same window.
+ *
+ * A popup that is *already* up on entry is a different case: typing keeps an
+ * open popup showing while it re-requests, because `beginSuggest` invalidates
+ * without hiding (`RCompletionManager.java:1163`, hidePopup false), so its
+ * contents can still be an earlier prefix's results with the final token's
+ * request in flight. Visibility proves nothing there, hence the settle.
+ *
+ * The caller reads the popup afterwards (getCompletionItems, or an expect on
+ * COMPLETION_POPUP), and that wait is the final deadline -- this returns
+ * after the second keypress rather than waiting on the same locator twice.
+ */
+export async function waitForCompletionPopup(page: Page): Promise<void> {
+  if (await page.locator(COMPLETION_POPUP).isVisible()) {
+    await sleep(STALE_POPUP_SETTLE_MS);
+    return;
+  }
+
+  if (await popupAppears(page, IMPLICIT_COMPLETION_TIMEOUT_MS))
+    return;
+
+  await page.keyboard.press('Control+Space');
+  if (await popupAppears(page, EXPLICIT_COMPLETION_TIMEOUT_MS))
+    return;
+
+  await page.keyboard.press('Control+Space');
+}
+
+/**
+ * Toggle the automation-only "always show popup" completion override, so a
+ * unique match is listed in the popup instead of being auto-accepted. The
+ * popup-reading helpers wrap their request in this to stay deterministic
+ * regardless of how many results the token happens to have. No-op on
+ * builds that predate the knob (those keep the auto-accept behavior).
+ */
+export async function setAlwaysShowCompletionPopup(page: Page, force: boolean): Promise<void> {
+  await page.evaluate((f) => {
+    window.rstudio?.completions?.setAlwaysShowPopup(f);
+  }, force);
+}
+
+export class AutocompleteActions {
+  readonly page: Page;
+  readonly consoleActions: ConsolePaneActions;
+  readonly sourceActions: SourcePaneActions;
+
+  constructor(page: Page, consoleActions: ConsolePaneActions, sourceActions: SourcePaneActions) {
+    this.page = page;
+    this.consoleActions = consoleActions;
+    this.sourceActions = sourceActions;
+  }
+
+  /**
+   * Wait for the autocomplete popup and return completion item names.
+   * Extracts the display name from the first span in each grid cell,
+   * skipping the icon and any package/source/argument spans.
+   */
+  async getCompletionItems(timeoutMs = 15000): Promise<string[]> {
+    await this.page.locator(COMPLETION_POPUP).waitFor({ state: 'visible', timeout: timeoutMs });
+    await sleep(500);
+
+    return await this.page.evaluate(`(function() {
+      var popup = document.getElementById('rstudio_popup_completions');
+      if (!popup) return [];
+      var cells = popup.querySelectorAll('td');
+      var names = [];
+      for (var i = 0; i < cells.length; i++) {
+        var spans = cells[i].querySelectorAll('span');
+        if (spans.length > 0) {
+          var name = spans[0].textContent.trim();
+          if (name) names.push(name);
+        }
+      }
+      return names;
+    })()`);
+  }
+
+  /** Dismiss the autocomplete popup. */
+  async dismiss(): Promise<void> {
+    await this.page.keyboard.press('Escape');
+    await sleep(300);
+  }
+
+  /** See the module-level waitForCompletionPopup. */
+  private async waitForCompletionPopup(): Promise<void> {
+    await waitForCompletionPopup(this.page);
+  }
+
+  /** See the module-level setAlwaysShowCompletionPopup. */
+  private async setAlwaysShowPopup(force: boolean): Promise<void> {
+    await setAlwaysShowCompletionPopup(this.page, force);
+  }
+
+  /**
+   * Get completions in the console.
+   * Executes setupCode, then types triggerText (without Enter) and waits for
+   * the popup, falling back to Ctrl+Space if typing raises no completions.
+   */
+  async getCompletionsInConsole(setupCode: string[], triggerText: string): Promise<string[]> {
+    for (const code of setupCode) {
+      await this.consoleActions.executeInConsole(code);
+      await sleep(1000);
+    }
+
+    await this.setAlwaysShowPopup(true);
+    try {
+      // Type trigger text without executing -- needs per-key events to fire the completer.
+      await this.consoleActions.typeInConsole(triggerText);
+      await this.waitForCompletionPopup();
+
+      return await this.getCompletionItems();
+    } finally {
+      // Cleanup: restore auto-accept, dismiss popup, cancel partial input
+      await this.setAlwaysShowPopup(false);
+      await this.dismiss();
+      await this.page.keyboard.press('Escape');
+      await sleep(300);
+    }
+  }
+
+  /**
+   * Regression coverage for #17831. Types `pkg:::` in the console to bring up
+   * the all-objects completion popup, reads the items, then presses Backspace
+   * once (turning `:::` into `::`) and reads the items again. Deleting the
+   * colon changes the namespace context, so the list should narrow from all
+   * objects to only the exported ones.
+   *
+   * Returns both lists. `exported` is whatever the popup settled on after the
+   * backspace; if the fix is absent it stays equal to `all`, so the caller's
+   * assertion fails clearly rather than relying on a generic wait timeout.
+   */
+  async getNamespaceCompletionsBeforeAndAfterBackspace(
+    pkg: string,
+  ): Promise<{ all: string[]; exported: string[] }> {
+    await this.consoleActions.typeInConsole(`${pkg}:::`);
+    await this.page.locator(COMPLETION_POPUP).waitFor({ state: 'visible', timeout: 15000 });
+    const all = await this.getCompletionItems();
+
+    // Delete the trailing colon: ':::' -> '::'. This re-queries the server,
+    // which should narrow the list from all objects to only exported ones.
+    await this.page.keyboard.press('Backspace');
+
+    // Poll until the popup shrinks (the fix landed) or the deadline passes
+    // (the bug is present and the count never changes).
+    let exported = all;
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const current = await this.getCompletionItems();
+      exported = current;
+      if (current.length < all.length) break;
+    }
+
+    // Cleanup: dismiss popup, cancel partial input
+    await this.dismiss();
+    await this.page.keyboard.press('Escape');
+    await sleep(300);
+
+    return { all, exported };
+  }
+
+  /**
+   * Shared setup for the editor completion helpers: executes setupCode in
+   * console, creates a temp file (default extension `R`) with fileContent,
+   * positions cursor at cursorLine/cursorCol (or end of content), and presses
+   * Ctrl+Space unless a popup is already showing. Returns the temp file name
+   * so the caller can clean up with closeSourceAndDeleteFile.
+   */
+  private async triggerCompletionInEditor(
+    setupCode: string[],
+    fileContent: string,
+    cursorLine?: number,
+    cursorCol?: number,
+    extension: string = 'R',
+  ): Promise<string> {
+    for (const code of setupCode) {
+      await this.consoleActions.executeInConsole(code);
+      await sleep(1000);
+    }
+
+    const fileName = `ac_test_${Date.now()}.${extension}`;
+    await this.sourceActions.createAndOpenFile(fileName, fileContent);
+    await sleep(1000);
+
+    // Ensure the editor has DOM-level focus for keyboard events
+    await this.sourceActions.sourcePane.aceTextInput.click({ force: true });
+    await sleep(300);
+
+    // Position cursor in the source editor via the automation bridge.
+    // A DOM scan with `.ace_editor` here would pick stale editors left in
+    // the DOM after a tab close (ad175dccd1 / #17775) -- the chosen empty
+    // editor would silently receive focus + gotoLine, and Ctrl+Space then
+    // fires against an editor with no content to complete on.
+    await this.page.evaluate(
+      ({ line, col }: { line: number | null; col: number | null }) => {
+        const editor = window.rstudio?.documents.activeEditor() ?? null;
+        if (!editor) throw new Error('No active source editor');
+        editor.focus();
+        if (line !== null && col !== null) {
+          editor.gotoLine(line, col);
+        } else {
+          // Default: end of last non-empty line.
+          const session = editor.session;
+          let lastRow = session.getLength() - 1;
+          while (lastRow > 0 && session.getLine(lastRow).trim() === '') lastRow--;
+          const lastCol = session.getLine(lastRow).length;
+          editor.gotoLine(lastRow + 1, lastCol);
+        }
+      },
+      { line: cursorLine ?? null, col: cursorCol ?? null },
+    );
+    await sleep(500);
+
+    // If autocomplete already appeared (e.g. after typing $ or (), use it;
+    // otherwise trigger explicitly with Ctrl+Space
+    const popupAlreadyVisible = await this.page.locator(COMPLETION_POPUP).isVisible();
+    if (!popupAlreadyVisible) {
+      await this.page.keyboard.press('Control+Space');
+    }
+
+    return fileName;
+  }
+
+  /**
+   * Get completions in the editor.
+   * Executes setupCode in console, creates a temp file (default extension `R`)
+   * with fileContent, positions cursor at cursorLine/cursorCol (or end of
+   * content), presses Ctrl+Space.
+   */
+  async getCompletionsInEditor(
+    setupCode: string[],
+    fileContent: string,
+    cursorLine?: number,
+    cursorCol?: number,
+    extension: string = 'R',
+  ): Promise<string[]> {
+    await this.setAlwaysShowPopup(true);
+    let fileName: string | null = null;
+    try {
+      fileName = await this.triggerCompletionInEditor(
+        setupCode,
+        fileContent,
+        cursorLine,
+        cursorCol,
+        extension,
+      );
+
+      return await this.getCompletionItems();
+    } finally {
+      // Cleanup: restore auto-accept, dismiss popup, close and delete file
+      await this.setAlwaysShowPopup(false);
+      await this.dismiss();
+      if (fileName !== null) {
+        await this.sourceActions.closeSourceAndDeleteFile(fileName);
+      }
+    }
+  }
+
+  /**
+   * Trigger completion in the editor for a token expected to have a unique
+   * match. An explicit completion request (Ctrl+Space) with exactly one
+   * result is accepted directly by RCompletionManager without ever showing
+   * the completion popup, so instead of reading popup items this waits for
+   * the accepted completion to be inserted and returns the resulting line.
+   *
+   * Deliberately leaves the "always show popup" override off: this helper
+   * exists to exercise the real unique-match auto-accept path (use
+   * getCompletionsInEditor to enumerate popup items instead).
+   *
+   * The cursor is placed at the end of the last non-empty line of
+   * fileContent, and that line is the one watched for the insertion.
+   */
+  async completeInEditorExpectingUniqueMatch(
+    setupCode: string[],
+    fileContent: string,
+  ): Promise<string> {
+    const fileName = await this.triggerCompletionInEditor(setupCode, fileContent);
+
+    // The completion replaces the token in place, so waiting for the cursor
+    // line to differ from its original text is the "completion accepted"
+    // signal. Compute the original text from fileContent (rather than
+    // sampling the editor after Ctrl+Space) so a fast accept can't race us.
+    const lines = fileContent.split('\n');
+    let triggerLine = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') {
+        triggerLine = lines[i];
+        break;
+      }
+    }
+
+    await this.page.waitForFunction(
+      (original) => {
+        const editor = window.rstudio?.documents.activeEditor() ?? null;
+        if (!editor) return false;
+        const row = editor.getCursorPosition().row;
+        return editor.session.getLine(row) !== original;
+      },
+      triggerLine,
+      { timeout: 15000 },
+    );
+
+    const line = await this.page.evaluate(() => {
+      const editor = window.rstudio?.documents.activeEditor() ?? null;
+      if (!editor) throw new Error('No active source editor');
+      return editor.session.getLine(editor.getCursorPosition().row);
+    });
+
+    // Cleanup: dismiss any follow-on suggest popup, close and delete file
+    await this.dismiss();
+    await this.sourceActions.closeSourceAndDeleteFile(fileName);
+
+    return line;
+  }
+}

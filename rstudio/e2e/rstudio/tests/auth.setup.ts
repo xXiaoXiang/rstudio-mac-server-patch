@@ -1,0 +1,1356 @@
+import { test as setup, type Page } from '@playwright/test';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  AUTH_STORAGE_KEY,
+  PositAiOAuthEntry,
+  copilotAuthDbPath,
+  copilotConfigDir,
+  findAuthenticatedStore,
+  isCopilotStoreAuthenticated,
+  isExternalServerRun,
+  isStoreFileAuthenticated,
+  noSeedCredentials,
+  readAuthStatus,
+  storeFileCandidates,
+  strictAiAuth,
+  writeAuthStatus,
+  type AIProvider,
+} from '../utils/auth';
+import {
+  REMOTE_COPILOT_DIR,
+  REMOTE_POSITAI_STORE,
+  bytesHoldCopilotToken,
+  closeExternalSession,
+  connectExternalSession,
+  evalRemoteLogical,
+  readManifest,
+  remoteCopilotStoreAuthenticated,
+  remotePathExists,
+  remotePositAiStoreAuthenticated,
+  scrubRemote,
+  waitForRemotePath,
+  writeManifest,
+  writeRemoteBinary,
+  writeRemoteText,
+} from '../utils/remote-provision';
+import { provisionRemoteOdbcSandbox, writeRemoteOdbcStatus, type RemoteOdbcStatus } from '../utils/connections';
+import { externalServerUrl } from '../fixtures/server.fixture';
+import {
+  CopilotAgent,
+  STATUS_ALREADY_SIGNED_IN,
+  STATUS_NOT_AUTHORIZED,
+  STATUS_OK,
+  STATUS_PROMPT_DEVICE_FLOW,
+} from '../utils/copilot-agent';
+import { authorizeDeviceCode, GitHubLoginError } from '../utils/github-device-authorize';
+import { authStepLogger, launchAuthBrowser } from '../utils/auth-debug';
+
+/**
+ * Authenticate the AI providers (Posit AI and GitHub Copilot) for the
+ * per-invocation sandbox.
+ *
+ * This is a Playwright setup project (see playwright.config.ts): it runs once
+ * after globalSetup and before the desktop/server test projects, which depend
+ * on it. Its job is to leave each provider's credential store in the sandbox
+ * user-home so the AI tests start signed in. It is the sole authority for AI
+ * credentials in the sandbox -- globalSetup (sandbox-setup.ts) copies nothing.
+ * Every exit path that lets the run continue (success or skip) also records
+ * what happened in <sandbox>/<provider>-auth-status.json (see AiAuthStatus in
+ * utils/auth.ts), which requireAiCredentials() reads so skipped tests report
+ * the actual cause. The fail-loud throw paths write nothing -- they fail the
+ * setup, so dependent tests don't run at all.
+ *
+ * Each provider's credential source is auto-detected, not selected by an
+ * environment variable:
+ *   1. The provider's credentials are set (POSIT_EMAIL/POSIT_PASSWORD, or
+ *      COPILOT_USER/COPILOT_PASSWORD) -> run its live sign-in flow.
+ *      Setting the credentials is deliberate, so it wins even on a machine
+ *      already signed in locally -- it's how you exercise the sign-in flow.
+ *   2. else a local credential store exists (~/.posit/ai/auth/data.json;
+ *      ~/.config/github-copilot or %LOCALAPPDATA%\github-copilot) and the
+ *      PW_SANDBOX_NO_SEED_CREDENTIALS seed kill-switch is not set -> copy it
+ *      into the sandbox.
+ *   3. else -> provision nothing; that provider's tests skip with a reason
+ *      drawn from its status file.
+ *
+ * The two providers detect their sources independently: Posit AI falling back
+ * to copy never makes Copilot copy, and vice versa. Their only shared inputs
+ * are the seed kill-switch and strict mode.
+ */
+
+const AUTH_HOST = 'login.posit.cloud';
+const CLIENT_ID = 'rstudio-ide';
+const SCOPE = 'prism';
+
+// Whether this run targets an external RStudio Server (PW_RSTUDIO_SERVER_URL).
+// A spawned in-tree server delivers the sandbox credentials to its rsessions
+// via the --rsession-path wrapper (fixtures/server.fixture.ts, #18348); on an
+// external server that server's rsessions read the logged-in account's real
+// home directory instead, so the final setup step below pushes the sandbox
+// stores into that home through the session (utils/remote-provision.ts).
+const IS_EXTERNAL_SERVER = isExternalServerRun();
+
+// Copy a single file, first creating the destination's parent directory.
+function copyFile(src: string, dest: string): void {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(src, dest);
+}
+
+// Copy the local token store into the sandbox.
+function copyStoreToSandbox(localStore: string, sandboxUserHome: string): void {
+  for (const dest of storeFileCandidates(sandboxUserHome)) {
+    copyFile(localStore, dest);
+  }
+}
+
+// Verify the write succeeded: a partial or failed write must not pass.
+function verifyStoreWritten(sandboxUserHome: string): void {
+  for (const dest of storeFileCandidates(sandboxUserHome)) {
+    if (!isStoreFileAuthenticated(dest)) {
+      throw new Error(
+        `[auth-setup] post-write verification failed for ${dest}: store is missing, unreadable, malformed, lacks required fields, or its token is already expired (the unreadable/malformed cases emit a preceding [auth] WARNING naming the cause; the missing-file, missing-fields, and expiry cases fail without one)`,
+      );
+    }
+  }
+}
+
+interface DeviceCodeResponse {
+  user_code: string;
+  verification_uri: string;
+  // OPTIONAL per RFC 8628 §3.2, but login.posit.cloud always returns it and
+  // automateLogin depends on it; fetchDeviceCode validates its presence.
+  verification_uri_complete: string;
+  device_code: string;
+  // Optional per RFC 8628 §3.2 (default 5s); defaulted at the call site.
+  interval?: number;
+  // REQUIRED per RFC 8628 §3.2, but unused here (the poll runs under its own
+  // timeout), so fetchDeviceCode doesn't validate it -- optional keeps the
+  // type honest about what's actually guaranteed.
+  expires_in?: number;
+}
+
+// Per RFC 6749 §5.1 / RFC 8628 §3.5: access_token and token_type are required;
+// expires_in is RECOMMENDED; refresh_token and scope are optional.
+interface TokenSuccessResponse {
+  access_token: string;
+  token_type: string;
+  expires_in?: number;
+  refresh_token?: string;
+  scope?: string;
+}
+
+// Per RFC 6749 §5.2: error is required; error_description and error_uri are
+// optional. Device-flow error codes (RFC 8628 §3.5) include
+// authorization_pending and slow_down (transient) plus access_denied and
+// expired_token.
+interface TokenErrorResponse {
+  error: string;
+  error_description?: string;
+  error_uri?: string;
+}
+
+// A deterministic OAuth-side failure: the server terminated the sign-in
+// (access_denied, expired_token, a config fault) or returned a malformed
+// response. Treated as fatal so it fails the run rather than masquerading as
+// a skip.
+class OAuthTerminalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OAuthTerminalError';
+  }
+}
+
+// A browser-side login failure at a step where wrong credentials or a denied
+// authorization is the likely cause (see automateLogin). Treated as fatal so a
+// bad POSIT_EMAIL/POSIT_PASSWORD fails the run rather than masquerading as a
+// skip.
+class LoginAutomationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LoginAutomationError';
+  }
+}
+
+async function fetchDeviceCode(): Promise<DeviceCodeResponse> {
+  const resp = await fetch(`https://${AUTH_HOST}/oauth/device/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ scope: SCOPE, client_id: CLIENT_ID }).toString(),
+    // This fetch runs before (and outside) the withDeadline race in the setup
+    // body, so it needs its own bound: unbounded, a hung request would run
+    // into the harness timeout and bypass the transient path entirely.
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    // A 4xx carrying an RFC 6749 error body is the server rejecting the
+    // request as such (invalid_client, invalid_scope, ...) -- a config fault
+    // that a retry can't heal, so it's terminal, matching how pollForToken
+    // classifies the same codes. 5xx and proxy noise stay plain (transient).
+    if (resp.status < 500) {
+      let oauthError: unknown;
+      try {
+        oauthError = (JSON.parse(text) as Partial<TokenErrorResponse>).error;
+      } catch {
+        // Not JSON; fall through to the plain error below.
+      }
+      if (typeof oauthError === 'string' && oauthError !== '') {
+        throw new OAuthTerminalError(
+          `device-authorize request rejected by server (${oauthError}): HTTP ${resp.status}`,
+        );
+      }
+    }
+    throw new Error(`OAuth sign-in request failed: ${resp.status} ${text.slice(0, 200)}`);
+  }
+  let data: Partial<DeviceCodeResponse>;
+  try {
+    data = (await resp.json()) as Partial<DeviceCodeResponse>;
+  } catch (err) {
+    // A 200 that isn't JSON is a contract change, exactly like a 200 missing
+    // fields below -- terminal, not flake.
+    throw new OAuthTerminalError(
+      `device-authorize response is not valid JSON: ${(err as Error).message}`,
+    );
+  }
+  // A 200 with a shape we don't understand is a contract change on the auth
+  // server, not flake -- fail the run naming the field rather than letting a
+  // downstream TypeError read as "no credentials" (a perpetual dark skip).
+  for (const field of ['device_code', 'user_code', 'verification_uri', 'verification_uri_complete'] as const) {
+    if (typeof data[field] !== 'string' || data[field] === '') {
+      throw new OAuthTerminalError(
+        `device-authorize response is missing or has a non-string "${field}"; the endpoint contract may have changed`,
+      );
+    }
+  }
+  if (data.interval !== undefined && (typeof data.interval !== 'number' || data.interval <= 0)) {
+    throw new OAuthTerminalError(
+      `device-authorize response has invalid "interval" (${JSON.stringify(data.interval)}); expected a positive number`,
+    );
+  }
+  return data as DeviceCodeResponse;
+}
+
+async function pollForToken(
+  deviceCode: string,
+  intervalSeconds: number,
+  timeoutMs: number,
+): Promise<TokenSuccessResponse> {
+  const deadline = Date.now() + timeoutMs;
+  let waitMs = intervalSeconds * 1000;
+  // Most recent response that fit neither the success nor the RFC error shape
+  // (e.g. a proxy 502 with an HTML body); surfaced in the timeout message so
+  // a retried-through hiccup is still diagnosable.
+  let lastAnomaly: string | undefined;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    const resp = await fetch(`https://${AUTH_HOST}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        scope: SCOPE,
+        client_id: CLIENT_ID,
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: deviceCode,
+      }).toString(),
+    });
+    if (resp.ok) {
+      let token: Partial<TokenSuccessResponse>;
+      try {
+        token = (await resp.json()) as Partial<TokenSuccessResponse>;
+      } catch (err) {
+        // A 200 that isn't JSON is a contract change on the token endpoint,
+        // not flake -- terminal, matching fetchDeviceCode. (Contrast with the
+        // non-JSON *error* responses below, which are proxy noise and are
+        // retried through.)
+        throw new OAuthTerminalError(
+          `token response is not valid JSON: ${(err as Error).message}`,
+        );
+      }
+      // Same promotion discipline as fetchDeviceCode: name the missing field
+      // here, where the culprit is identifiable as the token endpoint, rather
+      // than let it surface later as a store-verification failure.
+      for (const field of ['access_token', 'token_type'] as const) {
+        if (typeof token[field] !== 'string' || token[field] === '') {
+          throw new OAuthTerminalError(
+            `token response is missing or has a non-string "${field}"; the endpoint contract may have changed`,
+          );
+        }
+      }
+      return token as TokenSuccessResponse;
+    }
+    const text = await resp.text();
+    let body: Partial<TokenErrorResponse> = {};
+    try {
+      body = JSON.parse(text) as TokenErrorResponse;
+    } catch {
+      // Not JSON; handled as an anomaly below.
+    }
+    // A 5xx, or any response without the RFC-required "error" string, is a
+    // server-side hiccup or a proxy interjection, not an OAuth verdict. Keep
+    // polling until the deadline rather than misreading it as terminal (a
+    // "(undefined)" run failure) or letting a JSON parse error escape as a
+    // transient-looking skip when the next poll might have succeeded.
+    if (resp.status >= 500 || typeof body.error !== 'string' || body.error === '') {
+      lastAnomaly = `HTTP ${resp.status}: ${text.slice(0, 200)}`;
+      continue;
+    }
+    if (body.error === 'authorization_pending') continue;
+    if (body.error === 'slow_down') {
+      waitMs += 5000;
+      continue;
+    }
+    // Only authorization_pending / slow_down are non-terminal (RFC 8628 §3.5).
+    // Every other error is a deterministic problem -- access_denied,
+    // expired_token, invalid_grant, or a config fault (invalid_client,
+    // invalid_scope, ...) -- so fail loud rather than let it look like a skip.
+    // (expired_token can also mean a slow runner missed the window; failing
+    // loud there is the accepted trade-off over silently skipping.)
+    const suffix = body.error_description ? `: ${body.error_description}` : '';
+    throw new OAuthTerminalError(
+      `OAuth sign-in terminated by server (${body.error})${suffix}`,
+    );
+  }
+  throw new Error(
+    'timed out waiting for authorization'
+      + (lastAnomaly ? ` (last unexpected token response: ${lastAnomaly})` : ''),
+  );
+}
+
+// Per-step narration, off unless PW_DEBUG_AUTH_STEPS is set (see
+// auth-debug.ts) -- the Posit AI counterpart of the GitHub flow's
+// [authorize-github] lines. Step names are literal strings with no account
+// identifiers, per the flag's contract.
+const logStep = authStepLogger('posit');
+
+async function step<T>(page: Page, name: string, fn: () => Promise<T>, fatal = false): Promise<T> {
+  // Logged at step start so a hung step is still visible: its line is the
+  // last one printed.
+  logStep(name);
+  try {
+    return await fn();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // page.url() is the one piece of non-sensitive context always available
+    // with artifacts disabled for this project (see playwright.config.ts);
+    // guard it in case the page is already closed. PW_DEBUG_AUTH_CAPTURE=1 opts into
+    // page captures via the shared auth browser (utils/auth-debug.ts).
+    let url = 'unknown';
+    try {
+      url = page.url();
+    } catch {
+      // keep 'unknown'
+    }
+    const wrapped = `[authorize-posit] ${name} failed: ${msg} (page: ${url})`;
+    // Failures at credential/authorization steps are fatal (LoginAutomationError);
+    // non-credential steps stay transient so a flaky page load lets the Posit AI
+    // tests skip rather than failing the whole run. A step that has already
+    // diagnosed a credential rejection itself throws LoginAutomationError, and
+    // that verdict is kept -- see the catch in the setup body.
+    const isFatal = fatal || err instanceof LoginAutomationError;
+    throw isFatal ? new LoginAutomationError(wrapped) : new Error(wrapped);
+  }
+}
+
+// Race a promise against a deadline. On expiry, rejects with a plain Error so
+// the caller's transient path handles it; the underlying work is not
+// cancelled (Playwright kills any leftover browser at worker exit), but the
+// setup test itself settles promptly instead of running into the harness
+// timeout, which would bypass the transient path entirely.
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} after ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+}
+
+// Set by the authorize step when its clicks never visibly registered. The
+// console warning it emits is only visible in the setup's own output; this
+// variable carries the same diagnosis into the status file, so the eventual
+// poll-timeout skip reason names the likely culprit. (Written at most once
+// per process: the setup project runs one test with retries: 0.)
+let authorizeStepWarning: string | undefined;
+
+async function automateLogin(
+  verificationUriComplete: string,
+  userCode: string,
+  email: string,
+  password: string,
+): Promise<void> {
+  const verificationUri = verificationUriComplete.split('?')[0];
+  let session: Awaited<ReturnType<typeof launchAuthBrowser>>;
+  try {
+    session = await launchAuthBrowser('posit');
+  } catch (err) {
+    // A launch failure is an environment gap, not flake: desktop runs connect
+    // to RStudio's Electron over CDP and never otherwise need Playwright's
+    // own chromium, so a runner can pass the whole suite while lacking the
+    // binary this flow launches. Fail the run with the remedy rather than
+    // skipping the Posit AI tests forever.
+    throw new LoginAutomationError(
+      `could not launch the sign-in browser: ${(err as Error).message} -- if the Playwright browser is not installed, run "npx playwright install" from e2e/rstudio`,
+    );
+  }
+  try {
+    const page = session.page;
+    // All selectors below track the login.posit.cloud markup; when that page
+    // changes, these are the first thing to break (surfacing as a fatal error
+    // on the credential steps, or as a skip whose login-failed reason names
+    // the step for the others).
+    await step(page, 'open activation URL', () => page.goto(verificationUriComplete));
+    await step(page, 'submit email', async () => {
+      await page
+        .locator('input[type="email"], input[name="username"], input[name="email"]')
+        .fill(email);
+      await page.getByRole('button', { name: /continue/i }).click();
+    });
+    await step(page, 'submit password', async () => {
+      // Password field appears inline after the email step submits via XHR;
+      // no navigation fires, so waitForLoadState would return immediately
+      // (the page is already past "load") and waitForURL would hang. Wait
+      // for the field itself instead.
+      const passwordInput = page.locator('input[type="password"]');
+      await passwordInput.waitFor({ state: 'visible' });
+      await passwordInput.fill(password);
+      // noWaitAfter: click() otherwise waits for the navigation it triggers
+      // under the runner's actionTimeout (10s), which a slow redirect blew
+      // through and took the whole run down with it. Let the 30s URL wait
+      // below own that budget instead.
+      await page
+        .getByRole('button', { name: /log.?in|sign.?in|continue/i })
+        .click({ noWaitAfter: true });
+      const redirected = await page
+        .waitForURL(/\/oauth\/device/, { timeout: 30000 })
+        .then(() => true, () => false);
+      if (redirected)
+        return;
+
+      // Not redirected. A rejected password is the fatal case, and it shows
+      // up as an error message on the login page; anything else (a slow or
+      // stalled redirect) is transient and lets the Posit AI tests skip. The
+      // text patterns are deliberately narrow: ordinary login-page copy
+      // ("Wrong account?", "Try again") must not read as a rejection.
+      const rejection = page
+        .getByRole('alert')
+        .or(page.getByText(/incorrect|invalid|not recognized|does ?n.t match/i))
+        .first();
+      if (await rejection.isVisible().catch(() => false)) {
+        const rejectionText = await rejection.innerText().catch(() => '');
+        throw new LoginAutomationError(
+          `credentials rejected: ${rejectionText.trim().slice(0, 120)}`,
+        );
+      }
+      throw new Error('no redirect to /oauth/device within 30s of submitting the password');
+    });
+    await step(page, 'enter user code', async () => {
+      // _complete URL prefills the userCode form; navigate to the bare URI
+      // for an empty form to type into.
+      await page.goto(verificationUri);
+      await page.locator('input[name="userCode0"]').waitFor({ state: 'visible' });
+      // pressSequentially fires React's onChange per character; fill()
+      // bypasses it and leaves the form empty.
+      const codeChars = userCode.replace(/-/g, '').split('');
+      for (let i = 0; i < codeChars.length; i++) {
+        await page.locator(`input[name="userCode${i}"]`).pressSequentially(codeChars[i]);
+      }
+      await page.getByRole('button', { name: /continue/i }).click();
+    });
+    await step(page, 'authorize', async () => {
+      const authorizeBtn = page.getByRole('button', { name: 'Authorize' });
+      await authorizeBtn.waitFor({ state: 'visible', timeout: 15000 });
+      // The button can pass Playwright's actionability checks a beat before the
+      // SPA binds its click handler, so a single too-fast click is silently
+      // swallowed: the device is never authorized and the only symptom is a
+      // later poll timeout, not a click error. Re-click while the button is
+      // still present so a swallowed click is retried once the handler is
+      // bound; once a click registers the page advances and the button
+      // detaches, ending the loop. pollForToken remains the arbiter of whether
+      // authorization actually succeeded -- if it never takes, its timeout
+      // drives the transient -> skip path.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (!(await authorizeBtn.isVisible())) break;
+        try {
+          // Short explicit timeout: a click that starts just as the SPA's
+          // post-authorize transition detaches the button would otherwise
+          // retry actionability for the raw-page 30s default and surface as
+          // a fatal "authorize failed" -- on a sign-in that succeeded.
+          await authorizeBtn.click({ timeout: 2000 });
+        } catch {
+          // Button gone mid-click means a previous click registered and the
+          // page advanced -- that's success. Still attached: keep trying.
+          if (!(await authorizeBtn.isVisible())) break;
+        }
+        await page.waitForTimeout(1000);
+      }
+      if (await authorizeBtn.isVisible()) {
+        authorizeStepWarning =
+          'authorize button still present after 5 click attempts; authorization may not have registered';
+        console.warn(`[auth-setup] WARNING: ${authorizeStepWarning} (expect a poll timeout)`);
+      }
+    }, true);
+  } finally {
+    // session.close() takes the final page capture and never throws, so it
+    // can't replace an in-flight LoginAutomationError (see auth-debug.ts).
+    await session.close();
+  }
+}
+
+function writeTokensToSandbox(tokenData: TokenSuccessResponse, sandboxUserHome: string): void {
+  if (tokenData.expires_in === undefined) {
+    throw new Error('OAuth success response lacks expires_in; cannot compute expiresAt');
+  }
+  const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
+  const entry: PositAiOAuthEntry = {
+    authenticated: true,
+    oauthAuth: {
+      tokenData: {
+        accessToken: tokenData.access_token,
+        ...(tokenData.refresh_token !== undefined && { refreshToken: tokenData.refresh_token }),
+        expiresAt,
+        tokenType: tokenData.token_type,
+        ...(tokenData.scope !== undefined && { scope: tokenData.scope }),
+      },
+      expiresAt,
+      ...(tokenData.scope !== undefined && { scope: tokenData.scope }),
+    },
+  };
+  const storeData = { [AUTH_STORAGE_KEY]: entry };
+  // Write every candidate location (currently one; the array exists so a
+  // future store migration only needs to change POSITAI_STORE_CANDIDATES).
+  for (const dest of storeFileCandidates(sandboxUserHome)) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, JSON.stringify(storeData, null, 2), { mode: 0o600 });
+  }
+}
+
+// PW_AI_AUTH_STRICT: fail the run instead of returning normally when the
+// setup ends without credentials. Called after the status file is written, so
+// the record of what happened survives either way. This is the guard against
+// perpetual green-with-skips: on runs that expect credentials to be present
+// (e.g. CI once secrets are wired in), a broken credential source must turn
+// the run red, however the failure was classified.
+function failIfStrict(providerLabel: string, reason: string): void {
+  if (strictAiAuth()) {
+    throw new Error(
+      `[auth-setup] PW_AI_AUTH_STRICT is set but ${providerLabel} was not provisioned: ${reason}`,
+    );
+  }
+}
+
+setup('authenticate Posit AI', async () => {
+  // Explicit headroom above the flow's own budget: browser launch, five login
+  // steps (the runner applies the config's actionTimeout to contexts launched
+  // during a test, so 10s per action plus the password step's own 30s URL
+  // wait), and the 90s token poll can legitimately exceed the global 120s
+  // test timeout. If the harness timeout fired here, the catch below would
+  // never run and every dependent test would be marked "did not run"; the
+  // withDeadline race below fails through the transient path well before this
+  // outer limit can be reached.
+  setup.setTimeout(240_000);
+
+  const sandbox = process.env.PW_SANDBOX;
+  if (!sandbox) throw new Error('PW_SANDBOX is not set; sandbox-setup must run first');
+
+  const sandboxUserHome = path.join(sandbox, 'user-home');
+  const email = process.env.POSIT_EMAIL;
+  const password = process.env.POSIT_PASSWORD;
+
+  // A half-set pair is a config mistake, not a source: dropping silently into
+  // copy/skip would bypass the sign-in flow the user clearly intended, and the
+  // skip reason below would wrongly report both as unset. Fail loud so the typo
+  // (or the forgotten second variable) surfaces immediately.
+  if (!!email !== !!password) {
+    throw new Error(
+      '[auth-setup] exactly one of POSIT_EMAIL / POSIT_PASSWORD is set; set both to exercise the sign-in flow, or neither to copy the local token store',
+    );
+  }
+
+  // Source 2/3: no credentials set -> copy the local token store, else skip.
+  // (Source 1, the sign-in flow, is below and runs when credentials are set.)
+  if (!email || !password) {
+    // The global seed kill-switch blocks copying the local token store.
+    if (noSeedCredentials()) {
+      writeAuthStatus(sandbox, 'positai', {
+        source: 'none',
+        outcome: 'unavailable',
+        reason: 'Not provisioning Posit AI: POSIT_EMAIL/POSIT_PASSWORD are unset (so no sign-in) and PW_SANDBOX_NO_SEED_CREDENTIALS blocked copying the local token store. Set the credentials for the sign-in flow, or unset the seed kill-switch while signed in to Posit AI locally.',
+      });
+      console.log('[auth-setup] no credentials set and PW_SANDBOX_NO_SEED_CREDENTIALS set; Posit AI tests will skip');
+      failIfStrict('Posit AI', 'POSIT_EMAIL/POSIT_PASSWORD are unset and PW_SANDBOX_NO_SEED_CREDENTIALS blocked the local copy');
+      return;
+    }
+    const localStore = findAuthenticatedStore(os.homedir());
+    if (localStore === null) {
+      writeAuthStatus(sandbox, 'positai', {
+        source: 'none',
+        outcome: 'unavailable',
+        reason: 'Not provisioning Posit AI: not signed in to Posit AI locally (no valid token store at ~/.posit/ai/auth/data.json) and POSIT_EMAIL/POSIT_PASSWORD are unset. Sign in to Posit AI locally, or set the credentials for the sign-in flow.',
+      });
+      console.log('[auth-setup] not signed in to Posit AI locally and no credentials set; Posit AI tests will skip');
+      failIfStrict('Posit AI', 'not signed in to Posit AI locally and POSIT_EMAIL/POSIT_PASSWORD are unset');
+      return;
+    }
+    copyStoreToSandbox(localStore, sandboxUserHome);
+    verifyStoreWritten(sandboxUserHome);
+    writeAuthStatus(sandbox, 'positai', {
+      source: 'copy',
+      outcome: 'success',
+      reason: `copied the local token store from ${localStore}`,
+    });
+    console.log(`[auth-setup] copied Posit AI token store from ${localStore}`);
+    console.log(
+      "[auth-setup] real Posit AI tokens now live in the sandbox; teardown scrubs them if the run is preserved, and warns loudly if it can't.",
+    );
+    return;
+  }
+
+  // Source 1: credentials set -> OAuth device-flow sign-in. Chosen whenever
+  // POSIT_EMAIL/POSIT_PASSWORD are set, even on a machine already signed in
+  // locally: setting the credentials is the deliberate way to exercise the
+  // sign-in flow. The seed kill-switch never affects it (it copies nothing from
+  // the host); note it in the log so a run configured with the seed kill-switch set
+  // doesn't look silently ignored.
+  if (noSeedCredentials()) {
+    console.log('[auth-setup] PW_SANDBOX_NO_SEED_CREDENTIALS set; Posit AI sign-in flow is unaffected.');
+  }
+
+  console.log('[auth-setup] starting Posit AI sign-in...');
+  let tokenData: TokenSuccessResponse;
+  try {
+    const { verification_uri, verification_uri_complete, user_code, device_code, interval } =
+      await fetchDeviceCode();
+    console.log(`[auth-setup] verification_uri: ${verification_uri}`);
+    // Drive the browser and poll for the token concurrently. Promise.all
+    // attaches a handler to both, so a failure in automateLogin can't leave the
+    // poll as an orphaned unhandled rejection. interval defaults to 5s per
+    // RFC 8628 §3.2.
+    const flow = Promise.all([
+      automateLogin(verification_uri_complete, user_code, email, password),
+      pollForToken(device_code, interval ?? 5, 90000),
+    ]);
+    // Keep a handler attached so a rejection landing after the deadline race
+    // below has already settled can't become an unhandled rejection. Once the
+    // race HAS settled, though, a flow rejection is otherwise-lost diagnostic
+    // (the real cause behind a deadline expiry), so log it then. This handler
+    // is attached before the race, so when the flow's own rejection is what
+    // settles the race, it runs first -- outerSettled still false -- and
+    // stays quiet: no double-logging on the normal failure path.
+    let outerSettled = false;
+    flow.catch((err) => {
+      if (outerSettled) {
+        console.warn(
+          '[auth-setup] late sign-in rejection (after the overall deadline already fired):',
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    });
+    // Bound the whole flow well under this test's 240s timeout (set above) so
+    // a pile-up of slow steps fails through the transient path here instead
+    // of hitting the harness timeout, which would skip the catch below and
+    // fail the entire run. (fetchDeviceCode above runs outside this race and
+    // carries its own 30s bound.)
+    let resolvedPair: [void, TokenSuccessResponse];
+    try {
+      resolvedPair = await withDeadline(flow, 180_000, 'overall sign-in deadline exceeded');
+    } finally {
+      outerSettled = true;
+    }
+    tokenData = resolvedPair[1];
+  } catch (err) {
+    // Fail loud on deterministic problems: a terminal OAuth error (denied
+    // authorization, config fault, malformed device-authorize response) or a
+    // browser-side failure at the credential/authorization steps (e.g. a
+    // wrong POSIT_PASSWORD). Everything else falls through to a skip. That
+    // bucket is usually transient (page load, network, poll timeout, overall
+    // deadline), but the split is by step/error kind, not by root cause --
+    // deterministic login-page changes at the non-credential steps land here
+    // too. The status file keeps that visible: every skipped Posit AI test
+    // reports this failure as its skip reason.
+    if (err instanceof OAuthTerminalError || err instanceof LoginAutomationError) {
+      throw err;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    // A swallowed authorize click surfaces here as a generic poll timeout;
+    // append the authorize step's own diagnosis so the skip reason names the
+    // likely culprit rather than only the symptom.
+    const authorizeNote = authorizeStepWarning ? ` [${authorizeStepWarning}]` : '';
+    writeAuthStatus(sandbox, 'positai', {
+      source: 'login',
+      outcome: 'login-failed',
+      reason: `sign-in flow was attempted but failed: ${msg}${authorizeNote}`,
+    });
+    console.warn(
+      '[auth-setup] WARNING: Posit AI authentication flow failed; Posit AI tests will be skipped:',
+      msg,
+    );
+    failIfStrict('Posit AI', `the sign-in flow was attempted but failed: ${msg}${authorizeNote}`);
+    return;
+  }
+
+  // Past this point sign-in demonstrably succeeded, so a malformed token
+  // response or a failed store write is a contract violation, not flake -- let
+  // these throw and fail the run rather than masquerade as a skip.
+  writeTokensToSandbox(tokenData, sandboxUserHome);
+  verifyStoreWritten(sandboxUserHome);
+  writeAuthStatus(sandbox, 'positai', {
+    source: 'login',
+    outcome: 'success',
+    reason: 'sign-in flow completed',
+  });
+  console.log(
+    IS_EXTERNAL_SERVER
+      ? '[auth-setup] Posit AI sign-in complete; the provisioning step below will push the credentials to the external server'
+      : '[auth-setup] Posit AI sign-in complete; credentials are in place',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// GitHub Copilot. Same auto-detect shape as Posit AI above, different
+// mechanics: the sign-in flow spawns the copilot-language-server itself
+// (utils/copilot-agent.ts) with HOME pointed at the sandbox user-home, lets it
+// run GitHub's OAuth device-flow sign-in, and completes the browser half
+// (utils/github-device-authorize.ts). The agent writes its own credential
+// store (auth.db), so the sandbox ends up with exactly what a real sign-in
+// through the IDE would produce. The copy mode replicates the host's
+// github-copilot config dir, as sandbox-setup.ts used to do.
+
+// The host-side Copilot config dir (the copy-mode source). Windows honors
+// %LOCALAPPDATA%, which need not equal <home>\AppData\Local -- that's why this
+// is computed here and not with copilotConfigDir, which owns the sandbox-side
+// (destination) layout.
+function hostCopilotConfigDir(): string {
+  return process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local'), 'github-copilot')
+    : path.join(os.homedir(), '.config', 'github-copilot');
+}
+
+// A deterministic Copilot sign-in failure: the flow worked but the account
+// can't use Copilot, or the config is unusable. Fails the run rather than
+// masquerading as a skip, mirroring OAuthTerminalError / LoginAutomationError
+// for Posit AI.
+class CopilotTerminalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CopilotTerminalError';
+  }
+}
+
+setup('authenticate GitHub Copilot', async () => {
+  // Same reasoning as the Posit AI block: agent startup, five browser steps,
+  // the authorize-button delay (up to 60s), and the agent's own token poll
+  // can legitimately exceed the global 120s test timeout; the withDeadline
+  // race below settles well before this outer limit.
+  setup.setTimeout(300_000);
+
+  const sandbox = process.env.PW_SANDBOX;
+  if (!sandbox) throw new Error('PW_SANDBOX is not set; sandbox-setup must run first');
+
+  const sandboxUserHome = path.join(sandbox, 'user-home');
+  const user = process.env.COPILOT_USER;
+  const password = process.env.COPILOT_PASSWORD;
+  const totpSecret = process.env.COPILOT_TOTP_SECRET;
+
+  // Mirror the POSIT_EMAIL/POSIT_PASSWORD rule: a half-set pair is a config
+  // mistake, not a source.
+  if (!!user !== !!password) {
+    throw new Error(
+      '[auth-setup] exactly one of COPILOT_USER / COPILOT_PASSWORD is set; set both to exercise the Copilot sign-in flow, or neither to copy the local credential store',
+    );
+  }
+
+  // Source 2/3: no credentials set -> copy the host's Copilot config dir,
+  // else skip.
+  if (!user || !password) {
+    if (noSeedCredentials()) {
+      writeAuthStatus(sandbox, 'copilot', {
+        source: 'none',
+        outcome: 'unavailable',
+        reason: 'Not provisioning GitHub Copilot: COPILOT_USER/COPILOT_PASSWORD are unset (so no sign-in) and PW_SANDBOX_NO_SEED_CREDENTIALS blocked copying the local credential store. Set the credentials for the sign-in flow, or unset the seed kill-switch while signed in to Copilot locally.',
+      });
+      console.log('[auth-setup] no GitHub credentials set and PW_SANDBOX_NO_SEED_CREDENTIALS set; Copilot tests will skip');
+      failIfStrict('GitHub Copilot', 'COPILOT_USER/COPILOT_PASSWORD are unset and PW_SANDBOX_NO_SEED_CREDENTIALS blocked the local copy');
+      return;
+    }
+    const hostDir = hostCopilotConfigDir();
+    if (!fs.existsSync(hostDir)) {
+      writeAuthStatus(sandbox, 'copilot', {
+        source: 'none',
+        outcome: 'unavailable',
+        reason: `Not provisioning GitHub Copilot: no local credential store (${hostDir} does not exist) and COPILOT_USER/COPILOT_PASSWORD are unset. Sign in to Copilot locally, or set the credentials for the sign-in flow.`,
+      });
+      console.log(`[auth-setup] no ${hostDir} on host and no GitHub credentials set; Copilot tests will skip`);
+      failIfStrict('GitHub Copilot', 'not signed in to Copilot locally and COPILOT_USER/COPILOT_PASSWORD are unset');
+      return;
+    }
+    fs.cpSync(hostDir, copilotConfigDir(sandboxUserHome), { recursive: true });
+    // A config dir can exist without a signed-in token (the agent creates one
+    // on first launch); a copy of that must not read as provisioned.
+    if (!(await isCopilotStoreAuthenticated(sandboxUserHome))) {
+      writeAuthStatus(sandbox, 'copilot', {
+        source: 'copy',
+        outcome: 'unavailable',
+        reason: `Copied ${hostDir}, but its credential store holds no signed-in token. Sign in to Copilot locally (e.g. through RStudio), or set COPILOT_USER/COPILOT_PASSWORD for the sign-in flow.`,
+      });
+      console.log('[auth-setup] host Copilot config dir copied but holds no signed-in token; Copilot tests will skip');
+      failIfStrict('GitHub Copilot', 'the local Copilot store holds no signed-in token');
+      return;
+    }
+    writeAuthStatus(sandbox, 'copilot', {
+      source: 'copy',
+      outcome: 'success',
+      reason: `copied the local credential store from ${hostDir}`,
+    });
+    console.log(`[auth-setup] copied GitHub Copilot credential store from ${hostDir}`);
+    console.log(
+      "[auth-setup] real GitHub Copilot tokens now live in the sandbox; teardown scrubs them if the run is preserved, and warns loudly if it can't.",
+    );
+    return;
+  }
+
+  // Source 1: credentials set -> agent-driven sign-in. Same precedence rule as
+  // Posit AI: setting the credentials is deliberate, so this wins even on a
+  // machine signed in locally, and the seed kill-switch never affects it.
+  if (noSeedCredentials()) {
+    console.log('[auth-setup] PW_SANDBOX_NO_SEED_CREDENTIALS set; Copilot sign-in flow is unaffected.');
+  }
+
+  console.log('[auth-setup] starting GitHub Copilot sign-in...');
+  const agent = new CopilotAgent(sandboxUserHome);
+  // Captured from the authorize step so a later failure can name a likely
+  // culprit (e.g. the Authorize button never appeared) in the skip reason.
+  let authorizeNote: string | undefined;
+  try {
+    const flow = (async () => {
+      await agent.initialize();
+      const initiate = await agent.signInInitiate();
+
+      // With credentials the sandbox user-home may already hold a token from a
+      // prior source; the agent then just confirms it, which is success.
+      if (initiate.status === STATUS_ALREADY_SIGNED_IN || initiate.status === STATUS_OK) {
+        console.log('[auth-setup] Copilot agent reports already signed in');
+        return;
+      }
+
+      if (initiate.status === STATUS_NOT_AUTHORIZED) {
+        // The account has no Copilot access -- deterministic, same remedy as
+        // the post-sign-in NotAuthorized case, not a protocol change.
+        throw new CopilotTerminalError(
+          'Copilot sign-in reports the account has no Copilot access (NotAuthorized). Enable Copilot Free at https://github.com/settings/copilot and re-run.',
+        );
+      }
+      if (initiate.status !== STATUS_PROMPT_DEVICE_FLOW || !initiate.userCode || !initiate.verificationUri) {
+        // An unrecognized signInInitiate shape is a protocol change on the
+        // agent, not flake.
+        throw new CopilotTerminalError(
+          `signInInitiate returned an unexpected result (status "${initiate.status}"); the agent protocol may have changed`,
+        );
+      }
+      console.log(`[auth-setup] Copilot device flow: ${initiate.verificationUri}`);
+
+      // The browser half: sign in to GitHub and authorize the agent's device
+      // code. The agent polls GitHub itself afterwards, exchanges the code,
+      // and persists the token.
+      authorizeNote = await authorizeDeviceCode({
+        verificationUri: initiate.verificationUri,
+        userCode: initiate.userCode,
+        user,
+        password,
+        totpSecret,
+      });
+
+      const finalStatus = await agent.waitForSignIn();
+      if (finalStatus.status === STATUS_NOT_AUTHORIZED) {
+        // The mechanics worked (GitHub authorized the device) but the account
+        // has no Copilot access -- deterministic, so fail the run with the
+        // remedy rather than skipping forever.
+        throw new CopilotTerminalError(
+          'Copilot sign-in completed but the account has no Copilot access (NotAuthorized). Enable Copilot Free at https://github.com/settings/copilot and re-run.',
+        );
+      }
+      if (finalStatus.status !== STATUS_OK && finalStatus.status !== STATUS_ALREADY_SIGNED_IN) {
+        throw new Error(`Copilot sign-in ended in unexpected status "${finalStatus.status}"`);
+      }
+      console.log('[auth-setup] Copilot signed in');
+    })();
+
+    // Bound the whole flow under this test's 300s timeout (set above), for the
+    // same reason as the Posit AI block: fail through the transient path here
+    // rather than hit the harness timeout and take the whole run down.
+    await withDeadline(flow, 270_000, 'overall Copilot sign-in deadline exceeded');
+  } catch (err) {
+    if (err instanceof CopilotTerminalError || err instanceof GitHubLoginError) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    writeAuthStatus(sandbox, 'copilot', {
+      source: 'login',
+      outcome: 'login-failed',
+      reason: `Copilot sign-in flow was attempted but failed: ${msg}${authorizeNote ? ` (${authorizeNote})` : ''}`,
+    });
+    console.warn(
+      '[auth-setup] WARNING: GitHub Copilot sign-in flow failed; Copilot tests will be skipped:',
+      msg,
+    );
+    failIfStrict('GitHub Copilot', `the sign-in flow was attempted but failed: ${msg}${authorizeNote ? ` (${authorizeNote})` : ''}`);
+    return;
+  } finally {
+    // Orderly shutdown before reading the store, so the SQLite WAL is
+    // checkpointed into auth.db and the row is visible to fresh readers (the
+    // gate here, and the IDE processes launched later).
+    await agent.shutdown();
+  }
+
+  // Past this point sign-in demonstrably succeeded, so a store the gate can't
+  // read back is a contract violation, not flake.
+  if (!(await isCopilotStoreAuthenticated(sandboxUserHome))) {
+    throw new Error(
+      '[auth-setup] Copilot sign-in reported success, but the sandbox credential store holds no token row afterwards',
+    );
+  }
+  writeAuthStatus(sandbox, 'copilot', {
+    source: 'login',
+    outcome: 'success',
+    reason: 'agent-driven sign-in flow completed',
+  });
+  console.log(
+    IS_EXTERNAL_SERVER
+      ? '[auth-setup] Copilot sign-in complete; the provisioning step below will push the credentials to the external server'
+      : '[auth-setup] Copilot sign-in complete; credentials are in place',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// External-server provisioning (#18348, part 2). The two steps above leave the
+// credential stores in the SANDBOX user-home; on desktop and spawned-server
+// runs the launch fixtures deliver that home to the session, but an external
+// server's rsessions read the logged-in account's real home directory, which
+// this process cannot write directly. It can, however, act as that account once
+// logged in -- so this final step connects, uploads each provisioned store into
+// the remote home (over HTTP, with the console moving it into place; see
+// utils/remote-provision.ts for why the bytes stay out of console commands),
+// records what it created in a manifest
+// (<sandbox>/remote-provision-manifest.json) for the auth-teardown project to
+// scrub, marks each provider's status file with remoteProvisioned (which
+// requireAiCredentials requires on external runs), and ends the remote R
+// session so tests attach to a fresh one that reads the new stores.
+//
+// A store already present on the remote account is used as-is: never
+// overwritten, never added to the scrub manifest -- the teardown must not
+// delete credentials this run didn't write. For both providers "present"
+// means "holds a sign-in", probed by content: the rsession writes an
+// unauthenticated stub data.json at every session startup (including this
+// step's own login), and any session that enables Copilot leaves an empty
+// auth.db behind. Such stubs are machine-written state, not user data --
+// they are overwritten and scrubbed like this run's own files.
+
+// How long to wait for the remote session's own stub data.json write before
+// pushing the Posit AI store (see the call site). The stub's timing is
+// variable -- observed both before the provisioning step's first probe and
+// several seconds after session startup -- so this is margin over the
+// observed range, weighed against paying the full wait on accounts that never
+// write one at all. Two layers backstop a straggler that outlasts it: the
+// write retry in writeRemoteBinary, and the post-push content re-probe, which
+// refuses to vouch for a store the stub landed on top of.
+const POSITAI_STUB_WAIT_MS = 5_000;
+
+// A deterministic external-server misconfiguration that a retry can't heal.
+// Fails the run (mirroring OAuthTerminalError above) rather than skipping.
+class RemoteProvisionConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RemoteProvisionConfigError';
+  }
+}
+
+// Mark `provider`'s status file remoteProvisioned. The status file must exist
+// (both success paths above write one); warn rather than fabricate one if not.
+function markRemoteProvisioned(sandbox: string, provider: AIProvider, note: string): void {
+  const status = readAuthStatus(sandbox, provider);
+  if (status === null) {
+    console.warn(
+      `[auth-setup] WARNING: no readable ${provider} status file to mark remoteProvisioned; its tests will skip`,
+    );
+    return;
+  }
+  writeAuthStatus(sandbox, provider, {
+    ...status,
+    remoteProvisioned: true,
+    reason: `${status.reason}; ${note}`,
+  });
+}
+
+setup('provision external server credentials', async () => {
+  setup.skip(!IS_EXTERNAL_SERVER, 'remote provisioning applies only to external-server runs (PW_RSTUDIO_SERVER_URL)');
+  // Headroom for a full login plus the store uploads over a possibly remote
+  // link; sized like the sign-in steps above.
+  setup.setTimeout(240_000);
+
+  const sandbox = process.env.PW_SANDBOX;
+  if (!sandbox) throw new Error('PW_SANDBOX is not set; sandbox-setup must run first');
+  const sandboxUserHome = path.join(sandbox, 'user-home');
+
+  // Which providers actually have sandbox credentials to push. Reading the
+  // stores (not the status files) keeps this step's input identical to what
+  // the in-sandbox gates read.
+  const positaiStore = findAuthenticatedStore(sandboxUserHome);
+  const copilotProvisioned = await isCopilotStoreAuthenticated(sandboxUserHome);
+  if (positaiStore === null && !copilotProvisioned) {
+    console.log('[auth-setup] no provider has sandbox credentials; nothing to provision remotely');
+    return;
+  }
+
+  const session = await connectExternalSession();
+  const { page } = session;
+  const createdPaths: string[] = [];
+  // Every remote path this run creates is recorded here AND persisted to the
+  // manifest the moment it exists -- including the server-chosen temp file each
+  // upload lands in before the console moves it into place, which briefly holds
+  // real token bytes. Persisting on each append rather than once at the end is
+  // what makes the teardown's cleanup survivable: a run killed between an upload
+  // and the finally block below (a CI cancel's SIGTERM, the harness timeout)
+  // would otherwise leave tokens in the remote home with nothing on disk naming
+  // them for the scrub.
+  const recordPath = (remotePath: string): void => {
+    createdPaths.push(remotePath);
+    try {
+      writeManifest(sandbox, { serverUrl: externalServerUrl()!, createdPaths });
+    } catch (err) {
+      // A manifest that won't write is a cleanup problem, not a reason to
+      // abandon a push already in flight. The finally block tries again.
+      console.warn(
+        `[auth-setup] WARNING: could not update the provisioning manifest after ${remotePath}:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  };
+  // Per-provider push failures, collected so one provider's bad luck doesn't
+  // strand the other unprovisioned, and escalated (failIfStrict) only after
+  // the session is closed and the manifest written.
+  const provisionFailures: string[] = [];
+  try {
+    // Bound the provisioning work inside the test timeout set above, with
+    // headroom for the login that already ran outside this try and so is not
+    // covered here: 180s of work against a 240s timeout. A hang that reached
+    // the harness timeout instead would bypass the finally block entirely,
+    // leaking the browser and skipping the backstop manifest write; failing
+    // through here keeps cleanup on the path. As with the sign-in steps, the
+    // underlying work is not cancelled, only outrun.
+    await withDeadline((async () => {
+      // A remote XDG_CONFIG_HOME would make the copilot-language-server resolve
+      // its store outside ~/.config, where this step writes it. Fail loud: this
+      // is a server configuration the harness can't reconcile from here.
+      //
+      // Copilot-only concern, so gate it on there being a Copilot store to
+      // push. Posit AI resolves its store from HOME, not the XDG dirs, and
+      // failing a Posit-only run over a variable that cannot affect it would
+      // block provisioning for no reason.
+      if (copilotProvisioned) {
+        const xdgSet = await evalRemoteLogical(page, 'nzchar(Sys.getenv("XDG_CONFIG_HOME"))');
+        if (xdgSet !== false) {
+          throw new RemoteProvisionConfigError(
+            '[auth-setup] the external server\'s rsession has XDG_CONFIG_HOME set (or the probe failed), '
+              + 'so the Copilot store location would not match where provisioning writes it; '
+              + 'unset it in the server\'s session environment and re-run',
+          );
+        }
+      }
+
+      if (positaiStore !== null) {
+        try {
+          // Existence alone is meaningless here: the rsession's AI client writes
+          // an unauthenticated stub data.json at session startup, so this step's
+          // own login just planted one. Only a store that holds a real sign-in is
+          // treated as pre-existing; a stub is overwritten (and scrubbed later).
+          //
+          // The stub write's timing is variable (observed both before this probe
+          // and several seconds after), and pushing while it is in flight loses
+          // the race -- the stub lands on top of the pushed store. When the path
+          // is absent, wait out the stub writer before writing; accounts without
+          // the assistant enabled never write one and just pay the full wait.
+          const remoteExists = await waitForRemotePath(page, REMOTE_POSITAI_STORE, POSITAI_STUB_WAIT_MS);
+          if (remoteExists === null) {
+            // "Can't tell" is not "absent". Treating it as absent would push
+            // over a store this step never managed to read, which could be the
+            // account's own sign-in. Bail out of the provider instead: the catch
+            // below leaves the file untouched, skips its tests, and records the
+            // reason so strict mode can escalate it.
+            throw new Error(
+              `could not determine whether ${REMOTE_POSITAI_STORE} exists on the remote account; `
+                + 'leaving it untouched rather than risk overwriting a real sign-in',
+            );
+          }
+          const remoteAuthenticated = remoteExists
+            ? await remotePositAiStoreAuthenticated(page)
+            : false;
+          if (remoteAuthenticated === true) {
+            console.log(`[auth-setup] ${REMOTE_POSITAI_STORE} on the remote account already holds a sign-in; using it as-is`);
+            markRemoteProvisioned(sandbox, 'positai', 'remote store pre-existing; left untouched');
+          } else if (remoteAuthenticated === null) {
+            // Unreadable content probe: same reasoning as the existence probe
+            // above -- the file might be someone's real sign-in, so leave it
+            // alone, and don't vouch for it either.
+            throw new Error(
+              `could not determine whether ${REMOTE_POSITAI_STORE} on the remote account holds a sign-in; `
+                + 'leaving it untouched',
+            );
+          } else {
+            // Recorded before the write so a partial push still gets scrubbed
+            // (and cannot pose as a pre-existing store on a later run).
+            recordPath(REMOTE_POSITAI_STORE);
+            await writeRemoteText(
+              page,
+              REMOTE_POSITAI_STORE,
+              fs.readFileSync(positaiStore, 'utf-8'),
+              undefined,
+              recordPath,
+            );
+            // writeRemoteText verified size and mode, which establishes that the
+            // bytes landed -- not that they are still there. A straggling stub
+            // writer that beat the write's own retry would satisfy both checks
+            // and still leave a signed-out store, so re-read the content before
+            // vouching for the provider.
+            if ((await remotePositAiStoreAuthenticated(page)) !== true) {
+              throw new Error(
+                `${REMOTE_POSITAI_STORE} does not read as signed in after the push `
+                  + '(a remote-side stub writer may have overwritten it)',
+              );
+            }
+            console.log(
+              remoteExists
+                ? `[auth-setup] replaced the unauthenticated stub at ${REMOTE_POSITAI_STORE} with the sandbox token store`
+                : `[auth-setup] pushed the Posit AI token store to ${REMOTE_POSITAI_STORE}`,
+            );
+            markRemoteProvisioned(sandbox, 'positai', 'pushed to the external server through the session');
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn('[auth-setup] WARNING: Posit AI remote provisioning failed; its tests will skip:', msg);
+          provisionFailures.push(`positai: ${msg}`);
+        }
+      }
+
+      if (copilotProvisioned) {
+        try {
+          const remoteDb = `${REMOTE_COPILOT_DIR}/auth.db`;
+          // Existence alone is as misleading as for the Posit AI store: any
+          // session that enables Copilot leaves an empty auth.db behind (see
+          // remoteCopilotStoreAuthenticated). Only a store holding a token is
+          // treated as pre-existing; an empty shell is replaced.
+          const existsProbe = await remotePathExists(page, remoteDb);
+          if (existsProbe === null) {
+            throw new Error(
+              `could not determine whether ${remoteDb} exists on the remote account; `
+                + 'leaving it untouched rather than risk overwriting a real sign-in',
+            );
+          }
+          const remoteExists = existsProbe;
+          const remoteAuthenticated = remoteExists
+            ? await remoteCopilotStoreAuthenticated(page)
+            : false;
+          if (remoteAuthenticated === true) {
+            console.log(`[auth-setup] ${remoteDb} on the remote account already holds a sign-in; using it as-is`);
+            markRemoteProvisioned(sandbox, 'copilot', 'remote store pre-existing; left untouched');
+          } else if (remoteAuthenticated === null) {
+            throw new Error(
+              `could not determine whether ${remoteDb} on the remote account holds a sign-in; `
+                + 'leaving it untouched',
+            );
+          } else {
+            if (remoteExists) {
+              // Replacing an empty shell: clear the whole main/-wal/-shm trio
+              // first, so a stale sidecar from the shell can't be paired with
+              // the pushed main file (SQLite treats them as one store). The
+              // -shm is cleared even though the push below never writes one:
+              // leaving the old index beside a new database is exactly the
+              // mismatch this is guarding against.
+              const survivors = await scrubRemote(page, ['', '-wal', '-shm'].map((s) => `${remoteDb}${s}`));
+              if (survivors.length > 0) {
+                // Pushing anyway is exactly how a signed-in main file ends up
+                // paired with a sidecar from the store it replaced, which
+                // SQLite may read in preference to it.
+                throw new Error(
+                  `could not clear the existing Copilot store before pushing: ${survivors.join(', ')}`,
+                );
+              }
+            }
+            // auth.db plus any SQLite sidecars: the sign-in agent can leave the
+            // token row in an uncheckpointed -wal, so the sidecars are part of
+            // the store's on-disk truth (see isCopilotStoreAuthenticated).
+            const localDb = copilotAuthDbPath(sandboxUserHome);
+            // Whether the bytes actually pushed carry the token marker
+            // remoteCopilotStoreAuthenticated searches for, using that probe's
+            // own definition (bytesHoldCopilotToken) so the two cannot drift.
+            // The local gate, isCopilotStoreAuthenticated, decides by counting
+            // oauth_tokens rows through SQLite instead, so the two can
+            // legitimately disagree -- a store the prefix scan can't see is a
+            // blind spot in the remote probe, not a failed push, and must not
+            // be reported as one.
+            //
+            // The main database and its -wal only. -shm is SQLite's WAL index:
+            // regenerable, holding no row data (and, checked here, no token
+            // marker), so pushing it would add a file of credential-adjacent
+            // state to a real account for no benefit. A remote reader rebuilds
+            // it from the -wal.
+            //
+            // Read every file before pushing any. The source store is live --
+            // the local copilot-language-server may rewrite it on a token
+            // refresh -- and each push takes seconds, so reading inside the
+            // loop could capture the database and its -wal from either side of
+            // such a write and land a torn pair on the remote.
+            const localFiles = ['', '-wal']
+              .map((suffix) => ({ suffix, local: `${localDb}${suffix}` }))
+              .filter(({ local }) => fs.existsSync(local))
+              .map(({ suffix, local }) => ({ suffix, bytes: fs.readFileSync(local) }));
+            const pushedTokenMarker = localFiles.some(({ bytes }) => bytesHoldCopilotToken(bytes));
+            for (const { suffix, bytes } of localFiles) {
+              const remote = `${remoteDb}${suffix}`;
+              // Recorded before the write so a partial push still gets scrubbed
+              // (and cannot pose as a pre-existing store on a later run).
+              recordPath(remote);
+              await writeRemoteBinary(page, remote, bytes, undefined, recordPath);
+            }
+            // Same reasoning as the Posit AI re-probe above: per-file size and
+            // mode checks say each piece landed, not that the assembled store
+            // still reads as a sign-in. Only decisive when the pushed bytes
+            // carried the marker to begin with.
+            //
+            // Both outcomes are logged. A check that silently does nothing is
+            // indistinguishable from one that passes, which is how an earlier
+            // marker mismatch (matching only gho_, while Copilot's GitHub App
+            // issues ghu_) went unnoticed: the re-probe never armed and every
+            // run still looked green. If the prefixes change again, the skip
+            // says so in the log instead of quietly dropping the check.
+            if (pushedTokenMarker) {
+              if ((await remoteCopilotStoreAuthenticated(page)) !== true) {
+                throw new Error(`${remoteDb} does not read as signed in after the push`);
+              }
+              console.log('[auth-setup] verified the pushed Copilot store reads as signed in on the remote');
+            } else {
+              console.log(
+                '[auth-setup] WARNING: the pushed Copilot store carries no recognizable GitHub token marker, '
+                  + 'so the post-push verification was skipped (see bytesHoldCopilotToken)',
+              );
+            }
+            console.log(
+              remoteExists
+                ? `[auth-setup] replaced the empty Copilot store at ${remoteDb} with the sandbox credential store`
+                : `[auth-setup] pushed the Copilot credential store to ${remoteDb}`,
+            );
+            markRemoteProvisioned(sandbox, 'copilot', 'pushed to the external server through the session');
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn('[auth-setup] WARNING: Copilot remote provisioning failed; its tests will skip:', msg);
+          provisionFailures.push(`copilot: ${msg}`);
+        }
+      }
+    })(), 180_000, 'remote provisioning deadline exceeded');
+  } catch (err) {
+    // Failures of the shared preamble (the XDG probe) and the overall deadline
+    // -- the per-provider pushes catch their own, and the login above happens
+    // outside this try. A deterministic misconfiguration fails the run;
+    // everything else leaves the affected providers without remoteProvisioned,
+    // so their tests skip with the status-file reason -- unless strict mode
+    // escalates it below.
+    if (err instanceof RemoteProvisionConfigError) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      '[auth-setup] WARNING: remote provisioning failed; unprovisioned AI tests will skip:',
+      msg,
+    );
+    provisionFailures.push(msg);
+  } finally {
+    // Close first: ending the remote R session is what makes the next login
+    // read the stores just pushed. Each half is guarded separately so one
+    // failing doesn't cost the other -- a close that throws must not skip the
+    // manifest, and a manifest write that throws must not leak the browser.
+    try {
+      await closeExternalSession(session);
+    } catch (err) {
+      console.warn(
+        '[auth-setup] WARNING: could not close the provisioning session:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    // recordPath has already written this after every append; repeating it here
+    // is the backstop for the case where one of those writes failed.
+    try {
+      writeManifest(sandbox, { serverUrl: externalServerUrl()!, createdPaths });
+    } catch (err) {
+      console.warn(
+        '[auth-setup] WARNING: could not write the provisioning manifest; '
+          + 'scrub any pushed credentials from the remote host by hand:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  if (provisionFailures.length > 0) {
+    failIfStrict('external-server AI credentials', `remote provisioning failed: ${provisionFailures.join('; ')}`);
+  }
+});
+
+// Remote ODBC provisioning for the Connections pane tests, for the same
+// reason and through the same channel as the AI credential push above (see
+// utils/remote-provision.ts): a genuinely external server's rsessions are
+// outside the harness's reach, so the sandbox's ODBC config is pushed
+// through a logged-in session rather than injected into the process
+// environment. Its own independent session/login, separate from the
+// credential push above, so a hiccup in one cannot strand the other.
+//
+// Unlike the credential stores, none of this is a secret and there is no
+// "don't overwrite a real sign-in" concern -- REMOTE_ODBC_DIR is rebuilt
+// from scratch on every run. A target whose driver can't be found or
+// pushed just means that target's specs skip, mirroring how a missing
+// driver library skips locally (utils/connections.ts, prepareOdbcSandbox);
+// there is no strict-mode escalation here the way there is for AI auth.
+setup('provision remote ODBC drivers', async () => {
+  setup.skip(!IS_EXTERNAL_SERVER, 'remote ODBC provisioning applies only to external-server runs (PW_RSTUDIO_SERVER_URL)');
+  setup.setTimeout(120_000);
+
+  const sandbox = process.env.PW_SANDBOX;
+  if (!sandbox) throw new Error('PW_SANDBOX is not set; sandbox-setup must run first');
+
+  const session = await connectExternalSession();
+  const { page } = session;
+  const priorManifest = readManifest(sandbox);
+  const createdPaths: string[] = priorManifest ? [...priorManifest.createdPaths] : [];
+  // Persisted on every append, not just once at the end -- a run killed
+  // mid-push must still leave the manifest naming what to scrub, same
+  // reasoning as recordPath in the credential-provisioning step above.
+  const recordPath = (remotePath: string): void => {
+    createdPaths.push(remotePath);
+    try {
+      writeManifest(sandbox, { serverUrl: externalServerUrl()!, createdPaths });
+    } catch (err) {
+      console.warn(
+        `[db-setup] WARNING: could not update the provisioning manifest after ${remotePath}:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  };
+
+  let status: RemoteOdbcStatus = { odbcSysIni: null, registered: [], fileDatabases: {} };
+  try {
+    status = await provisionRemoteOdbcSandbox(page, recordPath);
+    console.log(
+      status.registered.length > 0
+        ? `[db-setup] remote ODBC drivers registered: ${status.registered.join(', ')}`
+        : '[db-setup] no ODBC driver found on the remote machine; Connections pane specs will skip',
+    );
+  } catch (err) {
+    console.warn(
+      '[db-setup] WARNING: remote ODBC provisioning failed; Connections pane specs will skip:',
+      err instanceof Error ? err.message : String(err),
+    );
+  } finally {
+    try {
+      await closeExternalSession(session);
+    } catch (err) {
+      console.warn(
+        '[db-setup] WARNING: could not close the ODBC provisioning session:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  writeRemoteOdbcStatus(sandbox, status);
+});

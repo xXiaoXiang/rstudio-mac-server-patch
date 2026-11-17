@@ -1,0 +1,41 @@
+{
+  // Use GWT (DOM) dialogs so Playwright can interact with confirm/info modals.
+  // Required by tests that interact with Yes/No or message dialogs (e.g.
+  // check-for-updates-command.test.ts).
+  "native_file_dialogs": false,
+
+  // Skip the "Save workspace?" prompt on quit so shutdown is clean.
+  "save_workspace": "never",
+
+  // Don't restore source tabs from the previous session. Prevents one spec's
+  // open documents from leaking into a subsequent spec (Desktop-only effect;
+  // Server prefs are server-side).
+  "restore_source_documents": false,
+
+  // Don't check for RStudio updates at startup. CI runners have no route to
+  // the update server, so each check spawns a child R process that blocks in
+  // download.file() until the network timeout and then logs a jsonrpc error.
+  "check_for_updates": false,
+
+  // Disable UI animations so pane minimize/maximize/zoom transitions apply
+  // synchronously. The animated path (PaneManager + DualWindowLayoutPanel,
+  // both already gate on this pref) runs an async onAnimationComplete that
+  // automation can race -- leaving the Source pane stuck in the minimized
+  // state. No test currently needs real animations; if one does, it can
+  // override this per-test with setPref(page, 'reduced_motion', false) and
+  // restore it afterward.
+  "reduced_motion": true,
+
+  // Keep the AI assistant off unless a test opts in. Both prefs default to
+  // "posit", so once the Posit Assistant backend is present in this worker's
+  // data home (seeded locally via PW_SEED_PAI, or installed by a @chat suite
+  // settling the install prompt), every session start would launch the NES
+  // agent, every chat pane init would launch the chat backend -- and every
+  // project open/close/restart would then shut them down again seconds
+  // later. That churn is the window for the session-shutdown wedge that
+  // kills whole CI shards (#18394). The @ai/@chat suites select their
+  // provider explicitly and don't rely on the default; the per-test guard in
+  // rstudio.fixture.ts restores "none" after they run.
+  "assistant": "none",
+  "chat_provider": "none"
+}

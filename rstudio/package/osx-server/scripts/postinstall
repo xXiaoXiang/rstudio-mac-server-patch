@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+APP=/Applications/RStudioServer.app
+STATE=/var/db/rstudio-server
+"$APP/Contents/Resources/app/bin/rstudio-server" install-service
+if [ -f "$STATE/upgrade-startup" ]; then
+ result=0
+ "$APP/Contents/MacOS/RStudioServer" --enable-service || result=$?
+ # A changed development signature may require fresh approval in Login Items.
+ if [ "$result" -ne 0 ] && [ "$result" -ne 3 ]; then exit "$result"; fi
+ /bin/rm "$STATE/upgrade-startup"
+fi
+echo 'Open /Applications/RStudioServer.app to manage startup, network settings and user accounts.'

@@ -1,0 +1,613 @@
+// Editor behaviors ported from src/cpp/tests/automation/testthat/test-automation-editor.R.
+
+import { test, expect } from '@fixtures/rstudio.fixture';
+import { ConsolePaneActions } from '@actions/console_pane.actions';
+import { AceEditor } from '@pages/ace_editor.page';
+import { useSuiteSandbox } from '@utils/sandbox';
+import { writeAndOpenFile, closeAndDeleteSandboxFiles } from '@utils/files';
+import { clearPref, executeCommand, getPref, saveDocument, setPref, waitForActiveDocument } from '@utils/commands';
+import { TIMEOUTS } from '@utils/constants';
+import { LIGHT_THEME, expectThemeStylesheet, getThemeStylesheetHref } from '@utils/theme';
+
+// Both the console and the active editor mount a FindReplaceBar that shares
+// these automation classes. Scope to the source panel so the test never
+// accidentally drives the console's find bar. The `rstudio-find-replace-*`
+// classes are on the FindTextBox/CheckBox *widget wrapper* in the currently
+// installed RStudio build, so reach the interactive child with a descendant
+// selector. FindReplaceBar.java has been updated to put these classes
+// directly on the inner control; when this PR's RStudio build lands, the
+// descendant traversal can be dropped.
+const SOURCE_PANEL_SELECTOR = "[class*='rstudio_source_panel']";
+const FIND_INPUT = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-find-input input`;
+const REPLACE_INPUT = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-replace-input input`;
+const REPLACE_BUTTON = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-replace-button`;
+const REGEX_CHECKBOX = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-regex-checkbox input`;
+const MATCH_CASE_CHECKBOX = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-match-case-checkbox input`;
+const WHOLE_WORD_CHECKBOX = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-whole-word-checkbox input`;
+const CLOSE_FIND_BAR = `${SOURCE_PANEL_SELECTOR} button[aria-label='Close find and replace']`;
+const FIND_NEXT_BUTTON = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-find-next-button`;
+const SELECT_ALL_BUTTON = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-select-all-button`;
+const REPLACE_ALL_BUTTON = `${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-replace-all-button`;
+const FIND_MATCH_MARKER = `${SOURCE_PANEL_SELECTOR} .ace_marker-layer .ace_find_match`;
+// #8D6414, from applyFixups.pastel_on_dark in src/gwt/tools/compile-themes.R:
+// a translucent fill of it, outlined in it
+const FIND_MATCH_AMBER = 'rgb(141, 100, 20)';
+const FIND_MATCH_AMBER_FILL = 'rgba(141, 100, 20, 0.45)';
+
+test.describe('Editor', () => {
+  const sandbox = useSuiteSandbox();
+  let consoleActions: ConsolePaneActions;
+
+  test.beforeAll(async ({ rstudioPage: page }) => {
+    consoleActions = new ConsolePaneActions(page);
+    await consoleActions.resetSourcePane();
+  });
+
+  test.afterEach(async ({ rstudioPage: page }) => {
+    await closeAndDeleteSandboxFiles(page, sandbox.dir, [
+      'editor_whitespace.R',
+      'editor_whole_word.R',
+      'editor_select_all_regex.R',
+      'editor_select_all_multiline.R',
+      'editor_select_all_rename.R',
+      'editor_select_all_empty.R',
+      'editor_select_all_large.R',
+      'editor_select_all_lines.R',
+      'editor_shortcuts.R',
+      'editor_find_from_selection.R',
+      'editor_comment_indent.R',
+      'editor_soft_wrap.R',
+      'editor_find_match_marker.R',
+    ]);
+  });
+
+  test('trailing whitespace is trimmed on save when pref is enabled', async ({ rstudioPage: page }) => {
+    // setPref goes through the bridge (synchronous to GWT) -- using
+    // executeInConsole here would race the save below, since the R-side
+    // pref update isn't necessarily visible to the editor's save flow yet.
+    await setPref(page, 'strip_trailing_whitespace', true);
+    try {
+      const content = '# comment 1  \n# comment 2 \n# comment 3   \n';
+      await writeAndOpenFile(page, sandbox.dir, 'editor_whitespace.R', content);
+
+      const editor = new AceEditor(page, '# comment 1');
+      await expect.poll(() => editor.getValue()).toContain('# comment 3');
+
+      await editor.gotoLine(4);
+      await editor.insert('# comment 4   ');
+
+      await saveDocument(page);
+
+      expect((await editor.getValue()).trim()).toBe('# comment 1\n# comment 2\n# comment 3\n# comment 4');
+    } finally {
+      await clearPref(page, 'strip_trailing_whitespace');
+    }
+  });
+
+  // Scoping regression for https://github.com/rstudio/rstudio/issues/18447:
+  // the console overrides Ace's line start / line end commands to span the
+  // whole soft-wrapped command, but that override is opted into per editor
+  // (ShellWidget), so source editors must keep the stock wrap-aware behavior,
+  // where End stops at the soft-wrap boundary rather than the end of the
+  // document line.
+  test('End stops at the soft-wrap boundary in a soft-wrapped source editor', async ({ rstudioPage: page }) => {
+    await setPref(page, 'soft_wrap_r_files', true);
+    try {
+      // Long enough to wrap at any plausible source pane width.
+      const line = `x <- c(${Array.from({ length: 80 }, (_, i) => i + 1).join(', ')})`;
+      await writeAndOpenFile(page, sandbox.dir, 'editor_soft_wrap.R', line);
+
+      const editor = new AceEditor(page, 'x <- c(');
+      await expect.poll(() => editor.getValue()).toContain('x <- c(');
+
+      // The assertions below are vacuously true unless the line really
+      // soft-wrapped; wrap mode is applied asynchronously after open.
+      await expect.poll(() => editor.getScreenRowCount()).toBeGreaterThan(1);
+
+      await editor.gotoLine(1);
+      await editor.focus();
+      await page.keyboard.press('End');
+
+      // Poll until the End press has moved the cursor off column 0, then
+      // check where it landed: wrap-aware End stays on the (single) document
+      // line but stops at the wrap boundary, short of the document line's end.
+      await expect.poll(async () => (await editor.getCursorPosition()).column).toBeGreaterThan(0);
+
+      const position = await editor.getCursorPosition();
+      expect(position.row).toBe(0);
+      expect(position.column).toBeLessThan(line.length);
+    } finally {
+      await clearPref(page, 'soft_wrap_r_files');
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/16798
+  test('whole-word find and replace handles leading dots correctly', async ({ rstudioPage: page }) => {
+    const content = '.hello\n.hello\n.hello';
+    await writeAndOpenFile(page, sandbox.dir, 'editor_whole_word.R', content);
+
+    const editor = new AceEditor(page, '.hello');
+    await expect.poll(() => editor.getValue()).toContain('.hello');
+
+    // Invoke findReplace through the automation bridge -- the command targets
+    // the active source editor without needing keyboard focus there. Wait for
+    // the just-opened document to be reported as the active source target;
+    // on Server, the editor needs a beat after the tab renders before it
+    // registers as the find-replace target.
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_whole_word.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    await page.locator(WHOLE_WORD_CHECKBOX).click();
+
+    await page.locator(FIND_INPUT).click();
+    await page.locator(FIND_INPUT).pressSequentially('.hello');
+
+    await page.locator(REPLACE_INPUT).click();
+    await page.locator(REPLACE_INPUT).pressSequentially('.goodbye');
+
+    // "Replace" replaces the current match and advances. With find-as-you-type
+    // the first match is already current after typing the search term, so no
+    // explicit Find Next click is needed -- it would skip past the first match
+    // before any replacement happens.
+    await page.locator(REPLACE_BUTTON).click();
+    await page.locator(REPLACE_BUTTON).click();
+
+    // Restore checkbox state and close the find bar so it doesn't bleed into later tests.
+    await page.locator(WHOLE_WORD_CHECKBOX).click();
+    await page.locator(CLOSE_FIND_BAR).click();
+    await expect(page.locator(FIND_INPUT)).toHaveCount(0, { timeout: 5000 });
+
+    await expect.poll(() => editor.getValue()).toBe('.goodbye\n.goodbye\n.hello');
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('select all honors regex and literal find modes', async ({ rstudioPage: page }) => {
+    const content = 'a1\na2\nA3\nxa4\na[0-9]\na[0-9]\nfalse\nfoo\nbar\nfoobar\n';
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_regex.R', content);
+
+    const editor = new AceEditor(page, 'a1');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_regex.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const matchCase = page.locator(MATCH_CASE_CHECKBOX);
+    const wholeWord = page.locator(WHOLE_WORD_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    const originalMatchCase = await matchCase.isChecked();
+    const originalWholeWord = await wholeWord.isChecked();
+    try {
+      await regex.check();
+      await matchCase.uncheck();
+      await wholeWord.uncheck();
+      await page.locator(FIND_INPUT).fill('a[0-9]');
+      await page.locator(FIND_NEXT_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toMatch(/^[aA][0-9]$/);
+
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2\nA3\na4');
+
+      await page.locator(FIND_INPUT).fill('(?<letter>a)[0-9]');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2\nA3\na4');
+      await wholeWord.check();
+      await page.locator(FIND_INPUT).fill('foo|bar');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('foo\nbar');
+
+      // Find Next and Replace All must bound every alternative too: from the
+      // start of `foobar`, Find Next wraps to the standalone `foo` instead.
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(10, 1, 10, 1), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await page.locator(FIND_NEXT_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('foo');
+      await expect.poll(() => editor.getCursorPosition()).toEqual({ row: 7, column: 3 });
+      await page.locator(REPLACE_INPUT).fill('X');
+      await page.locator(REPLACE_ALL_BUTTON).click();
+      await expect(page.getByText('2 occurrences replaced.', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'OK', exact: true }).click();
+      await expect.poll(() => editor.getLine(9)).toBe('foobar');
+      expect(await editor.getLine(7)).toBe('X');
+      expect(await editor.getLine(8)).toBe('X');
+      await wholeWord.uncheck();
+      await page.locator(FIND_INPUT).fill('a[0-9]');
+
+      await matchCase.check();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2\na4');
+
+      await wholeWord.check();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2');
+
+      // Switching back must explicitly clear Ace's previous regex setting.
+      await regex.uncheck();
+      await wholeWord.uncheck();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a[0-9]\na[0-9]');
+
+      // In Selection must still limit the regex matches to the chosen range.
+      await regex.check();
+      await matchCase.uncheck();
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(1, 1, 3, 1), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2\n');
+      await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2');
+
+      await page.locator(FIND_INPUT).fill('[');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect(page.getByText('Invalid search term.', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'OK', exact: true }).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a1\na2');
+    } finally {
+      await regex.setChecked(originalRegex);
+      await matchCase.setChecked(originalMatchCase);
+      await wholeWord.setChecked(originalWholeWord);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('select all finds multiline regexes within a selection below the first row', async ({ rstudioPage: page }) => {
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_multiline.R', 'a\nb\nx\nx\na\nb\n');
+    const editor = new AceEditor(page, 'a\nb\nx');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_multiline.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    try {
+      await regex.check();
+      await page.locator(FIND_INPUT).fill('a\\nb');
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(3, 1, 7, 1), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a\nb');
+      await expect.poll(() => editor.getCursorPosition()).toEqual({ row: 5, column: 1 });
+
+      // The range's trailing newline must not invent an empty line before b.
+      await page.locator(FIND_INPUT).fill('^$');
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(1, 1, 2, 1), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+      await expect.poll(() => editor.getCursorPosition()).toEqual({ row: 0, column: 0 });
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getCursorPosition()).toEqual({ row: 0, column: 0 });
+
+      // An actual line end, selected without its newline, remains a match.
+      await page.locator(FIND_INPUT).fill('$');
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(1, 1, 2, 2), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectionRanges()).toEqual([
+        { start: { row: 0, column: 1 }, end: { row: 0, column: 1 } },
+        { start: { row: 1, column: 1 }, end: { row: 1, column: 1 } },
+      ]);
+
+      // An alternative crossing the range end must not hide valid matches,
+      // including an alternative starting at the same position.
+      const patterns = [
+        ['a\\nb\\nx|b', 'b'],
+        ['a\\nb\\nx|a', 'a'],
+        // Consuming matches use the selected text's end, as Replace All does.
+        ['a\\nb\\n$', 'a\nb\n'],
+      ];
+      for (const [pattern, expected] of patterns) {
+        await page.locator(FIND_INPUT).fill(pattern);
+        await consoleActions.executeInConsole(
+          '.rs.api.setSelectionRanges(c(1, 1, 3, 1), id = .rs.api.getSourceEditorContext()$id)',
+          { wait: true },
+        );
+        await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+        await page.locator(SELECT_ALL_BUTTON).click();
+        await expect.poll(() => editor.getSelectedText()).toBe(expected);
+      }
+    } finally {
+      await regex.setChecked(originalRegex);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('select all matches regexes line by line, like find next', async ({ rstudioPage: page }) => {
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_lines.R', 'a  \n  b\nx,y\nz,w\n');
+    const editor = new AceEditor(page, 'x,y');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_lines.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    try {
+      await regex.check();
+      // Whitespace and negated classes can match a newline; Find Next never crosses one.
+      await page.locator(FIND_INPUT).fill('\\s+');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectionRanges()).toEqual([
+        { start: { row: 0, column: 1 }, end: { row: 0, column: 3 } },
+        { start: { row: 1, column: 0 }, end: { row: 1, column: 2 } },
+      ]);
+
+      await page.locator(FIND_INPUT).fill('[^,]+');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a  \n  b\nx\ny\nz\nw');
+
+      // A newline escape in the pattern spans lines, as it does for Find Next.
+      await page.locator(FIND_INPUT).fill('y\\nz');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('y\nz');
+    } finally {
+      await regex.setChecked(originalRegex);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('regex select all does not change literal string rename matching', async ({ rstudioPage: page }) => {
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_rename.R', 'c("a.b", "axb", "a.b")\n');
+    const editor = new AceEditor(page, 'c("a.b"');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_rename.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    try {
+      await regex.check();
+      await page.locator(FIND_INPUT).fill('a.b');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('a.b\naxb\na.b');
+    } finally {
+      await regex.setChecked(originalRegex);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+
+    await editor.gotoLine(1, 4);
+    await executeCommand(page, 'renameInScope');
+    try {
+      await expect.poll(() => editor.getSelectedText()).toBe('"a.b"\n"a.b"');
+    } finally {
+      // Finish renaming before the next test opens a document.
+      await editor.focus();
+      await page.keyboard.press('Escape');
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('select all advances past empty regex matches and Unicode code points', async ({ rstudioPage: page }) => {
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_empty.R', '😀\nb');
+    const editor = new AceEditor(page, '😀');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_empty.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    try {
+      await regex.check();
+      await page.locator(FIND_INPUT).fill('(?=.)|$');
+      await page.locator(SELECT_ALL_BUTTON).click();
+      const positions = [
+        { row: 0, column: 0 },
+        { row: 0, column: 2 },
+        { row: 1, column: 0 },
+        { row: 1, column: 1 },
+      ];
+      await expect.poll(() => editor.getSelectionRanges()).toEqual(
+        positions.map(position => ({ start: position, end: position })),
+      );
+    } finally {
+      await regex.setChecked(originalRegex);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/19249
+  test('greedy regex select all handles a large unselected Unicode suffix', async ({ rstudioPage: page }) => {
+    const content = '# selected\n' + '# 😀\n'.repeat(10000);
+    await writeAndOpenFile(page, sandbox.dir, 'editor_select_all_large.R', content);
+    const editor = new AceEditor(page, '# selected');
+    await waitForActiveDocument(page, `${sandbox.dir}/editor_select_all_large.R`, TIMEOUTS.fileOpen);
+    await executeCommand(page, 'findReplace');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+    const regex = page.locator(REGEX_CHECKBOX);
+    const originalRegex = await regex.isChecked();
+    try {
+      await regex.check();
+      await page.locator(FIND_INPUT).fill('[\\s\\S]*');
+      await consoleActions.executeInConsole(
+        '.rs.api.setSelectionRanges(c(1, 1, 2, 1), id = .rs.api.getSourceEditorContext()$id)',
+        { wait: true },
+      );
+      await page.locator(`${SOURCE_PANEL_SELECTOR} .rstudio-find-replace-in-selection-checkbox input`).check();
+      // Scanning the unselected lines would match them all, so the result
+      // check also covers the regression this guards against.
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('# selected');
+      await expect.poll(() => editor.getCursorPosition()).toEqual({ row: 0, column: 10 });
+    } finally {
+      await regex.setChecked(originalRegex);
+      await page.locator(CLOSE_FIND_BAR).click();
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/16973
+  test('AceEditorCommandDispatcher shortcuts work', async ({ rstudioPage: page }) => {
+    // Use distinct content markers (xxshort/yyshort) so the AceEditor wrapper
+    // can locate this editor regardless of newline normalization quirks.
+    const content = 'xxshort\nyyshort\n';
+    await writeAndOpenFile(page, sandbox.dir, 'editor_shortcuts.R', content);
+
+    const editor = new AceEditor(page, 'xxshort');
+    await expect.poll(() => editor.getValue()).toContain('xxshort');
+
+    // Insert pipe operator (|> or %>%) at end of line 1.
+    await editor.gotoLine(1);
+    await editor.navigateLineEnd();
+    await editor.focus();
+    await page.keyboard.press('ControlOrMeta+Shift+m');
+
+    await expect.poll(() => editor.getValue()).toMatch(/\|>|%>%/);
+
+    // Insert assignment operator at end of line 2.
+    await editor.gotoLine(2);
+    await editor.navigateLineEnd();
+    await editor.focus();
+    await page.keyboard.press('Alt+-');
+
+    await expect.poll(() => editor.getValue()).toContain('<-');
+  });
+
+  // https://github.com/rstudio/rstudio/issues/15863
+  test('findFromSelection does not jump to next instance on first invocation', async ({ rstudioPage: page }) => {
+    const content = 'hello world\nhello world\nhello world\n';
+    await writeAndOpenFile(page, sandbox.dir, 'editor_find_from_selection.R', content);
+
+    const editor = new AceEditor(page, 'hello world');
+    await expect.poll(() => editor.getValue()).toContain('hello world');
+
+    // Move to line 1 and select the first "hello".
+    await editor.gotoLine(1);
+    await editor.find('hello');
+
+    const posBefore = await editor.getCursorPosition();
+
+    // First invocation should set the search term without advancing the cursor.
+    // Wait for the find bar to open before reading the cursor -- otherwise we
+    // can sample the position before the command's selection-to-find handler
+    // has run, masking a regression where the cursor *does* advance.
+    await executeCommand(page, 'findFromSelection');
+    await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: 5000 });
+
+    const posAfter = await editor.getCursorPosition();
+    expect(posAfter.row).toBe(posBefore.row);
+
+    // Second invocation advances to the next match.
+    await executeCommand(page, 'findFromSelection');
+    await expect.poll(async () => (await editor.getCursorPosition()).row).toBeGreaterThan(posBefore.row);
+
+    // Close the find bar via its dedicated button so we don't depend on
+    // keyboard focus being on the bar.
+    await page.locator(CLOSE_FIND_BAR).click();
+    await expect(page.locator(FIND_INPUT)).toHaveCount(0, { timeout: 5000 });
+  });
+
+  // https://github.com/rstudio/rstudio/issues/13204
+  test('find marks the current match with its own marker', async ({ rstudioPage: page }) => {
+    // The shared stylesheet only places the marker; a theme gives it its
+    // colour, and today only Pastel On Dark (the theme in the report) does.
+    // Run under it so the colour check is of what is painted, and put the
+    // original theme back afterwards. applyTheme, not setPref: a live session
+    // is not re-themed off the pref.
+    const originalTheme = (await getPref(page, 'editor_theme')) as string | null;
+    const originalThemeHref = await getThemeStylesheetHref(page);
+    await consoleActions.executeInConsole(`.rs.api.applyTheme("Pastel On Dark")`, { wait: true });
+    await expectThemeStylesheet(page, 'pastel_on_dark');
+
+    try {
+      const content = 'alpha beta\nalpha gamma\nalpha delta\n';
+      await writeAndOpenFile(page, sandbox.dir, 'editor_find_match_marker.R', content);
+
+      const editor = new AceEditor(page, 'alpha beta');
+      await expect.poll(() => editor.getValue()).toContain('alpha beta');
+
+      await waitForActiveDocument(page, `${sandbox.dir}/editor_find_match_marker.R`, TIMEOUTS.fileOpen);
+      await executeCommand(page, 'findReplace');
+      await expect(page.locator(FIND_INPUT)).toBeVisible({ timeout: TIMEOUTS.consoleReady });
+
+      await page.locator(FIND_INPUT).click();
+      await page.locator(FIND_INPUT).pressSequentially('gamma');
+
+      // Find-as-you-type selects the match, and the match marker is drawn over
+      // exactly that selection (both are text markers of the same range, so
+      // their boxes coincide).
+      await expect.poll(() => editor.getSelectedText()).toBe('gamma');
+      const marker = page.locator(FIND_MATCH_MARKER);
+      await expect(marker).toHaveCount(1);
+      const boxes = await page.evaluate((selector) => {
+        const rect = (el: Element | null) => {
+          const b = el!.getBoundingClientRect();
+          return { x: Math.round(b.x), y: Math.round(b.y), width: Math.round(b.width), height: Math.round(b.height) };
+        };
+        const match = document.querySelector(selector)!;
+        return { match: rect(match), selection: rect(match.parentElement!.querySelector('.ace_selection')) };
+      }, FIND_MATCH_MARKER);
+      expect(boxes.match).toEqual(boxes.selection);
+
+      // Pastel On Dark paints the marker amber.
+      await expect(marker).toHaveCSS('background-color', FIND_MATCH_AMBER_FILL);
+      await expect(marker).toHaveCSS('border-top-color', FIND_MATCH_AMBER);
+
+      // Moving the cursor elsewhere drops the marker; Find Next brings it back.
+      await editor.gotoLine(1);
+      await expect(marker).toHaveCount(0);
+      await page.locator(FIND_NEXT_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('gamma');
+      await expect(marker).toHaveCount(1);
+
+      // Select All drops it too, including when the current match is the
+      // first occurrence: Ace keeps that one as the primary selection, so no
+      // selection change reports it.
+      await editor.gotoLine(1);
+      await page.locator(FIND_INPUT).click();
+      await page.locator(FIND_INPUT).press('ControlOrMeta+a');
+      await page.locator(FIND_INPUT).pressSequentially('alpha');
+      await expect.poll(() => editor.getSelectedText()).toBe('alpha');
+      await expect(marker).toHaveCount(1);
+      await page.locator(SELECT_ALL_BUTTON).click();
+      await expect.poll(() => editor.getSelectedText()).toBe('alpha\nalpha\nalpha');
+      await expect(marker).toHaveCount(0);
+
+      // Closing the bar removes the marker and leaves the selection in place.
+      await page.locator(FIND_NEXT_BUTTON).click();
+      await expect(marker).toHaveCount(1);
+      await page.locator(CLOSE_FIND_BAR).click();
+      await expect(page.locator(FIND_INPUT)).toHaveCount(0, { timeout: 5000 });
+      await expect(marker).toHaveCount(0);
+      expect(await editor.getSelectedText()).toBe('alpha');
+    } finally {
+      await consoleActions.executeInConsole(
+        `.rs.api.applyTheme(${JSON.stringify(originalTheme ?? LIGHT_THEME)})`,
+        { wait: true },
+      );
+      await expectThemeStylesheet(page, originalThemeHref);
+    }
+  });
+
+  // https://github.com/rstudio/rstudio/issues/17493
+  test('comment shortcut preserves indent on an empty indented line', async ({ rstudioPage: page }) => {
+    const content = 'f <- function() {\n\n}\n';
+    await writeAndOpenFile(page, sandbox.dir, 'editor_comment_indent.R', content);
+
+    const editor = new AceEditor(page, 'f <- function()');
+    await expect.poll(() => editor.getValue()).toContain('f <- function()');
+
+    // Put the cursor on the empty body line and indent it, mirroring the user
+    // pressing Tab on a fresh line inside the function. gotoLine(2) and
+    // getLine(1) below both target this line (1-indexed vs 0-indexed).
+    await editor.gotoLine(2);
+    await editor.insert('  ');
+
+    await executeCommand(page, 'commentUncomment');
+
+    // The comment character must land after the indent, not at column zero.
+    await expect.poll(() => editor.getLine(1)).toMatch(/^  #/);
+  });
+});

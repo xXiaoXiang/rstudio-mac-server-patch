@@ -1,0 +1,38 @@
+#!/bin/bash
+set -e
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+APP=/Applications/RStudioServer.app
+STATE=/var/db/rstudio-server
+if [ "${3:-/}" != / ]; then
+ echo 'Install on the running macOS startup volume; offline account provisioning is not supported.' >&2
+ exit 1
+fi
+if [ -d "$APP" ]; then
+ [ "$(/usr/bin/stat -f '%u' "$APP")" = 0 ] || {
+    echo 'The existing Server app must be administrator-installed and root-owned.' >&2; exit 1
+ }
+ /usr/bin/codesign --verify --deep --strict "$APP"
+ if /usr/bin/pgrep -f "$APP/Contents/MacOS/RStudioServer" >/dev/null; then
+    echo 'Quit the RStudioServer control app before upgrading so its next launch uses the new version.' >&2; exit 1
+ fi
+ if /usr/bin/pgrep -f "$APP/Contents/Resources/app/bin/rsession" >/dev/null; then
+    echo 'Quit all RStudio Server sessions before upgrading. User homes will be preserved.' >&2; exit 1
+ fi
+ if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
+    [ ! -L "$STATE" ] || exit 1
+    if [ ! -d "$STATE" ]; then /bin/mkdir -m 700 "$STATE"; fi
+    [ "$(/usr/bin/stat -f '%u' "$STATE")" = 0 ] || exit 1
+    mode=$(/usr/bin/stat -f '%Lp' "$STATE")
+    (( (8#$mode & 0022) == 0 )) || exit 1
+    /usr/bin/touch "$STATE/upgrade-startup"
+    "$APP/Contents/MacOS/RStudioServer" --disable-service
+    for ((attempt=0; attempt<30; attempt++)); do
+       /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1 || break
+       /bin/sleep 0.2
+    done
+    if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
+       echo 'Server shutdown is still in progress; rerun the installer after it stops.' >&2; exit 1
+    fi
+ fi
+fi

@@ -1,0 +1,263 @@
+import { test, expect } from '@fixtures/rstudio.fixture';
+import { ConsolePaneActions } from '@actions/console_pane.actions';
+import { SourcePaneActions } from '@actions/source_pane.actions';
+import { AceEditor } from '@pages/ace_editor.page';
+import { useSuiteSandbox } from '@utils/sandbox';
+import { setPref, clearPref } from '@utils/commands';
+import { heredoc } from '@utils/heredoc';
+import type { Page } from '@playwright/test';
+
+// Inline LaTeX / math previews in the source editor (line widgets for $$
+// display math, a popup for inline math), rendered client-side by the
+// MathJax 4 bundle served from the session's /mathjax4/ URI.
+test.describe('Inline LaTeX math previews', () => {
+  useSuiteSandbox();
+  let consoleActions: ConsolePaneActions;
+  let sourceActions: SourcePaneActions;
+
+  // Move the cursor into the editor via the automation bridge; the resulting
+  // cursor-changed event arms the idle monitor, which fires the LaTeX
+  // preview after its 700ms idle delay. Line numbers are 1-based.
+  const moveCursorTo = async (page: Page, line: number, column: number) => {
+    await page.evaluate(
+      ([lineNumber, columnNumber]) => {
+        const editor = window.rstudio?.documents.activeEditor();
+        if (!editor)
+          throw new Error('no active editor');
+        editor.focus();
+        editor.gotoLine(lineNumber, columnNumber);
+      },
+      [line, column]
+    );
+  };
+
+  // Typesets render into a hidden scratch element inside their target before
+  // being swapped in, so a re-render in flight adds a second, hidden
+  // mjx-container there -- and re-renders overlap the assertions, since each
+  // preview has two triggers (document load or change, then cursor idle).
+  // Match only the math the user can see.
+  const visibleMath = (page: Page, selector: string) => page.locator(selector).filter({ visible: true });
+
+  // the popup preview typesets outside of any line widget
+  const popupMath = (page: Page) => visibleMath(page, 'mjx-container:not(.rstudio-mathjax-root mjx-container)');
+
+  test.beforeAll(async ({ rstudioPage: page }) => {
+    consoleActions = new ConsolePaneActions(page);
+    sourceActions = new SourcePaneActions(page, consoleActions);
+
+    await consoleActions.resetSourcePane();
+    await setPref(page, 'latexPreviewOnCursorIdle', 'always');
+  });
+
+  test.afterAll(async ({ rstudioPage: page }) => {
+    await clearPref(page, 'latexPreviewOnCursorIdle');
+  });
+
+  test('MathJax 4 is loaded from the local bundle', async ({ rstudioPage: page }) => {
+    // the loader is invoked at session init; the bundle comes from the
+    // /mathjax4/ URI handler rather than a CDN
+    const script = page.locator('script[src*="mathjax4/tex-mml-chtml.js"]');
+    await expect(script).toBeAttached({ timeout: 30000 });
+
+    await expect
+      .poll(async () => await page.evaluate(() => (window as any).MathJax?.version ?? ''), {
+        timeout: 60000,
+      })
+      .toMatch(/^4\./);
+
+    // our configuration survived the load: inline $-math is enabled, and
+    // dynamically-loaded font resources resolve locally rather than via CDN
+    const config = await page.evaluate(() => ({
+      inlineMath: JSON.stringify((window as any).MathJax?.config?.tex?.inlineMath ?? null),
+      fontPath: (window as any).MathJax?.config?.output?.fontPath ?? null,
+    }));
+    expect(config.inlineMath).toContain('"$"');
+    expect(config.fontPath).toContain('mathjax4/fonts');
+  });
+
+  test('display math renders as a line-widget preview', async ({ rstudioPage: page }) => {
+    const fileName = `math_preview_widget_${Date.now()}.Rmd`;
+    const content = heredoc`
+      ---
+      title: "Math"
+      ---
+
+      Some prose, then math:
+
+      $$
+      e = mc^2
+      $$
+    `;
+
+    await sourceActions.createAndOpenFile(fileName, content);
+    await expect(sourceActions.sourcePane.selectedTab).toContainText(fileName, { timeout: 20000 });
+
+    // place the cursor inside the display math chunk (line of 'e = mc^2')
+    await moveCursorTo(page, 8, 2);
+
+    // the preview line widget renders typeset CHTML output
+    const widget = visibleMath(page, '.rstudio-mathjax-root mjx-container');
+    await expect(widget).toBeVisible({ timeout: 60000 });
+
+    await sourceActions.closeSourceAndDeleteFile(fileName);
+  });
+
+  test('inline math renders a popup preview', async ({ rstudioPage: page }) => {
+    const fileName = `math_preview_popup_${Date.now()}.Rmd`;
+    const content = heredoc`
+      ---
+      title: "Math"
+      ---
+
+      Einstein wrote $e = mc^2$ and moved on.
+    `;
+
+    await sourceActions.createAndOpenFile(fileName, content);
+    await expect(sourceActions.sourcePane.selectedTab).toContainText(fileName, { timeout: 20000 });
+
+    // place the cursor inside the inline math region
+    await moveCursorTo(page, 5, 20);
+
+    const math = popupMath(page);
+    await expect(math).toBeVisible({ timeout: 60000 });
+
+    // watch the popup's math element: rendered TeX errors must never become
+    // visible (typesets happen in a hidden scratch element inside the target,
+    // and a failed render keeps the previous output). a scratch element holds
+    // the text being typeset when it is added, and is removed once that
+    // typeset is done: count the typesets of the edited text only, as a
+    // render of the original text can still be in flight (the cursor move
+    // below arms the cursor-idle monitor as well).
+    await math.evaluate((container, editedText) => {
+      const el = container.parentElement!;
+      (window as any).__merrorSeen = false;
+      (window as any).__renderAttempts = 0;
+      (window as any).__lastRenderActivity = performance.now();
+      new MutationObserver(() => {
+        (window as any).__lastRenderActivity = performance.now();
+        const errors = Array.from(el.querySelectorAll('mjx-merror, [data-mjx-error]'));
+        if (errors.some((n) => getComputedStyle(n).visibility !== 'hidden'))
+          (window as any).__merrorSeen = true;
+      }).observe(el, { childList: true, subtree: true });
+
+      const scratches = new WeakSet<Node>();
+      new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          m.addedNodes.forEach((node) => {
+            if (node.textContent?.includes(editedText))
+              scratches.add(node);
+          });
+          m.removedNodes.forEach((node) => {
+            if (scratches.has(node))
+              (window as any).__renderAttempts += 1;
+          });
+        }
+      }).observe(el, { childList: true });
+    }, 'mc^2_');
+
+    // type a trailing subscript, making the expression incomplete
+    // ("Missing superscript or subscript argument")
+    await moveCursorTo(page, 5, 24);
+    await page.keyboard.type('_');
+
+    // wait for the edited text to be typeset and the re-renders to settle (a
+    // quiet window longer than the 700ms cursor-idle delay, so the idle
+    // re-render is covered too), then verify the previous render was kept and
+    // no error output was ever shown
+    await expect
+      .poll(
+        async () =>
+          await page.evaluate(() => {
+            const w = window as any;
+            return w.__renderAttempts > 0 && performance.now() - w.__lastRenderActivity > 1000;
+          }),
+        { timeout: 30000 }
+      )
+      .toBe(true);
+
+    expect(await page.evaluate(() => (window as any).__merrorSeen)).toBe(false);
+    await expect(math).toBeVisible();
+    await expect(math).not.toContainText('Missing');
+
+    await sourceActions.closeSourceAndDeleteFile(fileName);
+  });
+
+  test('dismissed popup does not leak Escape handlers', async ({ rstudioPage: page }) => {
+    const fileName = `math_preview_escape_${Date.now()}.Rmd`;
+    const content = heredoc`
+      ---
+      title: "Math"
+      ---
+
+      Einstein wrote $e = mc^2$ and moved on.
+    `;
+
+    await sourceActions.createAndOpenFile(fileName, content);
+    await expect(sourceActions.sourcePane.selectedTab).toContainText(fileName, { timeout: 20000 });
+
+    // place the cursor inside the inline math region and wait for the popup
+    await moveCursorTo(page, 5, 20);
+    const math = popupMath(page);
+    await expect(math).toBeVisible({ timeout: 60000 });
+
+    // snapshot the exception count so the assertion below sees only errors
+    // raised by the Escape presses; earlier unrelated exceptions still fail
+    // the test via the per-test fixture drain (don't clear() them away)
+    const errorCountBefore = await page.evaluate(() => window.rstudio!.errors.list().length);
+
+    // Escape dismisses the popup
+    await page.keyboard.press('Escape');
+    await expect(math).toBeHidden();
+
+    // each popup render used to register a second, leaked Escape preview
+    // handler that swallowed every later Escape keydown app-wide and raised
+    // an uncaught TypeError on a nulled handler field (#18474); Escape after
+    // dismissal must not raise a client exception
+    await page.keyboard.press('Escape');
+    const errors = await page.evaluate(
+      (count) => window.rstudio!.errors.list().slice(count).map((e) => e.message),
+      errorCountBefore
+    );
+    expect(errors).toEqual([]);
+
+    await sourceActions.closeSourceAndDeleteFile(fileName);
+  });
+
+  // math in the visual editor is typeset into ProseMirror widget decorations
+  // through the same MathJax pipeline. the typeset scratch element must live
+  // inside the widget: ProseMirror reverts unexpected siblings in its editing
+  // DOM, which detached the scratch mid-typeset (zero-size output), wedged
+  // the shared typeset queue, and re-parsed raw TeX into the document (#18551)
+  test('inline and display math render in the visual editor', async ({ rstudioPage: page }) => {
+    const fileName = `math_visual_${Date.now()}.qmd`;
+    const content = heredoc`
+      ---
+      format: html
+      ---
+
+      This is inline math: $\mu = 5$.
+
+      $$
+      \bar{X} \sim N\left(\mu,\frac{\sigma^2}{n}\right)
+      $$
+    `;
+
+    await sourceActions.createAndOpenFile(fileName, content);
+    await expect(sourceActions.sourcePane.selectedTab).toContainText(fileName, { timeout: 20000 });
+
+    await sourceActions.ensureVisualMode();
+
+    // both expressions typeset into visible (non-zero-size) output; the
+    // regression rendered the first at zero size and left the rest empty
+    const containers = visibleMath(page, '.ProseMirror .pm-math-mathjax mjx-container');
+    await expect(containers).toHaveCount(2, { timeout: 60000 });
+
+    // the round trip back to source mode must preserve the math text
+    await sourceActions.ensureSourceMode();
+    const editor = new AceEditor(page, '');
+    await expect.poll(() => editor.getValue(), { timeout: 20000 }).toContain('\\mu = 5');
+    expect(await editor.getValue()).toContain('\\bar{X}');
+
+    await sourceActions.closeSourceAndDeleteFile(fileName);
+  });
+});

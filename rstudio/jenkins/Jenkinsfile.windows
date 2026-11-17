@@ -1,0 +1,426 @@
+
+def utils
+
+pipeline {
+
+  agent none
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(
+      logRotator(
+        artifactDaysToKeepStr: '',
+        artifactNumToKeepStr: '',
+        daysToKeepStr: '',
+        numToKeepStr: '100'
+      )
+    )
+    // Timeout after no activity in the logs
+    timeout(time: 2, unit: 'HOURS', activity: true)
+  }
+
+  parameters {
+    string(name: 'COMMIT_HASH' , defaultValue: '')
+    booleanParam(name: 'RSTUDIO_SKIP_QT', defaultValue: false, description: 'Skips installing and bulding for QT')
+    booleanParam(name: 'DAILY', defaultValue: false, description: 'Runs daily build if true')
+    booleanParam(name: 'PUBLISH', defaultValue: true, description: 'Runs publish stage if true')
+    booleanParam(name: 'FORCE_BUILD_BINARIES', defaultValue: false, description: 'Force build binaries even if there are no changes, and even if they have already been built previously')
+    string(name: 'SLACK_CHANNEL', defaultValue: '#ide-builds', description: 'Slack channel to publish build message.')
+  }
+
+  environment {
+    OS = "windows"
+    FLAVOR = "Electron"
+    ARCH = "x86_64"
+    PACKAGE_OS = 'Windows'
+    AWS_ACCOUNT_ID = '749683154838'
+    GIT_URL = "https://github.com/rstudio/rstudio"
+    RSTUDIO_VERSION_FLOWER = ""
+    RSTUDIO_VERSION_FILENAME = ""
+    SHOULD_REBUILD = true // Set to true for now until rebuildCheck can run on Windows agents
+  }
+
+  stages{
+
+    // Execute on a linux agent
+    stage('Checkout Load and Version') {
+      agent { label "linux" }
+      stages {
+        stage('Load Utils') {
+          steps {
+            script {
+              sh 'printenv'
+              sh "echo 'Loading utils from ${env.WORKSPACE}/jenkins/utils.groovy'"
+              utils = load "${env.WORKSPACE}/jenkins/utils.groovy"
+              utils.ensureFullCommitHistory()
+            }
+          }
+        }
+
+        stage ('Checkout') { // checkout stage required here in order for versioning to work properly
+          when { expression { params.COMMIT_HASH != '' } }
+          steps {
+            checkout([$class: 'GitSCM',
+              branches: [[name: params.COMMIT_HASH]],
+              extensions: [[$class: 'CloneOption', shallow: true, depth: 50, noTags: true, honorRefspec: true]],
+              userRemoteConfigs: [[credentialsId: 'posit-jenkins-rstudio', url: GIT_URL, refspec: "+refs/heads/${env.BRANCH_NAME}:refs/remotes/origin/${env.BRANCH_NAME}"]]])
+          }
+        }
+
+        stage('Versioning') {
+          steps {
+            script {
+              utils.ensureFullCommitHistory()
+
+              (RSTUDIO_VERSION,
+                RSTUDIO_VERSION_MAJOR,
+                RSTUDIO_VERSION_MINOR,
+                RSTUDIO_VERSION_PATCH,
+                RSTUDIO_VERSION_SUFFIX) = utils.getVersion(!params.DAILY)
+              RSTUDIO_VERSION_FLOWER = utils.getFlower()
+              currentBuild.displayName = "${RSTUDIO_VERSION}"
+              IS_PRO = RSTUDIO_VERSION_SUFFIX.contains('pro')
+              PACKAGE_NAME = "RStudio-${IS_PRO ? 'pro-' : ''}${RSTUDIO_VERSION.replace('+', '-')}"
+              RSTUDIO_VERSION_FILENAME = utils.getVersionFilename(RSTUDIO_VERSION) // Define here for use later in utils.rebuildCheck()
+
+              // Check if we should rebuild here on linux before moving into Windows build agent
+              // Disabling for now since rebuildCheck uses FLAVOR, which isn't defined until we're in the matrix
+              // SHOULD_REBUILD = utils.rebuildCheck()
+            }
+          }
+        }
+      }
+      post {
+        always {
+          deleteDir()
+        }
+      }
+    }
+
+    // Build on windows agent
+    stage('Build Windows') {
+      environment {
+        // Map the year-suffixed credentials onto the env var names the DigiCert
+        // tools and signing steps read; SM_CLIENT_CERT_FILE_2026 is a secret
+        // file credential, so it binds as the path to the client certificate
+        SM_HOST = credentials('SM_HOST_2026')
+        SM_API_KEY = credentials('SM_API_KEY_2026')
+        SM_CLIENT_CERT_PASSWORD = credentials('SM_CLIENT_CERT_PASSWORD_2026')
+        SM_CLIENT_CERT_FILE = credentials('SM_CLIENT_CERT_FILE_2026')
+        KEYPAIR_ALIAS = credentials('SM_KEYPAIR_ALIAS_2026')
+      }
+      agent {
+        docker {
+          image "jenkins/ide:${utils.getDockerTag()}"
+            registryUrl 'https://263245908434.dkr.ecr.us-east-1.amazonaws.com'
+            registryCredentialsId 'ecr:us-east-1:aws-build-role'
+            reuseNode true
+          label "${utils.getAgentLabelForOS('windows', 'x86_64')}"
+          // Set a custom workspace relative to the workspace root (C:\Users\jenikns) to ensure file names
+          // won't be too long
+          customWorkspace "workspace/ide-${IS_PRO ? 'pro' : 'os'}-windows/${env.BRANCH_NAME.replace('/', '-')}"
+        }
+      }
+
+      stages {
+        stage ('Checkout') {
+          when { expression { params.COMMIT_HASH != '' } }
+          steps {
+            checkout([$class: 'GitSCM',
+              branches: [[name: params.COMMIT_HASH]],
+              extensions: [[$class: 'CloneOption', shallow: true, depth: 50, noTags: true, honorRefspec: true]],
+              userRemoteConfigs: [[credentialsId: 'posit-jenkins-rstudio', url: GIT_URL, refspec: "+refs/heads/${env.BRANCH_NAME}:refs/remotes/origin/${env.BRANCH_NAME}"]]])
+          }
+        }
+
+        stage('Validate Signing Credentials') {
+          steps {
+            // Signing requires the mTLS host; any other value fails only at the
+            // moment of signing, so catch it before the build instead
+            bat 'if not "%SM_HOST%"=="https://clientauth.one.digicert.com" (echo SM_HOST must be the clientauth mTLS host; check the SM_HOST_2026 credential & exit /b 1)'
+            bat 'if not exist "%SM_CLIENT_CERT_FILE%" (echo SM_CLIENT_CERT_FILE is not a path to the client certificate; check the SM_CLIENT_CERT_FILE_2026 secret file credential & exit /b 1)'
+          }
+        }
+
+        stage('Prepare Signing Tools') {
+          steps {
+            // None of this consumes a signing operation, so it runs for every
+            // build: it installs the DigiCert tools, proves the credentials can
+            // reach the keypair, and downloads the public code signing
+            // certificate that both signing stages pass to signtool. Running it
+            // before the build means a broken credential or an expired
+            // certificate fails in a minute rather than after a full build.
+            bat '''
+              curl -O "https://rstudio-buildtools.s3.amazonaws.com/posit-dev/smtools-windows-x64.msi"
+              msiexec /i smtools-windows-x64.msi /quiet /qn /L*V smtools-windows-x64.log
+              type smtools-windows-x64.log
+              "C:\\Program Files\\DigiCert\\DigiCert One Signing Manager Tools\\smctl.exe" healthcheck || exit /b 1
+              "C:\\Program Files\\DigiCert\\DigiCert One Signing Manager Tools\\smctl.exe" keypair ls || exit /b 1
+              if exist cert.pem del /f /q cert.pem
+              "C:\\Program Files\\DigiCert\\DigiCert One Signing Manager Tools\\smctl.exe" certificate download --keypair-alias="%KEYPAIR_ALIAS%" --format=pem --name=cert.pem --out=. || exit /b 1
+            '''
+          }
+          post {
+            failure {
+              // Client-side tools wrap server rejections in opaque errors; the
+              // real HTTP status and message land in the signingmanager logs
+              bat 'if exist "%USERPROFILE%\\.signingmanager\\logs\\*.log" type "%USERPROFILE%\\.signingmanager\\logs\\*.log"'
+            }
+          }
+        }
+
+        stage('Build') {
+          steps {
+            // set requisite environment variables and build rstudio
+            bat "cd package/win32 &&" +
+              "set \"rstudio_version_major=${RSTUDIO_VERSION_MAJOR}\" &&" +
+              "set \"rstudio_version_minor=${RSTUDIO_VERSION_MINOR}\" &&" +
+              "set \"rstudio_version_patch=${RSTUDIO_VERSION_PATCH}\" &&" +
+              "set \"rstudio_version_suffix=${RSTUDIO_VERSION_SUFFIX}\" &&" +
+              "set \"package_os=windows\" &&" +
+              "make-package.bat clean ${FLAVOR.toLowerCase()} &&" +
+              "cd ../.."
+          }
+        }
+
+        stage('Sign Executables') {
+
+          // Each file is a separate signing operation, so the executables here
+          // account for nearly all of the operations a Windows build spends.
+          // Hourly builds skip them and sign only the installer below: that's
+          // the artifact Windows warns about on download, and signing it alone
+          // costs a single operation. Daily and release builds -- both of which
+          // pass DAILY -- sign everything we ship.
+          when { expression { return params.DAILY } }
+
+          environment {
+            // rsession.dll carries the bulk of the session code and is loaded by
+            // the rsession.exe / rsession-utf8.exe launcher stubs, so it needs a
+            // signature of its own; multiarch builds ship an x86 copy as well
+            EXECUTABLES = """^
+              package\\win32\\build\\src\\cpp\\session\\rsession-utf8.exe ^
+              package\\win32\\build\\src\\cpp\\session\\rsession.exe ^
+              package\\win32\\build\\src\\cpp\\session\\rsession.dll ^
+              package\\win32\\build\\src\\cpp\\session\\x86\\rsession.exe ^
+              package\\win32\\build\\src\\cpp\\session\\x86\\rsession.dll ^
+              package\\win32\\build\\src\\cpp\\session\\consoleio\\consoleio.exe ^
+              package\\win32\\build\\src\\cpp\\session\\postback\\rpostback.exe ^
+              package\\win32\\build\\src\\cpp\\diagnostics\\diagnostics.exe ^
+              src\\node\\desktop-build-AMD64\\out\\RStudio-win32-x64\\rstudio.exe ^
+            """
+          }
+          steps {
+            bat '''
+              call "C:\\Program Files\\Microsoft Visual Studio\\2026\\BuildTools\\Common7\\Tools\\VsDevCmd.bat"
+              C:\\Windows\\System32\\certutil.exe -csp "DigiCert Signing Manager KSP" -key -user
+              "C:\\Program Files\\DigiCert\\DigiCert One Signing Manager Tools\\smctl.exe" windows certsync
+              signtool.exe sign /csp "DigiCert Signing Manager KSP" /kc "%KEYPAIR_ALIAS%" /f cert.pem /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 %EXECUTABLES%
+              signtool.exe verify /v /pa %EXECUTABLES%
+            '''
+          }
+          post {
+            failure {
+              // Client-side tools wrap server rejections in opaque errors; the
+              // real HTTP status and message land in the signingmanager logs
+              bat 'if exist "%USERPROFILE%\\.signingmanager\\logs\\*.log" type "%USERPROFILE%\\.signingmanager\\logs\\*.log"'
+            }
+          }
+        }
+
+        stage('Tests') {
+          steps {
+            bat 'cd package/win32/build/src/cpp && rstudio-tests.bat --scope core,rsession'
+          }
+        }
+
+        // TODO(Kevin): Tests failing with exit code 255. Mark as unstable?
+        // stage('Electron Tests') {
+        //   when { environment name: 'FLAVOR', value: 'Electron' }
+        //   steps {
+        //     bat 'cd src/node/desktop && scripts\\run-unit-tests.cmd'
+        //   }
+        // }
+
+        stage('Package') {
+          steps {
+            bat "cd package/win32 &&" +
+              "set \"package_os=windows\" &&" +
+              "make-dist-packages.bat &&" +
+              "cd ../.."
+          }
+        }
+
+        stage('Upload Debug Symbols') {
+
+          when { expression { return params.PUBLISH } }
+
+          environment {
+            PRODUCT = "${utils.getProductName()}"
+            VERSION = "${RSTUDIO_VERSION}"
+          }
+
+          steps {
+            // same role the linux builds use to publish to rstudio-debug-symbols;
+            // as with the package upload below, the windows docker container cannot
+            // reach the instance-metadata endpoint, so supply credentials here
+            withAWS(role: 'build', roleAccount: AWS_ACCOUNT_ID, region: 'us-east-1') {
+              retry(5) {
+                powershell '.\\package\\win32\\scripts\\upload-debug-symbols.ps1 -product ${env:PRODUCT} -version ${env:VERSION}'
+              }
+            }
+          }
+        }
+
+        stage('Sign, Upload, and Publish') {
+
+          when { expression { return params.PUBLISH } }
+
+          environment {
+            LONG_PACKAGE_NAME = "${PACKAGE_NAME}-RelWithDebInfo"
+            LONG_PACKAGE_PATH = "package/win32/build/${PACKAGE_NAME}-RelWithDebInfo.exe"
+          }
+
+          stages {
+
+            stage('Sign Installer') {
+
+              steps {
+                // signs with the cert.pem downloaded during Prepare Signing Tools;
+                // it's the public code signing certificate, not a credential.
+                // Every build signs the installer, hourlies included
+                bat '''
+                  call "C:\\Program Files\\Microsoft Visual Studio\\2026\\BuildTools\\Common7\\Tools\\VsDevCmd.bat"
+                  C:\\Windows\\System32\\certutil.exe -csp "DigiCert Signing Manager KSP" -key -user
+                  "C:\\Program Files\\DigiCert\\DigiCert One Signing Manager Tools\\smctl.exe" windows certsync
+                  signtool.exe sign /csp "DigiCert Signing Manager KSP" /kc "%KEYPAIR_ALIAS%" /f cert.pem /tr http://timestamp.digicert.com /td SHA256 /fd SHA256 %LONG_PACKAGE_PATH%
+                  signtool.exe verify /v /pa %LONG_PACKAGE_PATH%
+                '''
+              }
+
+              post {
+                failure {
+                  bat 'if exist "%USERPROFILE%\\.signingmanager\\logs\\*.log" type "%USERPROFILE%\\.signingmanager\\logs\\*.log"'
+                }
+              }
+
+            }
+
+            stage('Upload') {
+              environment {
+                BUILD_DEST = "s3://rstudio-ide-build/${FLAVOR.toLowerCase()}/windows"
+              }
+
+              steps {
+                // strip unhelpful suffixes from filenames
+                bat "move package\\win32\\build\\${LONG_PACKAGE_NAME}.exe package\\win32\\build\\${PACKAGE_NAME}.exe"
+                bat "move package\\win32\\build\\${LONG_PACKAGE_NAME}.zip package\\win32\\build\\${PACKAGE_NAME}.zip"
+
+                // windows docker container cannot reach instance-metadata endpoint. supply credentials at upload.
+                withAWS(role: 'ide-build', region: 'us-east-1') {
+                  retry(5) {
+                    bat "aws s3 cp package\\win32\\build\\${PACKAGE_NAME}.exe ${BUILD_DEST}/${PACKAGE_NAME}.exe"
+                    bat "aws s3 cp package\\win32\\build\\${PACKAGE_NAME}.zip ${BUILD_DEST}/${PACKAGE_NAME}.zip"
+                  }
+                }
+              }
+            }
+
+            stage ('Publish') {
+              environment {
+                GITHUB_LOGIN = credentials('posit-jenkins-rstudio')
+                PRODUCT = "${utils.getProductName()}"
+                // This is being done to make the variables visible to the powershell call
+                VERSION = "${RSTUDIO_VERSION}"
+                PACKAGE = "${PACKAGE_NAME}"
+                // Channel to prevent hourlies from ending up on the Dailies page
+                CHANNEL = "${ params.DAILY ? 'Daily' : 'Hourly'}"
+                DAILIES_URL= "https://dl.dailies.rstudio.com/${FLAVOR.toLowerCase()}/windows"
+              }
+
+              stages {
+                stage("Publish Exe") {
+                  steps {
+                    echo "Publishing the following .exe build:"
+                    echo "Product : ${PRODUCT}"
+                    echo "Version : ${VERSION}"
+                    echo "Package : ${PACKAGE}"
+                    echo "Channel : ${CHANNEL}"
+                    script {
+                      // publish the build (self installing exe)
+                      powershell '.\\docker\\jenkins\\publish-build.ps1 -build ${env:PRODUCT}/windows -url ${env:DAILIES_URL}/${env:PACKAGE}.exe -pat ${env:GITHUB_LOGIN_PSW} -file package\\win32\\build\\${env:PACKAGE}.exe -version ${env:VERSION} -channel ${env:CHANNEL}'
+                    }
+                  }
+                }
+
+                // Only publish the zip for dailies, hourlies don't need it
+                stage("Publish Zip") {
+                  when {
+                    allOf {
+                      expression { return params.DAILY }
+                    }
+                  }
+                  steps {
+                    echo "Publishing the following .zip build:"
+                    echo "Product : ${PRODUCT}"
+                    echo "Version : ${VERSION}"
+                    echo "Package : ${PACKAGE}"
+                    echo "Channel : ${CHANNEL}"
+                    script {
+                      // publish the build (installer-less zip)
+                      powershell '.\\docker\\jenkins\\publish-build.ps1 -build ${env:PRODUCT}/windows-xcopy -url ${env:DAILIES_URL}/${env:PACKAGE}.zip -pat ${env:GITHUB_LOGIN_PSW} -file package\\win32\\build\\${env:PACKAGE}.zip -version ${env:VERSION} -channel ${env:CHANNEL}'
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      post {
+        // the custom workspace is reused across builds: remove cert.pem so a
+        // failed download in a later build can never fall back to a stale
+        // certificate
+        always {
+          bat 'if exist "%WORKSPACE%\\cert.pem" del /f /q "%WORKSPACE%\\cert.pem"'
+        }
+      }
+    } // Build Windows Stage
+
+    // Run on linux agent
+    stage ("Update Daily Build Redirects") {
+      agent { label "linux" }
+
+      when {
+        anyOf {
+          expression { return params.PUBLISH && params.DAILY && FLAVOR == "Electron" }
+          expression { return params.PUBLISH && params.DAILY && FLAVOR == "Server" }
+        }
+      }
+
+      environment {
+        RSTUDIO_ORG_PEM = credentials('www-rstudio-org-pem')
+        AWS_PATH= "${FLAVOR.toLowerCase()}/windows"
+      }
+
+      steps {
+        // the updateDailyRedirects uses a bash script, so much be run on linux
+        // Also depends on flavor, so must be in the matrix
+        script {
+          utils.updateDailyRedirects "${AWS_PATH}/${PACKAGE_NAME}.exe"
+        }
+      }
+
+      post {
+        always {
+          deleteDir()
+        }
+      }
+    } // stage ("Upload Daily Build Redirects")
+  } // Root Stages
+  post {
+    always {
+      sendNotifications slack_channel: SLACK_CHANNEL
+    }
+  }
+}

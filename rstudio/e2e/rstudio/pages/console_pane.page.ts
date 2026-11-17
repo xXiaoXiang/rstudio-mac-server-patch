@@ -1,0 +1,701 @@
+import type { Page } from 'playwright';
+import type { Locator } from 'playwright';
+import { PageObject } from './page_object_base_classes';
+import { CRAN_REPOS, sleep, TIMEOUTS, typingTimeout } from '../utils/constants';
+import { documentCloseAllNoSave, executeCommand, getVersion } from '../utils/commands';
+import { AceEditorElement } from '../utils/ace';
+import { R_CONSOLE_LINE_MAX_BYTES } from '../utils/r';
+
+// ---------------------------------------------------------------------------
+// Class-based page object
+// ---------------------------------------------------------------------------
+
+export class ConsolePane extends PageObject {
+  public consoleInput: Locator;
+  public consoleTab: Locator;
+  public consoleOutput: Locator;
+  public interruptRBtn: Locator;
+  public tracebackBtn: Locator;
+  public stackTrace: Locator;
+  public findBar: Locator;
+  public findInput: Locator;
+  public findNext: Locator;
+  public findClose: Locator;
+  public findBtn: Locator;
+  public findCaseSensitive: Locator;
+
+  constructor(page: Page) {
+    super(page);
+    this.consoleInput = page.locator('#rstudio_console_input .ace_text-input');
+    this.consoleTab = page.locator('#rstudio_workbench_tab_console');
+    this.consoleOutput = page.locator('#rstudio_workbench_panel_console');
+    this.interruptRBtn = page.locator("[id^='rstudio_tb_interruptr']");
+    this.tracebackBtn = page.locator("[class*='show_traceback_text']");
+    this.stackTrace = page.locator("[class*='stack_trace']");
+
+    // Find in Console: #rstudio_find_replace_bar is the inner panel;
+    // the Close button is a sibling at the shelf level, so scope it at the console panel.
+    const consolePanel = page.locator('#rstudio_workbench_panel_console');
+    this.findBar = consolePanel.locator('#rstudio_find_replace_bar');
+    this.findInput = this.findBar.locator('input[type="text"]');
+    this.findNext = this.findBar.getByRole('button', { name: 'Next' });
+    this.findClose = consolePanel.getByRole('button', { name: 'Close' }).first();
+    this.findBtn = consolePanel.locator('button[aria-label^="Find in Console"]').first();
+    this.findCaseSensitive = this.findBar.getByRole('checkbox', { name: 'Case sensitive' });
+  }
+
+  async consoleInputValue(): Promise<string> {
+    return this.page.evaluate(() => {
+      const el = document.getElementById('rstudio_console_input') as AceEditorElement | null;
+      return el?.env?.editor?.getValue() ?? '';
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface EnvironmentVersions {
+  r: string;
+  rstudio: string;
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compatible exports (used by other tests & desktop.fixture.ts)
+// ---------------------------------------------------------------------------
+
+export const CONSOLE_INPUT = '#rstudio_console_input .ace_text-input';
+export const CONSOLE_TAB = '#rstudio_workbench_tab_console';
+export const CONSOLE_OUTPUT = '#rstudio_workbench_panel_console';
+// The output element alone: the scrollback and each submitted command's echo,
+// without the toolbar and live input line that CONSOLE_OUTPUT (the whole
+// panel) also covers.
+export const CONSOLE_SCROLLBACK = '#rstudio_console_output';
+export const INTERRUPT_R_BTN = "[id^='rstudio_tb_interruptr']";
+
+/**
+ * Wait for the console input to clear its "busy" class -- i.e. for R to
+ * finish processing whatever it's running. Polls the DOM at 100ms intervals.
+ * Default timeout is generous (TIMEOUTS.sessionRestart) so it covers project
+ * opens and session restarts; pass a smaller value for snappier per-command
+ * waits, or a larger one for long-running calls like `install.packages`.
+ */
+export async function waitForConsoleIdle(
+  page: Page,
+  timeout: number = TIMEOUTS.sessionRestart,
+): Promise<void> {
+  await page.waitForFunction(
+    () => {
+      const el = document.getElementById('rstudio_console_input');
+      return !!el && !el.classList.contains('rstudio-console-busy');
+    },
+    null,
+    { timeout, polling: 100 },
+  );
+}
+
+/**
+ * True when the console input carries its "busy" class (R is executing).
+ * Evaluation failures (e.g. mid-reload after a session abort) read as
+ * "not busy" -- pair with a readiness wait where that matters.
+ */
+async function isConsoleBusy(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const el = document.getElementById('rstudio_console_input');
+      return !!el && el.classList.contains('rstudio-console-busy');
+    })
+    .catch(() => false);
+}
+
+/**
+ * The blocking confirmation ApplicationInterrupt raises when R stays busy
+ * through interrupt requests (its 10s "unresponsive" timer, or a third
+ * request while one is already pending). Confirming aborts the session and
+ * relaunches it.
+ */
+const TERMINATE_R_DIALOG = '[role="alertdialog"]:has-text("Terminate R")';
+
+/**
+ * Wait for the automation bridge to report ready again after a session
+ * abort/relaunch. Polls with per-sample evaluate calls rather than
+ * waitForFunction because the abort's page reload destroys the execution
+ * context mid-wait; a destroyed context reads as "not ready yet".
+ */
+async function waitForSessionReady(page: Page, timeout: number = 60000): Promise<boolean> {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const ready = await page
+      .evaluate(() => window.rstudio?.ready === true)
+      .catch(() => false);
+    if (ready)
+      return !(await isConsoleBusy(page));
+
+    await sleep(500);
+  }
+
+  console.warn('[console] ensureConsoleIdle: session did not come back ready after Terminate R');
+  return false;
+}
+
+/**
+ * Actively free a busy console that no test is waiting on -- a prior test
+ * leaked a long-running command (the classic case: a shiny app its teardown
+ * failed to stop, which in Server mode blocks the shared session for every
+ * suite behind it in the shard). Escalates deliberately slowly:
+ *
+ *   1. Fast path: console already idle -- decline any stale "Terminate R"
+ *      dialog (terminating a healthy session would just cost a restart) and
+ *      return.
+ *   2. Dispatch interruptR and watch for up to 10s. A clean interrupt lands
+ *      well inside that window; meanwhile ApplicationInterrupt schedules a
+ *      10s "unresponsive" timer on the first request, so if R is stuck
+ *      (e.g. shiny caught the interrupt mid-callback and kept serving) the
+ *      blocking "Terminate R" dialog pops without further prodding.
+ *   3. Confirm the Terminate R dialog when it shows: the session aborts and
+ *      relaunches, and we wait for the automation bridge to come back. A
+ *      restarted session is fully usable by whatever runs next; a
+ *      permanently busy one is not.
+ *
+ * Interrupt dispatches are spaced ~10s apart on purpose: the client raises
+ * one Terminate R confirmation per interrupt request while R stays busy, so
+ * spamming interruptR stacks dialogs instead of helping.
+ *
+ * Never throws; returns whether the console ended up idle. Cleanup-path
+ * callers can ignore the result (the warnings above tell the story in the
+ * log); callers that need a working console (e.g. createSandbox) should
+ * escalate a false return to a failure.
+ */
+export async function ensureConsoleIdle(page: Page): Promise<boolean> {
+  const terminateDialog = page.locator(TERMINATE_R_DIALOG);
+
+  if (!(await isConsoleBusy(page))) {
+    if (await terminateDialog.isVisible().catch(() => false)) {
+      await terminateDialog.locator('button:has-text("No")').first().click().catch(() => {});
+    }
+    return true;
+  }
+
+  console.warn('[console] ensureConsoleIdle: console is busy with no test waiting on it; interrupting R');
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await executeCommand(page, 'interruptR').catch((err) => {
+      console.warn(`[console] ensureConsoleIdle: interruptR dispatch failed: ${(err as Error).message}`);
+    });
+
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      if (!(await isConsoleBusy(page)))
+        return true;
+
+      if (await terminateDialog.isVisible().catch(() => false)) {
+        console.warn(
+          '[console] ensureConsoleIdle: R is not responding to interrupts; ' +
+          'confirming "Terminate R" (the session will restart)',
+        );
+        await terminateDialog.locator('button:has-text("Yes")').first().click().catch(() => {});
+        return waitForSessionReady(page);
+      }
+
+      await sleep(500);
+    }
+  }
+
+  console.warn(
+    '[console] ensureConsoleIdle: console still busy after 3 interrupts ' +
+    'with no Terminate R dialog; giving up',
+  );
+  return false;
+}
+
+/**
+ * Read the automation agent's monotonic console prompt counter, or null if the
+ * running binary predates it (`window.rstudio.console.promptCount`, added in
+ * ApplicationAutomation). The counter advances by one each time R issues a
+ * console prompt awaiting fresh client input -- a submitted command either
+ * completing (top-level prompt) or settling at an interactive sub-prompt
+ * (browser()/readline()/menu()) -- so it is a race-free completion signal,
+ * unlike the busy CSS class which is sampled (and can be read stale in the
+ * submit->busy gap, or miss a fast command's busy flash). See
+ * waitForConsoleCommandComplete.
+ */
+export async function getConsolePromptCount(page: Page): Promise<number | null> {
+  return page.evaluate(() => {
+    const count = window.rstudio?.console?.promptCount;
+    return typeof count === 'number' ? count : null;
+  });
+}
+
+/**
+ * Read the text of the console's current prompt (`> `, `+ `, or an interactive
+ * read's own, e.g. `answer? `). The shell renders the prompt in the cell before
+ * the input's, in the input row of its table.
+ */
+export async function getConsolePromptText(page: Page): Promise<string> {
+  return page.evaluate(() =>
+    document.getElementById('rstudio_console_input')?.closest('tr')?.querySelector('td')?.textContent ?? '');
+}
+
+/** Set once we've warned about a missing prompt counter, to avoid log spam. */
+let warnedMissingPromptCount = false;
+
+/**
+ * Wait for a console command to finish, given the prompt count captured *before*
+ * it was submitted (via getConsolePromptCount). Resolves once the count exceeds
+ * `promptCountBefore`, i.e. R issued a new prompt awaiting client input. This is
+ * the reliable replacement for waitForConsoleIdle when bracketing a submission:
+ * it keys off the prompt *event*, not a sampled class, so it can't return
+ * spuriously-idle before the command starts.
+ *
+ * Every new prompt event advances the counter, but a single submission only
+ * produces one: the server services a multi-line/multi-statement submission's
+ * intermediate continuation (`+`) and inter-statement prompts from its buffered
+ * input without firing a client event (see ApplicationAutomation.registerConsole
+ * for the full rationale). So this resolves when the command completes (back to
+ * the top-level prompt) OR when it settles at an interactive sub-prompt that
+ * needs the test to act next -- `browser()`/Browse[N]>, readline(), menu(). The
+ * latter is what lets debugger tests submit a breakpoint-triggering call and
+ * proceed once R parks at the Browse prompt, rather than hanging until timeout.
+ *
+ * Falls back to the busy-class wait when the counter is unavailable (a binary
+ * built before the counter, or one where registerConsole failed to install it),
+ * preserving prior behavior; warns once so a silent revert to the flaky path is
+ * visible in the log.
+ */
+export async function waitForConsoleCommandComplete(
+  page: Page,
+  promptCountBefore: number | null,
+  timeout: number = TIMEOUTS.sessionRestart,
+): Promise<void> {
+  if (promptCountBefore === null) {
+    if (!warnedMissingPromptCount) {
+      warnedMissingPromptCount = true;
+      console.warn(
+        '[console] window.rstudio.console.promptCount unavailable; falling back ' +
+        'to the busy-class wait (waitForConsoleIdle). This is the known-flaky ' +
+        'path -- expected only against a binary that predates the counter.',
+      );
+    }
+    await waitForConsoleIdle(page, timeout);
+    return;
+  }
+
+  await page.waitForFunction(
+    (before) => {
+      const count = window.rstudio?.console?.promptCount;
+      return typeof count === 'number' && count > before;
+    },
+    promptCountBefore,
+    { timeout, polling: 50 },
+  );
+}
+
+/**
+ * Wait for the console input to gain its "busy" class -- i.e. for R to start
+ * processing submitted code. Pairs with waitForConsoleIdle to bracket an
+ * asynchronously-dispatched job (e.g. executeCurrentChunk) whose work doesn't
+ * begin on the same tick: wait for busy first so a following waitForConsoleIdle
+ * can't observe a spuriously-idle console and return before the job has even
+ * started. Callers should tolerate a job fast enough that the busy class is
+ * never observed (catch the timeout) -- waitForConsoleIdle is then already
+ * satisfied. Polls the DOM at 50ms intervals.
+ */
+export async function waitForConsoleBusy(page: Page, timeout: number = 2000): Promise<void> {
+  await page.waitForFunction(
+    () => {
+      const el = document.getElementById('rstudio_console_input');
+      return !!el && el.classList.contains('rstudio-console-busy');
+    },
+    null,
+    { timeout, polling: 50 },
+  );
+}
+
+/**
+ * Wait until the console input's Ace editor owns the document focus.
+ * `activateConsole` schedules the focus shift on the next event-loop tick,
+ * so callers that follow it with keystrokes can race the focus change.
+ * Polling beats a blind sleep -- the common case settles in tens of
+ * milliseconds.
+ */
+export async function waitForConsoleFocus(page: Page, timeout: number = 5000): Promise<void> {
+  await page.waitForFunction(
+    () => {
+      const el = document.getElementById('rstudio_console_input');
+      return el !== null && el.contains(document.activeElement);
+    },
+    null,
+    { timeout, polling: 50 },
+  );
+}
+
+/**
+ * Focus the console input, re-issuing `activateConsole` until focus sticks.
+ *
+ * A single activateConsole + waitForConsoleFocus is not enough: other UI can
+ * take focus *after* the command has run and nothing gives it back, so the
+ * wait can never succeed. The known offender is the Posit Assistant pane,
+ * whose iframe reload (e.g. the workspace-trust prompt shown after a project
+ * open) grabs document focus asynchronously. Re-issuing the command inside
+ * the poll loop wins that race deterministically.
+ *
+ * Use this on "just get me a focused console" paths. Tests that assert the
+ * focus behavior of a single activateConsole dispatch should keep using
+ * executeCommand + waitForConsoleFocus so a product regression isn't masked
+ * by the retry.
+ */
+export async function focusConsole(page: Page, timeout: number = 10000): Promise<void> {
+  const deadline = Date.now() + timeout;
+  let attempts = 0;
+
+  for (;;) {
+    attempts++;
+    await executeCommand(page, 'activateConsole');
+
+    const remaining = deadline - Date.now();
+    try {
+      await waitForConsoleFocus(page, Math.min(1000, Math.max(remaining, 100)));
+      return;
+    } catch (err) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `focusConsole: console input did not hold focus after ${attempts} ` +
+            `activateConsole dispatches over ${timeout}ms; something is ` +
+            `stealing focus (e.g. an assistant-pane iframe load or a modal)`,
+          { cause: err },
+        );
+      }
+    }
+  }
+}
+
+/** Options accepted by `executeInConsole`. */
+export interface ExecuteInConsoleOptions {
+  /**
+   * Whether to wait for R to finish processing the command before returning
+   * (via `waitForConsoleCommandComplete`, which keys off a new top-level
+   * prompt). Defaults to `true`: most callers expect the command to have fully
+   * executed before the next step runs. It also matters for correctness -- a
+   * command is only added to recall history when R *executes* it, so firing
+   * several commands without waiting leaves the later ones queued (not yet in
+   * history) and makes history navigation nondeterministic.
+   *
+   * Pass `wait: false` for the fire-and-forget pattern: submitting a
+   * long-running command (e.g. `install.packages`) and then queuing a marker
+   * command behind it while R is still busy, polling output for the marker.
+   */
+  wait?: boolean;
+  /**
+   * Timeout for the `wait: true` poll, in ms. Defaults to
+   * `TIMEOUTS.sessionRestart`. Raise this for slow commands like
+   * `install.packages`.
+   */
+  timeout?: number;
+}
+
+/**
+ * Submit an R expression to the console. Writes the text directly into the
+ * console's Ace editor and presses Enter -- no per-key typing -- so it doesn't
+ * race with autocomplete popups, tooltip handlers, or other live-edit UI that
+ * can swallow characters or steal focus. Prefer this when you just need code
+ * to run; use `typeInConsole` only when a test is exercising actual typing
+ * behavior (e.g. autocomplete triggering).
+ *
+ * By default this waits for R to finish the command -- it waits for a new
+ * console prompt (waitForConsoleCommandComplete) rather than sleeping. Pass
+ * `{ wait: false }` for the fire-and-forget pattern (e.g. queuing a marker
+ * command behind a long-running install).
+ */
+export async function executeInConsole(
+  page: Page,
+  command: string,
+  opts: ExecuteInConsoleOptions = {},
+): Promise<void> {
+  // A truncated line would leave R at a "+" prompt and fail some later,
+  // unrelated wait instead; fail here with the cause.
+  const longLine = command.split('\n').find(line => Buffer.byteLength(line, 'utf8') > R_CONSOLE_LINE_MAX_BYTES);
+  if (longLine !== undefined) {
+    throw new Error(
+      `executeInConsole: a command line is ${Buffer.byteLength(longLine, 'utf8')} bytes, over R's ` +
+      `${R_CONSOLE_LINE_MAX_BYTES}-byte console line limit; encode long values with rLongStringLiteral(). ` +
+      `Line starts: ${longLine.slice(0, 80)}`,
+    );
+  }
+
+  // Focus the console through the activateConsole command rather than by
+  // clicking its tab: two clicks on a pane tab within 500ms of each other are
+  // a double-click, which maximizes that pane (ModuleTabLayoutPanel) and so
+  // minimizes the Source pane. Back-to-back calls land in that window, e.g.
+  // seedSandboxFile's R-side dir.create + writeLines on Server, where the
+  // runner cannot write the sandbox itself.
+  await focusConsole(page);
+  await page.evaluate((text) => {
+    const el = document.getElementById('rstudio_console_input') as AceEditorElement | null;
+    const editor = el?.env?.editor;
+    if (!editor) throw new Error('Console Ace editor not found at #rstudio_console_input');
+    editor.setValue(text, 1); // 1 = move cursor to end
+    editor.focus();
+  }, command);
+  // Capture the console prompt count before submitting so the wait below can
+  // key off a *new* prompt (command completed) rather than sampling the busy
+  // class. Must be read before any Enter press, while R is still at the prior
+  // prompt.
+  const promptCountBefore = await getConsolePromptCount(page);
+  // Try the Enter dispatch a few times. Ace can briefly route the keystroke
+  // to an autocomplete / signature-help popup (selecting an entry instead of
+  // submitting). The completion wait below can't catch that case on its own:
+  // if nothing was submitted, no new prompt arrives, so the wait would just
+  // time out (and the busy-class fallback returns immediately, R already being
+  // idle) while the command sits unsubmitted in the editor. After each press
+  // we verify the editor is now empty (Ace clears the input on submit); if
+  // not, dismiss any popup and try again.
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt === 1) {
+      // First attempt: only clear a completions popup if one happens to be
+      // lingering from a prior interaction; setValue() shouldn't have
+      // triggered any new overlay.
+      if (await page.locator('#rstudio_popup_completions').isVisible()) {
+        await page.keyboard.press('Escape');
+      }
+    } else {
+      // Retry: the previous Enter didn't submit, so some overlay (popup,
+      // signature help, hover tooltip, ...) almost certainly intercepted
+      // it. Send Escape unconditionally to cover the full set of
+      // Enter-intercepting overlays, then re-focus the editor since
+      // Escape can shift focus off it.
+      await page.keyboard.press('Escape');
+      await page.evaluate(() => {
+        const e = document.getElementById('rstudio_console_input') as AceEditorElement | null;
+        e?.env?.editor?.focus();
+      });
+    }
+    // Press Enter on the console-input textarea explicitly.
+    // `page.keyboard.press` delivers to the focused element; relying on
+    // editor.focus() above is racy -- focus can shift between the evaluate()
+    // returning and the key press, leaving the text in the buffer but never
+    // submitted.
+    await page.locator(CONSOLE_INPUT).press('Enter');
+
+    // Verify the command was actually consumed by polling for an empty
+    // editor value. The await-poll completes immediately on the happy path.
+    try {
+      await page.waitForFunction(
+        () => {
+          const e = document.getElementById('rstudio_console_input') as AceEditorElement | null;
+          return e?.env?.editor?.getValue() === '';
+        },
+        null,
+        { timeout: 1000, polling: 50 },
+      );
+      break;
+    } catch (err) {
+      // Only TimeoutError is a legitimate "editor still non-empty" retry
+      // case -- other errors (frame teardown, exec-context destroyed, JS
+      // evaluation failures) must propagate so root causes aren't masked
+      // by the catch-all submission-failure message below.
+      const isTimeout = err instanceof Error && err.name === 'TimeoutError';
+      if (!isTimeout) throw err;
+      if (attempt === MAX_ATTEMPTS) {
+        throw new Error(
+          `executeInConsole: Enter did not submit "${command.slice(0, 80)}" ` +
+          `after ${MAX_ATTEMPTS} attempts; editor still non-empty.`,
+        );
+      }
+    }
+  }
+  if (opts.wait ?? true) {
+    await waitForConsoleCommandComplete(page, promptCountBefore, opts.timeout);
+  }
+}
+
+/**
+ * Simulate user typing one keystroke at a time into the console input. Does
+ * NOT press Enter -- the caller controls submission. Use this only when a
+ * test needs to exercise live-edit behavior that `executeInConsole`'s
+ * programmatic write doesn't trigger (e.g. autocomplete popups, parameter
+ * tooltips).
+ *
+ * `delayMs` is the per-keystroke delay; default 50ms is close to typical
+ * human typing speed and gives the editor time to dispatch input events and
+ * fire completers between chars.
+ */
+/** Options accepted by `ensurePackageInstalled`. */
+export interface EnsurePackageInstalledOptions {
+  /** Repos URL; defaults to `CRAN_REPOS`. */
+  repos?: string;
+  /** Install type ("binary" / "source"); defaults to `getOption("pkgType")`. */
+  type?: string;
+  /** Total timeout for the install, ms. Defaults to 120000 (2 min). */
+  timeout?: number;
+}
+
+/**
+ * Install an R package only if it isn't already on disk. Wraps the R-side
+ * `.rs.ensurePackageInstalled` helper, which checks the library before
+ * downloading -- much faster than a blind `install.packages` when the package
+ * is already present, which is the common case on repeated test runs.
+ *
+ * `repos` defaults to CRAN. Override it (e.g. with Posit Public Package
+ * Manager's per-distro endpoint) for faster Linux installs.
+ *
+ * Don't use this in tests that are exercising `install.packages` behavior
+ * itself -- call `executeInConsole(page, 'install.packages(...)', { wait: true })`
+ * directly there.
+ */
+export async function ensurePackageInstalled(
+  page: Page,
+  packageName: string,
+  opts: EnsurePackageInstalledOptions = {},
+): Promise<void> {
+  const repos = opts.repos ?? CRAN_REPOS;
+  const args: string[] = [
+    JSON.stringify(packageName),
+    `repos = ${JSON.stringify(repos)}`,
+  ];
+  if (opts.type !== undefined) args.push(`type = ${JSON.stringify(opts.type)}`);
+  await executeInConsole(
+    page,
+    `.rs.ensurePackageInstalled(${args.join(', ')})`,
+    { wait: true, timeout: opts.timeout ?? 120000 },
+  );
+}
+
+export async function typeInConsole(page: Page, text: string, delayMs: number = 50): Promise<void> {
+  await focusConsole(page);
+  await page.locator(CONSOLE_INPUT).click({ force: true });
+  await sleep(300);
+  await page.locator(CONSOLE_INPUT)
+    .pressSequentially(text, { delay: delayMs, timeout: typingTimeout(text, delayMs) });
+}
+
+export async function clearConsole(page: Page): Promise<void> {
+  await focusConsole(page);
+  await page.locator(CONSOLE_INPUT).click({ force: true });
+  await sleep(200);
+  await page.keyboard.press('Control+l');
+  await sleep(500);
+}
+
+export async function closeAllBuffersWithoutSaving(page: Page): Promise<void> {
+  await documentCloseAllNoSave(page);
+  await sleep(1000);
+}
+
+export async function getEnvironmentVersions(page: Page): Promise<EnvironmentVersions> {
+  return getVersion(page);
+}
+
+export async function goToLine(page: Page, line: number): Promise<void> {
+  await executeCommand(page, 'goToLine');
+  await sleep(500);
+  await page.keyboard.type(String(line));
+  await page.keyboard.press('Enter');
+  await sleep(500);
+}
+
+/**
+ * The first R error in `text`, flattened onto one line, or null. R formats
+ * errors as `Error in <call> :\n  <message>`, so the indented continuation
+ * lines are taken along with the header.
+ */
+export function findRError(text: string): string | null {
+  const match = text.match(/(?:Error in|Error:)[^\n]*(?:\n[ \t]+[^\n]*)*/);
+  return match ? match[0].replace(/\n+/g, ' | ').trim() : null;
+}
+
+/**
+ * The first R error after the last occurrence of `marker` in `text`, or null
+ * when there is none, or no marker to scan from. The console buffer is shared
+ * with everything else that ran in the worker, so a command's errors are only
+ * those that follow a marker the command itself put there.
+ *
+ * Lines at R's continuation prompt are skipped: the session echoes each line
+ * of a multi-line command as R reads it, so all but the first land after the
+ * marker, and they are the command's source rather than its output.
+ */
+export function findRErrorAfter(text: string, marker: string): string | null {
+  const at = text.lastIndexOf(marker);
+  if (at < 0)
+    return null;
+
+  const output = text.slice(at + marker.length).split('\n').filter((line) => !line.startsWith('+ '));
+  return findRError(output.join('\n'));
+}
+
+let checkedCommandCount = 0;
+
+// The session truncates a console input line to what R's read buffer holds
+// (RStdCallbacks.cpp: CONSOLE_BUFFER_SIZE less the newline and terminator).
+const MAX_CONSOLE_LINE_BYTES = 4094;
+
+/**
+ * An upper bound on the bytes the session hands R for one input line. The
+ * line is converted to R's native encoding first, and on Windows a character
+ * the code page lacks becomes an escape of up to ten bytes. Counted per UTF-16
+ * code unit, since one conversion path escapes each surrogate half on its own.
+ */
+function consoleLineBytes(line: string): number {
+  let bytes = 0;
+  for (let i = 0; i < line.length; i++)
+    bytes += line.charCodeAt(i) < 0x80 ? 1 : 10;
+
+  return bytes;
+}
+
+/**
+ * executeInConsole only confirms that R reached a new prompt, which an R error
+ * does just as readily as a success. Run the command, then scrape the output
+ * it produced for an error header, so a failed setup step fails here rather
+ * than as a later unrelated-looking timeout.
+ *
+ * Only this command's output is scanned: the console buffer is shared with
+ * everything else that ran in this worker, and an error an earlier spec left
+ * in it would otherwise fail every later call (run 42694353147, Windows
+ * shard 3). The command is prefixed with a cat() of a unique marker, and the
+ * scan starts after it. Comparing before/after snapshots of the console text
+ * cannot place that boundary reliably: the scrollback trims from the top, and
+ * output can repeat.
+ */
+export async function executeInConsoleChecked(
+  page: Page,
+  command: string,
+  opts: { timeout?: number } = {},
+): Promise<void> {
+  // The marker is assembled by R, so the command's echo does not contain it
+  // and its only occurrence is the cat() output, just ahead of the command's
+  // own. That also keeps the echo's first line out of the scan.
+  const id = `${Date.now()}_${checkedCommandCount++}__`;
+  const marker = `__CHECKED_${id}`;
+  const prefix = `cat(paste0("__CHECKED_", "${id}\\n")); `;
+
+  const label = `R error running "${command.slice(0, 120)}"`;
+
+  // A truncated line can lose its closing delimiters after the marker has
+  // printed, which would read as a clean run of a command that never ran.
+  const longest = Math.max(...(prefix + command).split('\n').map(consoleLineBytes));
+  if (longest > MAX_CONSOLE_LINE_BYTES) {
+    throw new Error(
+      `${label}: a line of up to ${longest} bytes exceeds the console's ${MAX_CONSOLE_LINE_BYTES}-byte input limit`,
+    );
+  }
+
+  await executeInConsole(page, prefix + command, { wait: true, timeout: opts.timeout });
+  const text = await page.locator(CONSOLE_SCROLLBACK).innerText();
+
+  // The console evaluates a line one statement at a time, so the marker is
+  // written even when the command itself fails to parse. No marker means the
+  // command cleared the console or wrote enough to push the marker out of the
+  // scrollback, and its result cannot be vouched for.
+  if (!text.includes(marker)) {
+    const tail = text.slice(-300);
+    const detail = findRError(tail) ?? `console tail: ${tail.replace(/\n+/g, ' | ').trim()}`;
+    throw new Error(`${label}: output marker not found; ${detail}`);
+  }
+
+  const error = findRErrorAfter(text, marker);
+  if (error)
+    throw new Error(`${label}: ${error}`);
+}

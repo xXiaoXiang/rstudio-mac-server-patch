@@ -1,0 +1,900 @@
+import type { Locator, Page } from 'playwright';
+import { expect } from '@playwright/test';
+import { ChatPane } from '../pages/chat_pane.page';
+import { ConsolePaneActions } from './console_pane.actions';
+import { sleep } from '../utils/constants';
+import { executeCommand } from '../utils/commands';
+import {
+  failUnlessAiServiceGone,
+  skipForAiServiceFailure,
+  skipIfAiServiceGone,
+} from '../utils/ai-credentials';
+
+// The stop button flickers off between streaming phases -- notably in the
+// approval -> tool-execution handoff right after clicking Allow -- so a single
+// hidden sample does not mean the turn is done. isTurnIdle() requires it to
+// stay hidden across TURN_IDLE_SAMPLES samples, spanning
+// (TURN_IDLE_SAMPLES - 1) * TURN_IDLE_SAMPLE_INTERVAL_MS of observation.
+const TURN_IDLE_SAMPLES = 4;
+const TURN_IDLE_SAMPLE_INTERVAL_MS = 500;
+
+// How long Send may stay disabled after a prompt is typed. It enables at once
+// whenever the assistant has a model to send with.
+const SEND_ENABLED_TIMEOUT_MS = 15000;
+
+// Floor for waitForResponse's settle window, used when the caller's own
+// budget has already been spent waiting for the response to appear.
+const MIN_TURN_SETTLE_MS = 30000;
+
+// How long to let an in-flight close of the conversation history panel finish
+// before treating the panel as one that has to be toggled shut.
+const PANEL_AUTO_CLOSE_TIMEOUT_MS = 1000;
+
+// The panel can read hidden for a frame while a re-open is still in flight --
+// a toggle click landing as an auto-close finishes produces exactly that. So
+// closeConversationHistory requires it to stay hidden across
+// PANEL_CLOSED_SAMPLES samples, spanning
+// (PANEL_CLOSED_SAMPLES - 1) * PANEL_CLOSED_SAMPLE_INTERVAL_MS of observation.
+const PANEL_CLOSED_SAMPLES = 3;
+const PANEL_CLOSED_SAMPLE_INTERVAL_MS = 200;
+
+// How Posit Assistant words a request that failed on the far side of the
+// provider call (databot's formatApiError). The message is appended to the
+// reply being streamed, so it ends the reply's last line -- possibly glued to
+// partial text, hence end-anchored only.
+//
+// Service-side: the Posit AI service answered, with a failure of its own --
+// HTTP 429, 500, another 5xx, 529.
+const SERVICE_FAILURE_MESSAGES = [
+  /Too many requests\. Please wait a moment and try again\.$/,
+  /The AI service encountered an internal error\. Please try again\.$/,
+  /The AI service is temporarily unavailable \(HTTP 5\d\d\)\. Please try again\.$/,
+  /The AI model is currently overloaded\. Please try again in a few moments\.$/,
+];
+
+// Network-side: a request that failed without any HTTP status. Bare
+// "Error making request" is how databot shows a failure it can say nothing
+// more about -- in run 34994843398, retried connect timeouts to
+// gateway.posit.ai. Otherwise a detail follows, e.g. the Node network error
+// ("Error making request: read ETIMEDOUT", from the same run). An error
+// databot doesn't recognize as an API failure is shown raw instead, as "[An
+// error occurred: ...]" -- a tool crash as readily as a network error, so only
+// the network details below count. None of this proves the far side failed;
+// skipIfProviderFailed has the runner re-probe the service before skipping.
+const FAILED_REQUEST_MESSAGE = /(?:Error making request(?:: (.+))?|\[An error occurred: (.+)\])$/;
+
+const NETWORK_ERROR_DETAIL =
+  /^(?:terminated|fetch failed|socket hang up|other side closed)$|\b(?:E(?:TIMEDOUT|CONNRESET|CONNREFUSED|CONNABORTED|NOTFOUND|AI_AGAIN|NETUNREACH|HOSTUNREACH|PIPE)|UND_ERR_[A-Z_]+)\b|Cannot connect to API|Connect Timeout Error/;
+
+// A network error on a loopback address is the assistant failing to reach
+// something local -- RStudio's own endpoints -- which no outage explains.
+const LOOPBACK_DETAIL = /\b(?:127\.\d+\.\d+\.\d+|localhost)\b|\[?::1\]?:\d+/;
+
+// Anthropic's streamed overloaded_error, relayed through the Posit AI gateway
+// mid-response: an SSE error event with no HTTP status of its own.
+const SERVICE_ERROR_DETAIL = /^Overloaded$/;
+
+/**
+ * A request to Posit AI that failed, as the assistant rendered it at the end
+ * of a reply.
+ *
+ * `side` is 'service' when the service answered with a failure of its own,
+ * 'network' when the request failed without any HTTP status.
+ */
+export interface ProviderFailure {
+  message: string;
+  side: 'service' | 'network';
+}
+
+/**
+ * Recognize Posit AI reporting that a request failed on its side, from the
+ * rendered text of a chat message. Returns null for anything else --
+ * including request failures a product change could cause (an HTTP 4xx, a
+ * rejected tool schema), which stay real failures.
+ */
+export function providerFailure(messageText: string): ProviderFailure | null {
+  const lines = messageText.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  const lastLine = lines[lines.length - 1] ?? '';
+
+  if (SERVICE_FAILURE_MESSAGES.some((pattern) => pattern.test(lastLine))) {
+    return { message: lastLine, side: 'service' };
+  }
+
+  const match = FAILED_REQUEST_MESSAGE.exec(lastLine);
+  if (match === null) {
+    return null;
+  }
+
+  const detail = match[1] ?? match[2];
+  if (detail !== undefined && LOOPBACK_DETAIL.test(detail)) {
+    return null;
+  }
+  if (detail === undefined || NETWORK_ERROR_DETAIL.test(detail)) {
+    // "[An error occurred]" always carries a detail, so a bare match is the
+    // bare "Error making request".
+    return { message: match[0], side: 'network' };
+  }
+  if (SERVICE_ERROR_DETAIL.test(detail)) {
+    return { message: match[0], side: 'service' };
+  }
+  return null;
+}
+
+export class ChatPaneActions {
+  readonly page: Page;
+  readonly chatPane: ChatPane;
+  readonly consolePaneActions: ConsolePaneActions;
+
+  constructor(page: Page, consolePaneActions: ConsolePaneActions) {
+    this.page = page;
+    this.chatPane = new ChatPane(page);
+    this.consolePaneActions = consolePaneActions;
+  }
+
+  async openChatPane(): Promise<void> {
+    await executeCommand(this.page, 'activateChat');
+    // Wait for the chat iframe to be present rather than blind-sleeping.
+    // The iframe element appears as soon as the pane is activated, even
+    // before its contents have loaded -- which is what dismissSetupPrompts
+    // and other callers actually need to begin polling for their own
+    // signals (install button, chatRoot, etc.).
+    await expect(this.page.locator("iframe[title='Posit Assistant']"))
+      .toBeVisible({ timeout: 15000 });
+  }
+
+  async dismissSetupPrompts(): Promise<void> {
+    try {
+      await this.settleSetupPrompts();
+    } catch (err) {
+      // Installing, updating, and signing in all need Posit AI's hosts; the
+      // install manifest alone comes from cdn.posit.co. When that download
+      // timed out (run 34994843398), the assistant never installed and the
+      // pane sat at "Posit Assistant Not Enabled" until waitForChatReady gave
+      // up. Called from a beforeAll, the skip covers the whole suite.
+      await failUnlessAiServiceGone('positai', err);
+    }
+  }
+
+  private async settleSetupPrompts(): Promise<void> {
+    // openChatPane() only waits for the iframe element, not its contents. The
+    // setup prompts (Install / Update) and the real chat app all render
+    // asynchronously after a backend install-status round-trip, so a single
+    // isVisible() snapshot here races that render: when Posit Assistant is not
+    // installed, the "Not Installed" view (with its Install button) has not
+    // appeared yet, the snapshot reads false, and we fall through to
+    // waitForChatReady() -- which then waits 30s for a composer that will never
+    // exist. Poll until one terminal setup state is reached instead.
+    const state = await this.waitForSetupState();
+
+    if (state === 'install') {
+      await this.chatPane.installBtn.click();
+      console.log('Clicked Install button -- waiting for installation...');
+      await expect(this.chatPane.chatRoot).toBeVisible({ timeout: 60000 });
+      await expect(this.chatPane.chatInput).toBeVisible({ timeout: 30000 });
+    } else if (state === 'update') {
+      await this.chatPane.updateBtn.click();
+      console.log('Clicked Update on update prompt -- updating Posit Assistant');
+      await expect(this.chatPane.chatRoot).toBeVisible({ timeout: 30000 });
+    }
+
+    // The TrustOverlay and the chat input both render asynchronously after
+    // the chat app loads; waitForChatReady polls for either path through the
+    // workspace-trust dialog or a clean editable composer, so callers don't
+    // need to handle it themselves.
+    await this.waitForChatReady();
+  }
+
+  /**
+   * Poll the chat iframe until it settles into a terminal setup state:
+   * an Install prompt ('install'), an Update prompt ('update'), or the real
+   * chat app having loaded ('ready').
+   *
+   * The chat app mounts at #root, which the plain-HTML "Not Installed" /
+   * "Update Available" views never contain, so its presence reliably means
+   * installation is complete and only trust/sign-in (handled by
+   * waitForChatReady) may remain. Install is checked before update because the
+   * downgrade variant of the update view also carries an "Install ..." button.
+   *
+   * The timeout must exceed the backend manifest-fetch bound that gates which
+   * view renders: chat_check_for_updates can run a manifest download for up to
+   * kManifestDeadlineSeconds (currently 30s, SessionChat.cpp) before any prompt
+   * appears, so a shorter window could give up just before a slow-manifest
+   * Install prompt renders. We poll past that bound with margin.
+   *
+   * On timeout (a genuine stall past the manifest bound), returns 'ready' so
+   * the caller defers to waitForChatReady, whose sign-in vs. stalled error is
+   * more actionable than anything we'd raise here.
+   */
+  private async waitForSetupState(
+    timeout: number = 40000
+  ): Promise<'install' | 'update' | 'ready'> {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await this.chatPane.installBtn.isVisible().catch(() => false)) {
+        return 'install';
+      }
+      if (await this.chatPane.updateBtn.isVisible().catch(() => false)) {
+        return 'update';
+      }
+      if (await this.chatPane.chatRoot.isVisible().catch(() => false)) {
+        return 'ready';
+      }
+      await sleep(500);
+    }
+    // Not a positive signal: waitForChatReady() (which dismissSetupPrompts always
+    // calls next) is the real readiness gate and throws on a genuine stall. Keep
+    // that call if this code is ever refactored, or this becomes a silent failure.
+    return 'ready';
+  }
+
+  /**
+   * Wait until the chat pane is actually usable -- i.e., the message composer
+   * is editable. Until that point, sending a message is a guaranteed failure
+   * even when chatRoot is visible, so this is the only real "ready" signal.
+   *
+   * Polls (a) clicking through any trust dialog that appears late and (b)
+   * failing fast with an actionable message if a Sign-In button shows up,
+   * since credentials are provisioned by the auth.setup project (the OAuth
+   * sign-in flow when POSIT_EMAIL/POSIT_PASSWORD are set, else a copy of the
+   * local token store).
+   * The local Posit Assistant rotates the refresh token in its credential
+   * store (~/.posit/ai/auth/data.json), so copied tokens can be invalidated
+   * between auth setup and test execution; surfacing that as "sign in locally
+   * and re-run" is more useful than the cryptic "input not editable after 15s"
+   * downstream timeout each test would otherwise hit.
+   *
+   * The TrustOverlay component in databot renders as a role="dialog" with the
+   * primary button; the RestrictedModeBadge also has a "Trust this workspace"
+   * affordance, so we explicitly target the dialog first (it's the modal
+   * blocker) and fall back to any visible match.
+   */
+  async waitForChatReady(timeout: number = 30000): Promise<void> {
+    const deadline = Date.now() + timeout;
+    const overlayTrustBtn = this.chatPane.frame.locator(
+      "[role='dialog'] button:has-text('Trust this workspace')"
+    );
+
+    let iter = 0;
+    while (Date.now() < deadline) {
+      iter += 1;
+
+      if (await this.chatPane.isChatInputReady()) {
+        if (iter > 1) console.log(`waitForChatReady: input editable after ${iter} iterations`);
+        return;
+      }
+
+      if (await overlayTrustBtn.isVisible().catch(() => false)) {
+        console.log('waitForChatReady: clicking trust overlay button');
+        await this.grantWorkspaceTrust(overlayTrustBtn, deadline);
+        continue;
+      }
+
+      const anyTrustBtn = this.chatPane.trustWorkspaceBtn.first();
+      if (await anyTrustBtn.isVisible().catch(() => false)) {
+        console.log('waitForChatReady: clicking fallback trust button');
+        await this.grantWorkspaceTrust(anyTrustBtn, deadline);
+        continue;
+      }
+
+      await sleep(500);
+    }
+
+    // A trust grant can consume the tail of the budget, leaving the loop no
+    // iteration in which to observe its result. Sample the real readiness
+    // signal once more before calling this a failure.
+    if (await this.chatPane.isChatInputReady()) {
+      console.log('waitForChatReady: input editable at deadline');
+      return;
+    }
+
+    // Deadline expired -- pick the most actionable error message.
+    // Check the trust overlay first: it renders over the sign-in panel
+    // without hiding it, so the sign-in check below would otherwise win and
+    // blame credentials for a trust grant that never landed.
+    if (await overlayTrustBtn.isVisible().catch(() => false)) {
+      throw new Error(
+        `waitForChatReady: the workspace-trust dialog was still showing after ${timeout}ms. ` +
+        'Clicking "Trust this workspace" did not complete the trustWorkspace round-trip; ' +
+        'check the chat iframe console for a "Failed to trust workspace" error.'
+      );
+    }
+
+    // The Sign-In affordance can flash briefly during backend startup while
+    // credentials are still being loaded from the token store, so we only
+    // treat it as a hard failure when it's still visible at the end of the
+    // polling window.
+    if (await this.chatPane.signInBtn.first().isVisible().catch(() => false)) {
+      throw new Error(
+        'Posit Assistant requires sign-in despite auth.setup provisioning credentials. ' +
+        'If the token store was copied from the local machine, sign in to Posit AI locally ' +
+        '(token store ~/.posit/ai/auth/data.json) and re-run; ' +
+        'if POSIT_EMAIL/POSIT_PASSWORD are set for the sign-in flow, check them and the auth-setup log.'
+      );
+    }
+
+    throw new Error(
+      `waitForChatReady: chat input still not editable after ${timeout}ms ` +
+      `(no Sign-In button, no Trust dialog). Chat pane initialization may ` +
+      `have stalled.`
+    );
+  }
+
+  /**
+   * Click a "Trust this workspace" affordance and wait for it to go away.
+   *
+   * The overlay disables both of its buttons for as long as the trustWorkspace
+   * round-trip runs -- around two seconds, since the assistant tears down and
+   * rebuilds the conversation view once trust is granted -- and only then
+   * unmounts. Polling back around after a fixed sleep lands inside that
+   * window: the overlay is still visible, so we click again, and that second
+   * click waits on a button that is disabled and about to detach until it
+   * times out. Waiting for the button to disappear keeps it to one click per
+   * appearance.
+   *
+   * Both steps are best-effort. The overlay can also be torn down by a trust
+   * grant we didn't make (leaving the click with no element), and a failed
+   * grant leaves it up with its buttons re-enabled and an inline error -- in
+   * which case the caller's next poll simply retries. The caller's deadline,
+   * not this click, is what fails the test, so neither step may outlive it:
+   * an attempt begun just before the deadline would otherwise overrun it by
+   * its full budget.
+   */
+  private async grantWorkspaceTrust(trustBtn: Locator, deadline: number): Promise<void> {
+    // Playwright reads a timeout of 0 as "wait forever", so an exhausted
+    // budget has to skip the step outright rather than pass 0 through.
+    const budget = (max: number) => Math.min(max, deadline - Date.now());
+    try {
+      const clickBudget = budget(5000);
+      if (clickBudget <= 0) return;
+      await trustBtn.click({ timeout: clickBudget });
+
+      const hiddenBudget = budget(10000);
+      if (hiddenBudget <= 0) return;
+      await trustBtn.waitFor({ state: 'hidden', timeout: hiddenBudget });
+    } catch (err) {
+      const [firstLine] = String(err instanceof Error ? err.message : err).split('\n');
+      console.log(`waitForChatReady: trust click did not settle (${firstLine}); re-polling`);
+    }
+  }
+
+  async clickAllowOnceIfPresent(): Promise<void> {
+    if (await this.chatPane.allowBtn.isVisible()) {
+      await this.chatPane.allowBtn.click();
+      console.log('Clicked "Allow" permission button');
+    }
+  }
+
+  async allowExecuteCodeForSession(): Promise<void> {
+    // Wait for the Allow dialog to appear (dropdown trigger next to Allow button)
+    await expect(this.chatPane.allowDropdownTrigger).toBeVisible({ timeout: 60000 });
+
+    // Click the chevron to open the dropdown menu; the toBeVisible below
+    // polls for the menu item, replacing a blind post-click sleep.
+    await this.chatPane.allowDropdownTrigger.click();
+
+    // Click "Allow for this session"
+    await expect(this.chatPane.allowForSessionItem).toBeVisible({ timeout: 5000 });
+    await this.chatPane.allowForSessionItem.click();
+    console.log('Granted "Allow for this session" permission');
+  }
+
+  /**
+   * Answer a pending AskUser question: select the first option whose
+   * accessible name matches `option`, then submit.
+   *
+   * An option's accessible name is its label followed by its description, and
+   * the option set is written by the model, so a loose matcher can land on the
+   * wrong choice -- picking "No, don't proceed" for a matcher meant to accept.
+   * Anchor `option` to the start of the label. Matching nothing is a loud
+   * failure here (with the options listed) precisely so it can't degrade into
+   * silently answering the opposite of what the caller intended.
+   */
+  async answerPendingQuestion(option: RegExp | string): Promise<void> {
+    const allChoices = this.chatPane.frame.getByRole('radio');
+    await expect(allChoices.first()).toBeVisible({ timeout: 10000 });
+
+    const choices = this.chatPane.frame.getByRole('radio', { name: option });
+    if ((await choices.count()) === 0) {
+      throw new Error(
+        `No pending-question option matched ${option}. The assistant offered: ` +
+        `${JSON.stringify(await allChoices.allInnerTexts())}. Widen the matcher ` +
+        'if one of these is the intended answer.'
+      );
+    }
+
+    await choices.first().click({ timeout: 5000 });
+    // Submit stays disabled until an option is selected, so this also
+    // confirms the click registered on the radio.
+    await expect(this.chatPane.submitAnswersBtn).toBeEnabled({ timeout: 5000 });
+    await this.chatPane.submitAnswersBtn.click();
+    // The form unmounts once the answer lands and the turn resumes; waiting
+    // here keeps the caller's poll from re-entering a half-torn-down form.
+    await expect(this.chatPane.pendingQuestions).toBeHidden({ timeout: 15000 });
+    console.log(`Answered pending assistant question with "${option}"`);
+  }
+
+  /**
+   * Poll in a loop, handling Allow dialogs (session-level then fallback),
+   * until the provided condition returns true or the timeout expires.
+   *
+   * `answerQuestion` matches the option to pick if the assistant pauses on an
+   * AskUser question. Without it, an unanswered question is a hard error
+   * rather than a spin to the timeout: the turn cannot finish on its own, so
+   * the caller must either answer or reword the prompt.
+   *
+   * A turn that ends with Posit AI reporting a failure on its side skips the
+   * test (see skipIfProviderFailed), unless that failure was already showing
+   * when the poll began: it then belongs to a turn that had ended, not to the
+   * one being waited on. It is ignored only while it is still the last
+   * message -- a caller polling right after clicking send can get here before
+   * its own message has rendered, and the turn it started is still watched. A
+   * failure that is not skipped is looked at once; isDone and the timeout
+   * decide.
+   *
+   * `watchForProviderFailure: false` turns that off, for a wait on a turn the
+   * caller did not send (see sendChatMessage).
+   */
+  async pollWithAllowDialogs(
+    isDone: () => Promise<boolean>,
+    timeout: number = 120000,
+    answerQuestion?: RegExp | string,
+    options: { watchForProviderFailure?: boolean } = {}
+  ): Promise<void> {
+    const deadline = Date.now() + timeout;
+    let watchForProviderFailure = options.watchForProviderFailure ?? true;
+
+    // Count before text: a message landing between the two reads then counts
+    // as new, which errs toward watching it.
+    const initialCount = await this.chatPane.getMessageCount();
+    let staleFailure = providerFailure(await this.chatPane.lastMessageText()) !== null;
+
+    while (Date.now() < deadline) {
+      if (await this.chatPane.isPendingQuestionVisible()) {
+        if (!answerQuestion) {
+          throw new Error(
+            'Posit Assistant paused on a question and no answer was configured: ' +
+            `"${await this.chatPane.pendingQuestions.innerText()}". ` +
+            'Pass answerQuestion, or reword the prompt so the assistant acts ' +
+            'without asking.'
+          );
+        }
+        await this.answerPendingQuestion(answerQuestion);
+        continue;
+      }
+
+      // Grant session-level permission if the dropdown is available
+      if (await this.chatPane.isAllowDropdownVisible()) {
+        await sleep(500);
+        await this.chatPane.allowDropdownTrigger.click();
+        await sleep(500);
+        try {
+          await this.chatPane.allowForSessionItem.click({ timeout: 5000 });
+          console.log('Granted "Allow for this session" permission');
+          await sleep(1000);
+          continue;
+        } catch {
+          console.log('Failed to click session permission menu item');
+        }
+      }
+
+      // Fallback: click Allow once
+      if (await this.chatPane.isAllowButtonVisible()) {
+        await sleep(500);
+        await this.chatPane.allowBtn.click();
+        console.log('Clicked "Allow once" as fallback');
+        await sleep(1000);
+        continue;
+      }
+
+      // A provider failure ends the turn short of whatever isDone waits for;
+      // catch it here rather than after the full timeout.
+      if (staleFailure && (await this.chatPane.getMessageCount()) !== initialCount) {
+        staleFailure = false;
+      }
+      if (watchForProviderFailure && !staleFailure && (await this.skipIfProviderFailed())) {
+        watchForProviderFailure = false;
+      }
+
+      // Check caller's condition
+      if (await isDone()) {
+        return;
+      }
+
+      await sleep(1000);
+    }
+
+    await failUnlessAiServiceGone(
+      'positai',
+      new Error(`pollWithAllowDialogs timed out after ${timeout}ms`)
+    );
+  }
+
+  /**
+   * Skip the current test when the conversation's finished turn ends with
+   * Posit AI reporting that a request failed on its side (see
+   * providerFailure): an outage or an overloaded service is not a product
+   * bug, and letting the caller assert against "Error making request" only
+   * produces a misleading failure.
+   *
+   * A service-side failure skips outright. A network-side one skips only when
+   * the service is unreachable from the runner too: the request leaves from
+   * the assistant's backend, which RStudio launches, so a failure the runner
+   * can't reproduce may be ours. Whatever isn't skipped is logged and left to
+   * the caller's own checks -- some pass on an error reply (a message count
+   * that grew, a file a tool wrote before the failure).
+   *
+   * Only a finished turn counts: after a failed request the assistant can
+   * still run the tools that step asked for and carry on. Returns whether a
+   * failure was found and not skipped.
+   */
+  async skipIfProviderFailed(): Promise<boolean> {
+    const failure = providerFailure(await this.chatPane.lastMessageText());
+    if (failure === null || !(await this.isTurnIdle())) {
+      return false;
+    }
+
+    const quoted = JSON.stringify(failure.message);
+    let notSkipped: string;
+    if (failure.side === 'service') {
+      skipForAiServiceFailure('positai', quoted);
+      notSkipped = 'PW_AI_AUTH_STRICT is set';
+    } else {
+      await skipIfAiServiceGone('positai');
+      notSkipped = 'every Posit AI host still answers from the test runner, or PW_AI_AUTH_STRICT is set';
+    }
+
+    console.warn(
+      `Posit AI request failed: ${quoted}. Not skipped (${notSkipped}); leaving the ` +
+      "outcome to the test's own checks. If it fails, positai.log (attached on Desktop " +
+      "and external-server runs) has the assistant backend's side of the failure."
+    );
+    return true;
+  }
+
+  /**
+   * Whether the assistant has finished its turn -- the single predicate every
+   * "wait for the response" poll in the suite should use.
+   *
+   * The composer shows the stop button in place of send for as long as the
+   * turn is active, so a hidden stop button is the completion signal. It is
+   * only trustworthy when sampled repeatedly (see TURN_IDLE_SAMPLES): the
+   * button flickers off mid-turn, and one sample landing in that gap reports a
+   * still-streaming turn as done. Returns as soon as the button is seen, so
+   * this stays cheap while a turn is streaming and pays the full sampling
+   * window only once the turn looks finished.
+   *
+   * The chat root is checked alongside it because isStopButtonVisible()
+   * reports any failed lookup as "not visible": if the assistant iframe is
+   * torn down mid-turn, its stop button is missing for a reason that is the
+   * opposite of idle, and without this the streak would complete on it.
+   */
+  async isTurnIdle(): Promise<boolean> {
+    for (let sample = 0; sample < TURN_IDLE_SAMPLES; sample++) {
+      if (sample > 0)
+        await sleep(TURN_IDLE_SAMPLE_INTERVAL_MS);
+
+      if (!(await this.chatPane.chatRoot.isVisible().catch(() => false)))
+        return false;
+
+      if (await this.chatPane.isStopButtonVisible())
+        return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Send a message, waiting out any still-running previous turn first.
+   *
+   * `answerQuestion` matches the option to pick if that previous turn is
+   * parked on an AskUser question.
+   *
+   * Returns the message count as of that wait finishing -- the baseline to
+   * hand waitForResponse. A caller that samples the count itself, before this
+   * call, reads it while the previous turn may still be appending to the
+   * conversation, and then credits this turn with that growth.
+   */
+  async sendChatMessage(
+    text: string,
+    answerQuestion?: RegExp | string
+  ): Promise<number> {
+    await expect(this.chatPane.chatInput).toBeVisible({ timeout: 15000 });
+
+    // The previous turn may still be streaming -- the composer shows the stop
+    // button in place of send until the whole turn (including any post-tool
+    // continuation) completes, which can take well over 15s of model latency,
+    // and a turn parked on an approval stays active until it is granted.
+    // Wait the turn out here, before typing: text typed while a turn runs is
+    // not reliably kept or dropped when it ends.
+    //
+    // No provider-failure watch: waitForResponse can return with its turn
+    // still running, so the turn being waited out may be a previous test's,
+    // and its failing must not skip a test that has yet to send anything.
+    await this.pollWithAllowDialogs(
+      () => this.isTurnIdle(),
+      60000,
+      answerQuestion,
+      { watchForProviderFailure: false }
+    );
+
+    const baseline = await this.chatPane.getMessageCount();
+
+    await expect(this.chatPane.chatInput)
+      .toHaveAttribute('contenteditable', 'true', { timeout: 15000 });
+
+    // A leftover draft would otherwise prefix this message, and the assistant
+    // may then decline to act on the mangled request.
+    await this.chatPane.clearMessage();
+    await expect(this.chatPane.chatInput).toHaveText('');
+    await this.chatPane.typeMessage(text);
+
+    await expect(this.chatPane.sendBtn).toBeVisible({ timeout: 15000 });
+    await this.waitForSendEnabled();
+    await this.chatPane.sendBtn.click();
+
+    return baseline;
+  }
+
+  /**
+   * Wait for Send to enable after typing. It stays disabled while the assistant
+   * has no model, which a signed-in session reaches when Posit AI briefly can't
+   * be read: the assistant then shows its provider-setup overlay until the
+   * backend pushes an update (posit-dev/assistant#2850). Treat that as an outage
+   * when the service is unreachable from the runner too, and otherwise fail
+   * naming the state rather than with a bare click timeout.
+   */
+  private async waitForSendEnabled(): Promise<void> {
+    try {
+      await expect(this.chatPane.sendBtn).toBeEnabled({ timeout: SEND_ENABLED_TIMEOUT_MS });
+    } catch (err) {
+      // Should Send be gone, keep the timeout above rather than the lookup's own.
+      const reason = await this.chatPane.sendDescription().catch(() => '');
+      if (!/pick a model/i.test(reason)) {
+        throw err;
+      }
+      await this.skipIfServiceGone();
+      throw new Error(
+        `Send stayed disabled for ${SEND_ENABLED_TIMEOUT_MS}ms because Posit Assistant has no ` +
+        'model to send with ("Please pick a model"). Where positai.log is attached ' +
+        '(Desktop and external-server runs), it shows whether the backend fetched models.'
+      );
+    }
+  }
+
+  /** Skip the test when Posit AI is unreachable from the runner (see skipIfAiServiceGone). */
+  async skipIfServiceGone(): Promise<void> {
+    await skipIfAiServiceGone('positai');
+  }
+
+  async waitForResponse(initialCount: number, timeout: number = 60000): Promise<number> {
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      if (await this.chatPane.isAllowButtonVisible()) {
+        await sleep(1000);
+        await this.chatPane.allowBtn.click();
+        console.log('Clicked "Allow once" during response wait');
+        await sleep(1000);
+      }
+
+      const currentCount = await this.chatPane.getMessageCount();
+      if (currentCount > initialCount) {
+        // Settling gets whatever is left of the caller's budget, never less
+        // than the floor. Deriving it from `timeout` is the point: a caller
+        // that raised its budget for slow turns means the whole turn, not
+        // just the arrival of its first message.
+        const settleStart = Date.now();
+        const readyDeadline = Math.max(deadline, settleStart + MIN_TURN_SETTLE_MS);
+        let idle = false;
+        while (!idle && Date.now() < readyDeadline) {
+          if (await this.chatPane.isAllowButtonVisible()) {
+            await sleep(1000);
+            await this.chatPane.allowBtn.click();
+            console.log('Clicked "Allow" after response arrived');
+            await sleep(1000);
+            continue;
+          }
+
+          idle = await this.isTurnIdle();
+          if (!idle)
+            await sleep(TURN_IDLE_SAMPLE_INTERVAL_MS);
+        }
+
+        // Falling out of that loop on the deadline means the turn never
+        // settled. Say so: the caller is about to assert against a response
+        // that may still be streaming, and silently returning here is what
+        // made this class of flake unreadable in the report.
+        if (!idle) {
+          console.warn(
+            'waitForResponse: the assistant turn was still active after ' +
+            `${Math.round((Date.now() - settleStart) / 1000)}s; ` +
+            'reading the response while it may still be streaming'
+          );
+        }
+
+        const finalCount = await this.chatPane.getMessageCount();
+        console.log(`Message count: ${initialCount} → ${finalCount}`);
+        await this.skipIfProviderFailed();
+        return finalCount;
+      }
+
+      await sleep(500);
+    }
+
+    const finalCount = await this.chatPane.getMessageCount();
+    if (finalCount > initialCount) {
+      console.log(`Message count: ${initialCount} → ${finalCount}`);
+      await this.skipIfProviderFailed();
+      return finalCount;
+    }
+
+    return await failUnlessAiServiceGone(
+      'positai',
+      new Error(`Timed out waiting for response. Message count stuck at ${finalCount} (expected > ${initialCount})`)
+    );
+  }
+
+  async getPositAssistantVersion(): Promise<string> {
+    if (!(await this.chatPane.moreBtn.isVisible())) {
+      return 'unknown';
+    }
+    try {
+      await this.chatPane.moreBtn.click();
+      await this.chatPane.aboutItem.first().click();
+
+      await this.chatPane.dialogOverlay.waitFor({ state: 'visible', timeout: 5000 });
+      const dialogText = await this.chatPane.dialogOverlay.innerText();
+
+      await this.page.keyboard.press('Escape');
+
+      const versionMatch = dialogText.match(/(\d+\.\d+\.\d+)/);
+      return versionMatch?.[1] ?? 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  async startNewConversation(): Promise<void> {
+    const messageCount = await this.chatPane.getMessageCount();
+    if (messageCount === 0) {
+      return; // Already in a fresh conversation
+    }
+    await this.chatPane.newConversationBtn.click({ timeout: 10000 });
+    // Poll for the conversation to reset (message list emptied) instead
+    // of blind-sleeping after the click.
+    await expect.poll(() => this.chatPane.getMessageCount(), { timeout: 10000 }).toBe(0);
+  }
+
+  /**
+   * Rename the current conversation via the UI context menu.
+   *
+   * Verifies the rename actually took effect before returning (#18363): the
+   * history panel is closed and reopened so the list reflects the new name,
+   * and the renamed item is asserted present. Leaves the history panel closed.
+   *
+   * @param name The new name for the conversation
+   */
+  async renameConversation(name: string): Promise<void> {
+    await this.openConversationHistory();
+
+    // Get the first (current/active) conversation item. Each toBeVisible
+    // below polls, replacing what used to be a chain of blind sleeps
+    // between hover, click, menu-item click, and input fill.
+    const activeConvItem = this.chatPane.conversationListItem.first();
+    await expect(activeConvItem).toBeVisible({ timeout: 5000 });
+
+    // Hover over the conversation item to reveal the menu button
+    await activeConvItem.hover();
+
+    // Look for the menu button (three dots) within the conversation item
+    const menuBtn = activeConvItem.locator('button, [role="button"]').first();
+    await expect(menuBtn).toBeVisible({ timeout: 5000 });
+    // force: true because GWT console DOM elements report overlapping coordinates
+    // even though the panes are visually separate
+    await menuBtn.click({ force: true });
+
+    // Click the Rename option from the context menu
+    const renameItem = this.chatPane.getRenameMenuItem();
+    await expect(renameItem).toBeVisible({ timeout: 5000 });
+    await renameItem.click();
+
+    // The input field should now be visible and editable
+    const nameInput = this.chatPane.getConversationNameInput();
+    await expect(nameInput).toBeVisible({ timeout: 5000 });
+    await expect(nameInput).toBeFocused();
+
+    // Clear the current name and type the new name
+    await nameInput.clear();
+    await nameInput.fill(name);
+
+    // Press Enter to confirm the rename; the input leaves edit mode once the
+    // rename has been committed.
+    await nameInput.press('Enter');
+    await expect(nameInput).toBeHidden({ timeout: 5000 });
+
+    // Close and reopen the panel so the list reflects the rename, then verify
+    // it took effect. Without this, a silently-failed rename surfaces several
+    // steps later as an opaque locator timeout (#18363).
+    await this.closeConversationHistory();
+    await this.openConversationHistory();
+    await expect(this.chatPane.getConversationItemByName(name).first()).toBeVisible({ timeout: 5000 });
+    await this.closeConversationHistory();
+
+    console.log(`Renamed conversation to "${name}"`);
+  }
+
+  /**
+   * Open the conversation history panel, or do nothing if it is already open.
+   *
+   * The panel is removed from the DOM when closed, so its presence is the
+   * open/closed signal. A state-blind "click and expect the list" helper
+   * inverts the panel state whenever its assumption about the current state is
+   * wrong -- and its post-click assertion could only pass on a closing toggle
+   * by winning a race against the panel's fade-out. Checking the panel's
+   * actual state first makes this idempotent.
+   */
+  async openConversationHistory(): Promise<void> {
+    if (await this.chatPane.conversationHistoryPanel.isVisible()) {
+      return;
+    }
+    await this.chatPane.historyBtn.click({ timeout: 10000 });
+    await expect(this.chatPane.conversationHistoryPanel).toBeVisible({ timeout: 10000 });
+  }
+
+  /**
+   * Close the conversation history panel.
+   *
+   * Recent assistant builds dismiss the panel themselves once a conversation
+   * is selected; older ones only close it via the toolbar toggle. Both states
+   * have to be tolerated, and the transition between them is what makes this
+   * delicate: a toggle click that lands while an auto-close is still finishing
+   * re-opens the panel, which is how this failed against the 1.1.7
+   * pre-release.
+   *
+   * So every decision here waits for the panel to settle and then holds it to
+   * that, the same way isTurnIdle treats the stop button: a single hidden
+   * observation can be a fade-out frame with a re-open queued behind it, which
+   * would either provoke a re-opening click or report a close about to be
+   * undone. At most two clicks are issued, and the closing assertion is what
+   * fails the test if the panel is still up.
+   */
+  async closeConversationHistory(): Promise<void> {
+    const panel = this.chatPane.conversationHistoryPanel;
+
+    // True once the panel is gone and stays gone. False if it is still up
+    // after the settle window -- the normal case on builds that never
+    // auto-close, so that timeout is an expected outcome mapped to a value
+    // rather than an error to propagate -- or if it comes back while being
+    // watched.
+    const staysHidden = async (): Promise<boolean> => {
+      const hidden = await panel
+        .waitFor({ state: 'hidden', timeout: PANEL_AUTO_CLOSE_TIMEOUT_MS })
+        .then(
+          () => true,
+          () => false,
+        );
+      if (!hidden) {
+        return false;
+      }
+
+      for (let sample = 1; sample < PANEL_CLOSED_SAMPLES; sample++) {
+        await sleep(PANEL_CLOSED_SAMPLE_INTERVAL_MS);
+        if (await panel.isVisible()) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (!(await staysHidden())) {
+      await this.chatPane.historyBtn.click({ timeout: 10000 });
+      if (!(await staysHidden())) {
+        // The click landed as an auto-close was finishing and re-opened the
+        // panel; it is stable now, so one more toggle closes it for good.
+        await this.chatPane.historyBtn.click({ timeout: 10000 });
+      }
+    }
+
+    await expect(panel).toBeHidden({ timeout: 10000 });
+  }
+}

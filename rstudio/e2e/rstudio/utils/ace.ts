@@ -1,0 +1,161 @@
+// TypeScript bindings for the runtime Ace editor API as exposed by RStudio.
+// These describe just the methods and fields the Playwright tests currently
+// reach into via page.evaluate -- add new entries here when a test needs
+// them instead of inlining cast-and-assert blocks at the call site.
+//
+// The namespace mirrors Ace's own naming (Ace.Editor, Ace.Range, etc.) so
+// the bindings are discoverable and don't collide with the AceEditor
+// page-object class in pages/ace_editor.page.ts (which is the Playwright
+// wrapper, not the runtime instance).
+
+export namespace Ace {
+  export interface Position {
+    row: number;
+    column: number;
+  }
+
+  export interface Range {
+    start: Position;
+    end: Position;
+  }
+
+  export interface Selection {
+    setRange(range: Range): void;
+    rangeList: { ranges: Range[]; session?: unknown | null; detach(): void };
+    // Multi-select bookkeeping (see Ace's multi_select.js). 'index' is set
+    // only on the temporary Selection that forEachSelection installs while
+    // iterating, so its presence on session.selection indicates an aborted
+    // multi-select operation (#13605).
+    inMultiSelectMode?: boolean;
+    ranges?: Range[] | null;
+    rangeCount?: number;
+    index?: number;
+  }
+
+  export interface Document {
+    on(event: string, fn: (e: unknown) => void): void;
+    off(event: string, fn: (e: unknown) => void): void;
+  }
+
+  // A collapsed range. Ace keeps only the outermost folds on its fold lines; a
+  // fold added inside an already-collapsed range (or one enclosed by a later,
+  // larger fold) is moved onto the enclosing fold's subFolds instead, with its
+  // range rewritten relative to the parent's start (see Ace's consumeRange).
+  export interface Fold {
+    start: Position;
+    end: Position;
+    subFolds: Fold[];
+  }
+
+  // A gutter marker + squiggle, as set by the lint pipeline (LintManager).
+  export interface Annotation {
+    row: number;
+    column: number;
+    text: string;
+    type: string;
+  }
+
+  // A node of the scope tree RStudio's code models build (see
+  // acesupport/acemode/r_scope_tree.js). Sections are the nodes that drive the
+  // document outline; 'depth' is set only on those with a heading level.
+  export interface Scope {
+    label: string;
+    start: Position;
+    attributes?: { depth?: number };
+    $children?: Scope[];
+    isSection(): boolean;
+    isFunction(): boolean;
+    isChunk(): boolean;
+  }
+
+  // RStudio's per-mode code model (acesupport/acemode/*_code_model.js), hung
+  // off the mode as .codeModel. Only the R modes have a scope tree.
+  export interface CodeModel {
+    getScopeTree?(): Scope[];
+  }
+
+  export interface Mode {
+    codeModel?: CodeModel;
+  }
+
+  // Methods on the EditSession (editor.session). Ace exposes many more --
+  // restrict to the ones tests actually need to keep the surface obvious.
+  export interface Session {
+    on(event: 'changeScrollTop', fn: (scrollTop: number) => void): void;
+    off(event: 'changeScrollTop', fn: (scrollTop: number) => void): void;
+    getLength(): number;
+    setScrollTop(scrollTop: number): void;
+    /** Rows as rendered: with wrap mode on, one soft-wrapped line counts once per visual row. */
+    getScreenLength(): number;
+    getLine(row: number): string;
+    getFoldWidget(row: number): string;
+    getFoldWidgetRange(row: number): Range | null;
+    /** The outermost folds only; nested folds live on each fold's subFolds. */
+    getAllFolds(): Fold[];
+    // usually a plain state name, but rows inside a multi-line construct
+    // (e.g. an open raw string) save the tokenizer stack instead
+    getState(row: number): string | string[];
+    getTabString(): string;
+    getTokens(row: number): unknown[];
+    getTokenAt(row: number, column: number): unknown | null;
+    getMarkers(inFront?: boolean): Record<string, unknown>;
+    getAnnotations(): Annotation[];
+    replace(range: Range, text: string): Position;
+    remove(range: Range): Position;
+    getDocument(): Document;
+    selection: Selection;
+    // The session's real Selection object; session.selection may briefly
+    // point at a temporary Selection during multi-select operations (see
+    // Ace's Editor.forEachSelection).
+    multiSelect?: Selection;
+    $mode?: Mode;
+  }
+
+  // The runtime editor instance. Hung off the .ace_editor DOM element via
+  // the .env.editor backref (see AceEditorElement below).
+  export interface Editor {
+    /** The .ace_editor root element. */
+    container: HTMLElement;
+    /** Per-editor command table; Ace's defaults are shared until a clone is installed. */
+    commands: { byName: Record<string, { scrollIntoView?: string; [key: string]: unknown }> };
+    renderer: {
+      scrollTop: number;
+      lineHeight: number;
+      $size: { scrollerHeight: number };
+      scrollBy(deltaX: number, deltaY: number): void;
+      $scrollAnimation?: { from: number; to: number } | null;
+      /** Set while ghost text (e.g. rstudioapi::setGhostText()) is shown. */
+      $ghostText?: unknown | null;
+    };
+    session: Session;
+    selection: Selection;
+    getValue(): string;
+    getOption(name: 'animatedScroll'): boolean;
+    setValue(value: string, cursorPos?: number): void;
+    focus(): void;
+    gotoLine(line: number, column?: number, animate?: boolean): void;
+    getCursorPosition(): Position;
+    getSelectedText(): string;
+    getFirstVisibleRow(): number;
+    getLastVisibleRow(): number;
+    isRowFullyVisible(row: number): boolean;
+    find(needle: string): void;
+    insert(text: string): void;
+    navigateLineEnd(): void;
+    navigateFileEnd(): void;
+    selectAll(): void;
+    execCommand(name: string): void;
+    exitMultiSelectMode(): void;
+    inMultiSelectMode?: boolean;
+    inVirtualSelectionMode?: boolean;
+  }
+}
+
+// Shape of a DOM element with the Ace runtime instance attached. Use with
+// document.getElementById when the editor is identified by a stable id
+// (e.g. #rstudio_console_input). For source editors that don't have a
+// stable id, iterate document.querySelectorAll('.ace_editor') and cast
+// elements with this type.
+export interface AceEditorElement extends HTMLElement {
+  env?: { editor?: Ace.Editor };
+}

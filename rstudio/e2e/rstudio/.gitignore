@@ -1,0 +1,21 @@
+node_modules/
+dist/
+test-results/
+# Per-run HTML report dirs (playwright-report-<timestamp>) and the
+# playwright-report symlink that points at the most recent one.
+playwright-report
+playwright-report-*/
+.env
+.env.*
+!.env.example
+# .env.op holds only OP op:// references, never secret values.
+!.env.op
+
+# Local-only notes, scratchpads, audit lists, etc.
+*.local.md
+
+# Local rstudio preference overrides
+.prefs.local.json
+
+# Written by scripts/a11y-report.ts screenshots.
+a11y-screenshots.html

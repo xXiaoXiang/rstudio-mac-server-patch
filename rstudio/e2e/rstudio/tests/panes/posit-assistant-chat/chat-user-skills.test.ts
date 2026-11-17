@@ -1,0 +1,335 @@
+import * as path from 'path';
+import { test, expect } from '@fixtures/rstudio.fixture';
+import { requireAiCredentials } from '@utils/ai-credentials';
+import { isExternalServerRun } from '@utils/auth';
+import { CHAT_PROVIDERS } from '@utils/constants';
+import { ConsolePaneActions } from '@actions/console_pane.actions';
+import { AssistantOptionsActions } from '@actions/assistant_options.actions';
+import { ChatPaneActions } from '@actions/chat_pane.actions';
+import { ChatPane } from '@pages/chat_pane.page';
+import type { EnvironmentVersions } from '@pages/console_pane.page';
+import { useSuiteSandbox } from '@utils/sandbox';
+import { closeProjectIfOpen, createAndOpenProject } from '@utils/project';
+import { getPref, setPref } from '@utils/commands';
+import { createChatActions, annotateVersions } from './_chat-setup';
+
+// ---------------------------------------------------------------------------
+// Project-level skill, in <project>/.posit/assistant/skills/ of a sandbox
+// project; paths are computed in beforeAll. Not the legacy .positai/skills/:
+// its "Legacy config" banner can cover the tool-approval row (#19372).
+// ---------------------------------------------------------------------------
+
+const PROJECT_NAME = 'user_skills_test_project';
+const PROJECT_SKILL_NAME = 'custom-data-summary';
+const PROJECT_MARKER = 'PROJECT_SKILL_ACTIVE_QA7742';
+
+// ---------------------------------------------------------------------------
+// User-level skill (lives in ~/.posit/assistant/skills/ under the user home
+// dir). This test creates the skill file itself (see createSkillFile below);
+// it does not depend on any host-seeded skills -- only on Posit AI being
+// signed in, which the auth.setup project provisions.
+//
+// The Playwright sandbox redirects HOME / USERPROFILE for the rstudio child
+// process (and therefore Databot, which inherits its env) to
+// $PW_SANDBOX/user-home/. We compute the absolute path from the sandbox so
+// the file lands where Databot looks, regardless of what the runner's own
+// os.homedir() returns.
+// ---------------------------------------------------------------------------
+
+const USER_SKILL_NAME = 'custom-code-review';
+const USER_MARKER = 'USER_SKILL_REVIEW_QA8853';
+
+// Resolve lazily so the spec can be loaded for --list / type-checks without
+// PW_SANDBOX being set; the assertion fires at test-run time instead.
+function userHome(): string {
+  const s = process.env.PW_SANDBOX;
+  if (!s) {
+    throw new Error(
+      'PW_SANDBOX is not set; fixtures/sandbox-setup.ts should populate it before any spec is loaded',
+    );
+  }
+  return path.join(s, 'user-home').replace(/\\/g, '/');
+}
+const userSkillDir = () => `${userHome()}/.posit/assistant/skills/${USER_SKILL_NAME}`;
+const userSkillPath = () => `${userSkillDir()}/SKILL.md`;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a SKILL.md file via two R console commands:
+ * 1. dir.create() for the directory
+ * 2. writeLines(c(...)) for the file content
+ *
+ * `executeInConsole` writes each command into the console programmatically
+ * (`editor.setValue`) rather than typing it, so neither command length nor
+ * autocomplete interference constrains what goes here.
+ */
+async function createSkillFile(
+  consoleActions: ConsolePaneActions,
+  dir: string,
+  filePath: string,
+  name: string,
+  description: string,
+  marker: string,
+): Promise<void> {
+  await consoleActions.executeInConsole(`dir.create("${dir}", recursive = TRUE)`, { wait: true });
+
+  const cmd =
+    `writeLines(c("---", "name: ${name}", "description: ${description}", "---", "", "Start with: ${marker}", "Markers are MANDATORY."), "${filePath}")`;
+  await consoleActions.executeInConsole(cmd, { wait: true });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test.describe.serial('User-Added Skills', { tag: ['@ai', '@chat', '@serial'] }, () => {
+  requireAiCredentials(test, 'positai');
+
+  const sandbox = useSuiteSandbox();
+  let chatPane: ChatPane;
+  let chatActions: ChatPaneActions;
+  let consoleActions: ConsolePaneActions;
+  let assistantActions: AssistantOptionsActions;
+  let versions: EnvironmentVersions;
+  let projectSkillDir = '';
+  let projectSkillPath = '';
+
+  test.beforeAll(async ({ rstudioPage: page }) => {
+    ({ consoleActions, assistantActions, chatActions, chatPane } = createChatActions(page));
+
+    await consoleActions.clearConsole();
+
+    // -----------------------------------------------------------------------
+    // Step 0: Create a real project inside the sandbox so the
+    // "project-level" skill actually lands in a project directory rather
+    // than in the user's home dir.
+    // -----------------------------------------------------------------------
+    const sandboxR = sandbox.dir.replace(/\\/g, '/');
+    const projectDir = await createAndOpenProject(page, sandboxR, PROJECT_NAME);
+    projectSkillDir = `${projectDir}/.posit/assistant/skills/${PROJECT_SKILL_NAME}`;
+    projectSkillPath = `${projectSkillDir}/SKILL.md`;
+
+    // Re-create actions after session restart
+    ({ consoleActions, assistantActions, chatActions, chatPane } = createChatActions(page));
+    await consoleActions.clearConsole();
+    versions = await consoleActions.getEnvironmentVersions();
+
+    // -----------------------------------------------------------------------
+    // Step 1: Make sure no backend is running FIRST.
+    //
+    // The e2e base prefs start chat_provider at "none", so normally there is
+    // no backend here -- but an earlier @chat suite in this worker may have
+    // left the provider on (the per-test leak guard skips @chat-tagged
+    // tests), and a running backend must be stopped before creating skill
+    // files: skills are only discovered during DatabotCore.initialize() (at
+    // process start). Setting the preference to "none" (a valid enum value --
+    // NOT "") triggers onChatProviderChanged() → stopBackend() on the GWT
+    // side.
+    // -----------------------------------------------------------------------
+    if ((await getPref(page, 'chat_provider')) !== 'none') {
+      await setPref(page, 'chat_provider', 'none');
+      // Deliberate wait: setPref triggers stopBackend() asynchronously on the
+      // GWT side. There's no bridge-exposed signal for "backend has fully shut
+      // down", so we settle for an observation window long enough for the
+      // child process to terminate before we recreate skill files below.
+      await page.waitForTimeout(5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Create a project-level skill (.posit/assistant/skills/ in workspace)
+    // -----------------------------------------------------------------------
+    await createSkillFile(
+      consoleActions,
+      projectSkillDir,
+      projectSkillPath,
+      PROJECT_SKILL_NAME,
+      'Summarize or describe a dataset.',
+      PROJECT_MARKER,
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 3: Create a user-level skill (~/.posit/assistant/skills/ in home dir)
+    // -----------------------------------------------------------------------
+    await createSkillFile(
+      consoleActions,
+      userSkillDir(),
+      userSkillPath(),
+      USER_SKILL_NAME,
+      'Review or critique a code snippet.',
+      USER_MARKER,
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 4: Verify the skill files exist and hold their markers (the
+    // user-level one only where an rsession can actually read it)
+    // -----------------------------------------------------------------------
+    await consoleActions.clearConsole();
+    await consoleActions.executeInConsole(
+      `cat(readLines("${projectSkillPath}"), sep = "\\n")`,
+      { wait: true },
+    );
+    const projectOutput = await consoleActions.consolePane.consoleOutput.innerText();
+
+    // Assert rather than just read back: if dir.create or writeLines above
+    // silently did nothing, the first symptom would otherwise be an
+    // LLM-content assertion failing in a test body, which is indistinguishable
+    // from the model simply not naming the marker. Fail here, with the cause
+    // obvious. The project skill lives in the opened project directory, which
+    // every run mode can read, so this one is unconditional.
+    expect(projectOutput).toContain(PROJECT_MARKER);
+
+    // The user-level skill sits under the sandbox HOME. A server reached by URL
+    // never reads that path -- rserver takes each rsession's HOME from the
+    // passwd db -- which is exactly why the two tests that depend on it skip on
+    // the same predicate. Asserting it unconditionally failed beforeAll on every
+    // such run and took the whole describe.serial block down, including those
+    // skips.
+    if (!isExternalServerRun()) {
+      await consoleActions.clearConsole();
+      await consoleActions.executeInConsole(
+        `cat(readLines("${userSkillPath()}"), sep = "\\n")`,
+        { wait: true },
+      );
+      const userOutput = await consoleActions.consolePane.consoleOutput.innerText();
+      expect(userOutput).toContain(USER_MARKER);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5: Start a fresh backend by setting chat_provider back to "posit".
+    //
+    // This triggers onChatProviderChanged() → checkForUpdates() → startBackend()
+    // The new backend process runs DatabotCore.initialize() → discoverSkills()
+    // which picks up our newly created skill files.
+    // -----------------------------------------------------------------------
+    await assistantActions.setChatProvider(CHAT_PROVIDERS['posit-assistant']);
+
+    // -----------------------------------------------------------------------
+    // Step 6: Open the chat pane and wait for the UI to be ready
+    // -----------------------------------------------------------------------
+    await chatActions.openChatPane();
+    await chatActions.dismissSetupPrompts();
+  });
+
+  test.beforeEach(async () => {
+    annotateVersions(versions);
+  });
+
+  test.afterAll(async ({ rstudioPage: page }) => {
+    // The project-level skill lives inside the sandbox project; the sandbox
+    // afterAll (registered by useSuiteSandbox) removes the entire sandbox
+    // tree, so no explicit cleanup is needed for it here.
+
+    // Clean up only the specific user-level skill we created (leave the rest
+    // of ~/.posit/assistant/ intact)
+    await consoleActions.executeInConsole(
+      `unlink("${userSkillDir()}", recursive = TRUE)`,
+      { wait: true },
+    );
+
+    // Close the project we opened in beforeAll so subsequent test files start
+    // from a no-project workbench (per the convention in utils/test-reset.ts).
+    await closeProjectIfOpen(page);
+  });
+
+  // This asserts on the user-level skill, which an EXTERNAL server can't see
+  // (see the user-level-skill notes in this file's header). Skipped on that
+  // predicate rather than tagged @desktop_only: a spawned in-tree server does
+  // read the sandbox HOME, so a tag would drop coverage in a mode where this
+  // passes -- and a tag also removes the row from the report entirely, where a
+  // skip carries its reason.
+  test('both custom skills are discovered by assistant', async () => {
+    test.skip(
+      isExternalServerRun(),
+      'asserts on the user-level skill, which an external server rsession never reads (its HOME comes from the passwd db, not the sandbox)',
+    );
+    await chatActions.startNewConversation();
+
+    const initialCount = await chatPane.getMessageCount();
+    await chatActions.sendChatMessage(
+      'List all Agent Skills that are currently available to you. ' +
+      'Include the exact name of each skill.'
+    );
+    const newCount = await chatActions.waitForResponse(initialCount);
+    expect(newCount).toBeGreaterThan(initialCount);
+
+    // The response should mention both custom skills by name
+    const lastMessage = chatPane.messageItem.last();
+    await expect(lastMessage).toContainText(PROJECT_SKILL_NAME, { timeout: 10000 });
+    await expect(lastMessage).toContainText(USER_SKILL_NAME, { timeout: 10000 });
+  });
+
+  // Chat-UI flake on RStudio Server, not skill-file access (followups item 16).
+  test('project-level skill markers appear in response', { tag: ['@desktop_only'] }, async () => {
+    await chatActions.startNewConversation();
+
+    const initialCount = await chatPane.getMessageCount();
+    await chatActions.sendChatMessage(
+      'Summarize the iris dataset. ' +
+      'Use your available Agent Skills. ' +
+      'Do not run any code.'
+    );
+
+    // Wait for the full response, handling any Allow dialogs that appear
+    await chatActions.pollWithAllowDialogs(async () => {
+      const messageCount = await chatPane.getMessageCount();
+      if (messageCount <= initialCount) return false;
+      return await chatActions.isTurnIdle();
+    }, 120000);
+
+    // Verify the response contains the markers from our project skill
+    const lastMessage = chatPane.messageItem.last();
+    const responseText = await lastMessage.innerText();
+
+    expect(responseText).toContain(PROJECT_MARKER);
+  });
+
+  // The user-level skill lives under the sandbox-redirected HOME described in
+  // this file's header. An EXTERNAL RStudio Server never reads it: rserver
+  // builds each rsession's environment from scratch and takes HOME from the
+  // passwd db, not from anything the harness sets (issue 18348). No product
+  // bug -- the skill genuinely isn't there for that account. A spawned in-tree
+  // server DOES see it, via the HOME its rsession wrapper exports, which is
+  // why this skips on isExternalServerRun() rather than carrying
+  // @desktop_only.
+  // Also tagged desktop_only: same pollWithAllowDialogs flake as above (item 16).
+  test('user-level skill is selected when its description matches the prompt', { tag: ['@desktop_only'] }, async () => {
+    test.skip(
+      isExternalServerRun(),
+      'the user-level skill lives under the sandbox HOME, which an external server rsession never reads (its HOME comes from the passwd db)',
+    );
+    await chatActions.startNewConversation();
+
+    const initialCount = await chatPane.getMessageCount();
+    await chatActions.sendChatMessage(
+      'Review this R code snippet and provide feedback: x <- 1:10; mean(x). ' +
+      'Use your available Agent Skills. ' +
+      'Do not run any code.'
+    );
+
+    // Wait for the full response, handling any Allow dialogs that appear
+    await chatActions.pollWithAllowDialogs(async () => {
+      const messageCount = await chatPane.getMessageCount();
+      if (messageCount <= initialCount) return false;
+      return await chatActions.isTurnIdle();
+    }, 120000);
+
+    // Databot emits `skill: <name>` in the message when the model selects a
+    // registered skill. That happens iff the skill was discovered at backend
+    // init -- which iff the SKILL.md was read from
+    // $HOME/.posit/assistant/skills/, which here is sandbox-redirected to
+    // $PW_SANDBOX/user-home/.posit/assistant/skills/.
+    // We avoid asserting on the marker emitted inside the SKILL.md body because
+    // LLMs are unreliable at reproducing long opaque tokens verbatim.
+    const lastMessage = chatPane.messageItem.last();
+    const responseText = await lastMessage.innerText();
+
+    // Assistant 1.4.0+ prefixes every tool-call caption with U+200E (LEFT-TO-RIGHT
+    // MARK) so an rtl-truncated file path keeps its leading slash on the left. JS
+    // `\s` does not cover U+200E, so match it explicitly; the class also accepts
+    // the bare whitespace that 1.3.1 and earlier emit.
+    expect(responseText).toMatch(new RegExp(`skill:[\\s\\u200e]*${USER_SKILL_NAME}`));
+  });
+});

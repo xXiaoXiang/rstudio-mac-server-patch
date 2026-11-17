@@ -1,0 +1,702 @@
+#
+# CMakeLists.txt
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+# set minimum version
+cmake_minimum_required(VERSION 3.25)
+
+# never fall back to CMake's deprecated FindBoost module; find_package(Boost)
+# uses Boost's own BoostConfig.cmake
+if(POLICY CMP0167)
+   cmake_policy(SET CMP0167 NEW)
+endif()
+
+# initialize
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/init.cmake")
+
+# read release name
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/release.cmake")
+
+# set project name
+project("RStudio [${RSTUDIO_RELEASE_NAME}]")
+
+# tools for reading executable file pre-requisites
+include(GetPrerequisites)
+
+# set compiler
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/compiler.cmake")
+
+# include globals. normally these are included at the root but we also
+# include them here to support configuring at the src level (i.e. for
+# cpp-development-configurations)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/globals.cmake")
+
+# global directives
+add_definitions(-DBOOST_ENABLE_ASSERT_HANDLER -DBOOST_BIND_GLOBAL_PLACEHOLDERS)
+
+# the core libs can be built without libpam (for Launcher, originally), but we
+# use it by default
+if (NOT DEFINED RSTUDIO_USE_PAM)
+  message(STATUS "Configured to build with libpam features")
+  set(RSTUDIO_USE_PAM TRUE)
+endif()
+
+# test directory
+set(TESTS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp" CACHE STRING "Test includes")
+
+# UNIX specific global directivies
+if(UNIX)
+   # cmake modules
+   include(CheckFunctionExists REQUIRED)
+   include(CheckSymbolExists REQUIRED)
+
+   # compiler flags
+   add_definitions(-Wall -pthread -Werror=return-type)
+
+   if(RSTUDIO_ASAN)
+      message(STATUS "Compiling with Address Sanitizer (ASAN) support")
+      add_definitions(-fsanitize=address -fno-omit-frame-pointer -fno-optimize-sibling-calls -O1)
+      set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+   endif()
+
+   if(APPLE)
+      add_definitions(-Wno-unknown-warning-option -Wsign-compare -Wno-unused-local-typedefs -fvisibility=hidden)
+
+      find_library(APPLICATION_SERVICES_LIBRARY NAMES ApplicationServices)
+      find_library(BSM_LIBRARY NAMES bsm)
+      find_library(COCOA_LIBRARY NAMES Cocoa)
+      find_library(CORE_FOUNDATION_LIBRARY NAMES CoreFoundation)
+      find_library(CORE_SERVICES_LIBRARY NAMES CoreServices)
+      find_library(FOUNDATION_LIBRARY NAMES Foundation)
+      find_library(IOKIT_LIBRARY NAMES IOKit)
+      find_library(SECURITY_LIBRARY NAMES Security)
+   endif()
+
+   if(APPLE)
+
+      # Figure out what version of Mac OS X this is. Unfortunately
+      # CMAKE_SYSTEM_VERSION does not match uname -r, so get the Mac OS
+      # version number another way.
+      execute_process(COMMAND /usr/bin/sw_vers -productVersion OUTPUT_VARIABLE MACOSX_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+      # notify the user of our selection
+      message(STATUS "Mac OS X version: ${MACOSX_VERSION}")
+      message(STATUS "Mac OS X deployment target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+
+   endif()
+
+   # gcc hardending options (see: http://wiki.debian.org/Hardening)
+   if(NOT APPLE)
+      add_definitions(-Wformat -Wformat-security)
+      add_definitions(-fPIC)
+      if(CMAKE_BUILD_TYPE STREQUAL Debug)
+         add_definitions(-O0)
+         add_definitions(-D_GLIBCXX_ASSERTIONS)
+      else()
+         add_definitions(-D_FORTIFY_SOURCE=2)
+         add_definitions(-fstack-protector-strong)
+      endif()
+      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pie -Wl,-z,relro,-z,now")
+   endif()
+
+   # other useful gcc diagnostics
+   if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      add_definitions(-Wlogical-op)
+      if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0.0)
+         add_definitions(-Wduplicated-cond)
+         add_definitions(-Wduplicated-branches)
+         add_definitions(-Wrestrict)
+         add_definitions(-Wnull-dereference)
+      endif()
+   endif()
+
+# Win32 specific global directives
+else()
+
+   # be large address aware
+   foreach(TYPE EXE MODULE)
+      set(CMAKE_${TYPE}_LINKER_FLAGS "${CMAKE_${TYPE}_LINKER_FLAGS} /largeaddressaware")
+   endforeach()
+
+   # increase stack size to 16mb
+   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /stack:0x1000000")
+
+   # allow for large number of sections
+   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /bigobj")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /bigobj")
+
+   # CMake no longer adds a default warning level; keep the /W3 it used to add.
+   # cmake/compiler.cmake does this for C++. it can't for C: when configuring
+   # from the root it runs only there (its include guard skips our include
+   # above), where project() has enabled CXX alone
+   if(NOT CMAKE_C_FLAGS MATCHES "/W[0-4]")
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W3")
+   endif()
+
+   # require Windows 10 version 1809 (build 17763), the minimum for the
+   # ConPTY pseudoconsole APIs. _WIN32_WINNT/WINVER are per-major-version and
+   # share one value across Windows 10 and 11 (0x0A00); NTDDI_VERSION selects
+   # the specific build (NTDDI_WIN10_RS5 = 1809) that gates the ConPTY headers.
+   add_definitions(
+      -DNOMINMAX
+      -DWINVER=0x0A00
+      -D_WIN32_WINNT=0x0A00
+      -D_WIN32_IE=0x0A00
+      -DNTDDI_VERSION=0x0A000006
+      -DWIN32_LEAN_AND_MEAN
+      -DBOOST_USE_WINDOWS_H)
+
+   # ensure we use 64-bit APIs for 64-bit builds
+   if(NOT RSTUDIO_SESSION_WIN32)
+      add_definitions(-D_WIN64)
+   endif()
+endif()
+
+if(RSTUDIO_PACKAGE_BUILD)
+   add_definitions(-DRSTUDIO_PACKAGE_BUILD)
+else()
+   add_definitions(-DRSTUDIO_DEVELOPMENT_BUILD)
+endif()
+
+# determine whether we should statically link boost. we always do this
+# unless we are building a non-packaged build on linux (in which case
+# boost dynamic libraries are presumed to be installed on the system ldpath)
+if(APPLE OR WIN32 OR RSTUDIO_PACKAGE_BUILD)
+   set(Boost_USE_STATIC_LIBS ON)
+endif()
+
+# default Boost versions
+if(NOT RSTUDIO_BOOST_REQUESTED_VERSION)
+   set(RSTUDIO_BOOST_REQUESTED_VERSION 1.91.0)
+endif()
+
+# set up rstudio boost version components
+set(RSTUDIO_BOOST_VERSION "${RSTUDIO_BOOST_REQUESTED_VERSION}")
+string(REPLACE "." "_" RSTUDIO_BOOST_VERSION_UNDERSCORE "${RSTUDIO_BOOST_VERSION}")
+string(REPLACE "." ";" RSTUDIO_BOOST_VERSION_LIST "${RSTUDIO_BOOST_VERSION}")
+list(GET RSTUDIO_BOOST_VERSION_LIST 0 RSTUDIO_BOOST_VERSION_MAJOR)
+list(GET RSTUDIO_BOOST_VERSION_LIST 1 RSTUDIO_BOOST_VERSION_MINOR)
+list(GET RSTUDIO_BOOST_VERSION_LIST 2 RSTUDIO_BOOST_VERSION_PATCH)
+
+# disable Boost Signals deprecation warning
+add_definitions(-DBOOST_SIGNALS_NO_DEPRECATION_WARNING)
+
+list(APPEND BOOST_LIBS
+   atomic
+   chrono
+   date_time
+   filesystem
+   iostreams
+   program_options
+   random
+   regex
+   thread
+   url
+)
+
+# UNIX BOOST
+if(UNIX)
+   # prefer static link to our custom built version
+   set(RSTUDIO_TOOLS_BOOST "${RSTUDIO_TOOLS_ROOT}/boost/boost_${RSTUDIO_BOOST_VERSION_UNDERSCORE}")
+   if(NOT RSTUDIO_USE_SYSTEM_BOOST AND EXISTS ${RSTUDIO_TOOLS_BOOST})
+      add_definitions(-DRSTUDIO_BOOST_NAMESPACE=rstudio_boost)
+
+      # find headers; search only our copy, since it uses its own namespace
+      set(Boost_USE_STATIC_LIBS ON)
+      find_package(Boost ${RSTUDIO_BOOST_REQUESTED_VERSION} EXACT CONFIG REQUIRED
+         PATHS "${RSTUDIO_TOOLS_BOOST}"
+         NO_DEFAULT_PATH)
+
+      # define library list manually (find_package doesn't always pick them up)
+      set(BOOST_LIB_DIR ${RSTUDIO_TOOLS_BOOST}/lib)
+      foreach(BOOST_LIB ${BOOST_LIBS})
+         list(APPEND Boost_LIBRARIES ${BOOST_LIB_DIR}/libboost_${BOOST_LIB}.a)
+      endforeach()
+      message(STATUS "Using RStudio-provided Boost ${RSTUDIO_BOOST_REQUESTED_VERSION}")
+   else()
+      add_definitions(-DRSTUDIO_BOOST_NAMESPACE=boost)
+
+      # unless system Boost was requested, stay out of the system locations
+      # (as FindBoost's Boost_NO_SYSTEM_PATHS, which we used to set, did)
+      if(NOT RSTUDIO_USE_SYSTEM_BOOST)
+         set(BOOST_FIND_OPTIONS NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH)
+      endif()
+
+      # FindBoost honored BOOST_ROOT. find_package only does from CMake 3.27
+      # (CMP0144), so hand it over as Boost_ROOT for the versions before that
+      if(NOT DEFINED Boost_ROOT)
+         if(DEFINED BOOST_ROOT)
+            set(Boost_ROOT "${BOOST_ROOT}")
+         elseif(DEFINED ENV{BOOST_ROOT} AND NOT DEFINED ENV{Boost_ROOT})
+            set(Boost_ROOT "$ENV{BOOST_ROOT}")
+         endif()
+      endif()
+
+      # set the policy too, so that newer versions don't warn about BOOST_ROOT;
+      # for this call only, as it changes where every package is looked for
+      cmake_policy(PUSH)
+      if(POLICY CMP0144)
+         cmake_policy(SET CMP0144 NEW)
+      endif()
+      find_package(Boost ${RSTUDIO_BOOST_REQUESTED_VERSION} CONFIG
+         COMPONENTS ${BOOST_LIBS}
+         ${BOOST_FIND_OPTIONS})
+      cmake_policy(POP)
+
+      # not REQUIRED above, so that we can say more than CMake's generic error
+      if(NOT Boost_FOUND)
+         set(BOOST_SYSTEM_PATHS_NOTE "")
+         if(NOT RSTUDIO_USE_SYSTEM_BOOST)
+            set(BOOST_SYSTEM_PATHS_NOTE "The system locations were not searched; use -DRSTUDIO_USE_SYSTEM_BOOST=1 to build against a system Boost.\n")
+         endif()
+
+         message(FATAL_ERROR
+            "Could not find Boost ${RSTUDIO_BOOST_REQUESTED_VERSION} or newer with all of "
+            "the components RStudio needs; CMake's messages above may say why.\n"
+            "Boost is found through the CMake package files it installs "
+            "(BoostConfig.cmake, in cmake/Boost-<version> under the library directory: "
+            "<prefix>/lib, lib64 or lib/<arch>), not through "
+            "CMake's FindBoost module. A Boost installed without them (b2 "
+            "--no-cmake-config, or a distribution package that leaves them out) "
+            "cannot be used.\n"
+            "${BOOST_SYSTEM_PATHS_NOTE}"
+            "Set Boost_ROOT or BOOST_ROOT to the prefix of a suitable Boost, or run "
+            "dependencies/common/install-boost to build the copy RStudio normally uses.")
+      endif()
+   endif()
+
+# WIN32 BOOST
+else()
+   # hard-code to our own prebuilt boost libs
+   add_definitions(-DRSTUDIO_BOOST_NAMESPACE=rstudio_boost)
+   if(RSTUDIO_SESSION_WIN32)
+      set(BOOST_ARCH "32")
+   else()
+      set(BOOST_ARCH "64")
+   endif()
+
+   # install-dependencies.cmd downloads Boost prebuilts for the MSVC 14.5
+   # (Visual Studio 2026) toolset; build against the toolset CMake detected.
+   if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(BOOST_SUFFIX "vc${MSVC_TOOLSET_VERSION}-mt-x${BOOST_ARCH}-${RSTUDIO_BOOST_VERSION_MAJOR}_${RSTUDIO_BOOST_VERSION_MINOR}.lib")
+      set(BOOST_ROOT "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/boost-${RSTUDIO_BOOST_REQUESTED_VERSION}-win-msvc${MSVC_TOOLSET_VERSION}-release-static/boost${BOOST_ARCH}")
+   else()
+      set(BOOST_SUFFIX "vc${MSVC_TOOLSET_VERSION}-mt-gd-x${BOOST_ARCH}-${RSTUDIO_BOOST_VERSION_MAJOR}_${RSTUDIO_BOOST_VERSION_MINOR}.lib")
+      set(BOOST_ROOT "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/boost-${RSTUDIO_BOOST_REQUESTED_VERSION}-win-msvc${MSVC_TOOLSET_VERSION}-debug-static/boost${BOOST_ARCH}")
+   endif()
+   set(BOOST_INCLUDEDIR "${BOOST_ROOT}/include/boost-${RSTUDIO_BOOST_VERSION_MAJOR}_${RSTUDIO_BOOST_VERSION_MINOR}")
+   # the Windows path hard-codes every Boost path, so skip find_package and
+   # wire up Boost_INCLUDE_DIRS and Boost_LIBRARIES directly
+   if(NOT EXISTS "${BOOST_INCLUDEDIR}")
+      message(FATAL_ERROR
+         "Boost prebuilts for the MSVC ${MSVC_TOOLSET_VERSION} toolset were not found:\n"
+         "  ${BOOST_INCLUDEDIR}\n"
+         "Run dependencies/windows/install-dependencies.cmd to download them.")
+   endif()
+   set(Boost_INCLUDE_DIRS "${BOOST_INCLUDEDIR}")
+   set(BOOST_LIBRARYDIR "${BOOST_ROOT}/lib")
+   foreach(BOOST_LIB ${BOOST_LIBS})
+      list(APPEND Boost_LIBRARIES "${BOOST_LIBRARYDIR}/libboost_${BOOST_LIB}-${BOOST_SUFFIX}")
+   endforeach()
+   message(STATUS "Using RStudio-provided Boost ${RSTUDIO_BOOST_REQUESTED_VERSION}: ${BOOST_ROOT}")
+endif()
+
+set(RSTUDIO_BOOST_SIGNALS_VERSION 2)
+add_definitions(-DRSTUDIO_BOOST_SIGNALS_VERSION=2)
+
+# add boost as system include directory
+include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
+
+# SOCI
+if(WIN32)
+   # install-soci.R builds SOCI for the MSVC 14.5 (Visual Studio 2026) toolset;
+   # locate it using the toolset CMake detected.
+   set(RSTUDIO_TOOLS_SOCI "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/install-soci/soci-msvc${MSVC_TOOLSET_VERSION}-4.0.3")
+   if(NOT EXISTS "${RSTUDIO_TOOLS_SOCI}")
+      message(FATAL_ERROR
+         "SOCI prebuilts for the MSVC ${MSVC_TOOLSET_VERSION} toolset were not found:\n"
+         "  ${RSTUDIO_TOOLS_SOCI}\n"
+         "Run dependencies/windows/install-dependencies.cmd to build them.")
+   endif()
+   if(RSTUDIO_SESSION_WIN32)
+      set(SOCI_ARCH "x86")
+   else()
+      set(SOCI_ARCH "x64")
+   endif()
+   set(SOCI_INCLUDE_BUILD_DIR "${RSTUDIO_TOOLS_SOCI}/build/${SOCI_ARCH}/include")
+else()
+   set(RSTUDIO_TOOLS_SOCI "${RSTUDIO_TOOLS_ROOT}/soci-4.0.3")
+   set(SOCI_INCLUDE_BUILD_DIR "${RSTUDIO_TOOLS_SOCI}/build/include")
+endif()
+
+set(SOCI_INCLUDE_DIR "${RSTUDIO_TOOLS_SOCI}/include")
+if(NOT RSTUDIO_USE_SYSTEM_SOCI)
+   include_directories(BEFORE SYSTEM ${SOCI_INCLUDE_DIR})
+   include_directories(BEFORE SYSTEM ${SOCI_INCLUDE_BUILD_DIR})
+endif()
+
+# PostgreSQL is only used by Workbench server components, so builds without
+# them (e.g. packaged Desktop Pro) use SQLite alone and don't link libpq
+if(RSTUDIO_PRO_BUILD AND RSTUDIO_SERVER)
+   set(RSTUDIO_USE_POSTGRESQL TRUE)
+else()
+   set(RSTUDIO_USE_POSTGRESQL FALSE)
+endif()
+
+# database library includes
+if(RSTUDIO_USE_POSTGRESQL AND APPLE)
+   include_directories(BEFORE SYSTEM "${HOMEBREW_PREFIX}/opt/postgresql/include")
+   include_directories(BEFORE SYSTEM "${HOMEBREW_PREFIX}/opt/postgresql/include/libpq")
+   include_directories(BEFORE SYSTEM "${HOMEBREW_PREFIX}/opt/libpq/include")
+elseif(RSTUDIO_USE_POSTGRESQL AND UNIX)
+   include_directories(SYSTEM "/usr/include/postgresql")
+   include_directories(SYSTEM "/usr/include/pgsql")
+elseif(WIN32)
+   include_directories(SYSTEM "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/install-soci/sqlite/sqlite-amalgamation-3310100")
+endif()
+
+# find SOCI libraries
+if(UNIX)
+   if(NOT APPLE AND RSTUDIO_USE_SYSTEM_SOCI)
+      find_library(SOCI_CORE_LIB NAMES "libsoci_core.a" "soci_core" REQUIRED)
+      find_library(SOCI_SQLITE_LIB NAMES "libsoci_sqlite3.a" "soci_sqlite3" REQUIRED)
+      if(RSTUDIO_USE_POSTGRESQL)
+         find_library(SOCI_POSTGRESQL_LIB NAMES "libsoci_postgresql.a" "soci_postgresql" REQUIRED)
+      endif()
+      get_filename_component(SOCI_LIBRARY_DIR "${SOCI_CORE_LIB}" DIRECTORY)
+   else()
+      set(SOCI_LIBRARY_DIR "${RSTUDIO_TOOLS_SOCI}/build/lib")
+      find_library(SOCI_CORE_LIB NAMES "libsoci_core.a" "soci_core" PATHS "${SOCI_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
+      find_library(SOCI_SQLITE_LIB NAMES "libsoci_sqlite3.a" "soci_sqlite3" PATHS "${SOCI_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
+      if(RSTUDIO_USE_POSTGRESQL)
+         find_library(SOCI_POSTGRESQL_LIB NAMES "libsoci_postgresql.a" "soci_postgresql" PATHS "${SOCI_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
+      endif()
+   endif()
+
+   find_library(DL_LIB "dl")
+
+   find_library(SQLITE_LIB "sqlite3" REQUIRED)
+   get_filename_component(SQLITE_LIB "${SQLITE_LIB}" REALPATH)
+
+   # use the flag rather than the found paths, which can be left in the cache
+   # when an existing server build directory is reconfigured for desktop
+   set(SOCI_POSTGRESQL_LIBRARIES "")
+   if(RSTUDIO_USE_POSTGRESQL)
+      find_library(PQ_LIB "pq" HINTS ${HOMEBREW_PREFIX}/opt/libpq/lib REQUIRED)
+      get_filename_component(PQ_LIB "${PQ_LIB}" REALPATH)
+      set(SOCI_POSTGRESQL_LIBRARIES ${SOCI_POSTGRESQL_LIB} ${PQ_LIB})
+   endif()
+
+   list(APPEND SOCI_LIBRARIES ${SOCI_SQLITE_LIB} ${SQLITE_LIB} ${SOCI_POSTGRESQL_LIBRARIES} ${SOCI_CORE_LIB} ${DL_LIB})
+else()
+   set(SOCI_LIBRARY_DIR "${RSTUDIO_TOOLS_SOCI}/build/${SOCI_ARCH}/lib")
+   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+       file(GLOB_RECURSE SOCI_LIBRARIES "${SOCI_LIBRARY_DIR}/Debug/*.lib")
+       list(LENGTH SOCI_LIBRARIES SOCI_LIB_COUNT)
+       if (NOT SOCI_LIB_COUNT EQUAL 0)
+         list(APPEND SOCI_LIBRARIES "Wldap32")
+         list(APPEND SOCI_LIBRARIES "Secur32")
+         list(APPEND SOCI_LIBRARIES "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/install-soci/sqlite/sqlite3-debug-${SOCI_ARCH}.lib")
+      endif()
+   else()
+       file(GLOB_RECURSE SOCI_LIBRARIES "${SOCI_LIBRARY_DIR}/Release/*.lib")
+       list(LENGTH SOCI_LIBRARIES SOCI_LIB_COUNT)
+       if (NOT SOCI_LIB_COUNT EQUAL 0)
+         list(APPEND SOCI_LIBRARIES "Wldap32")
+         list(APPEND SOCI_LIBRARIES "Secur32")
+         list(APPEND SOCI_LIBRARIES "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/install-soci/sqlite/sqlite3-release-${SOCI_ARCH}.lib")
+      endif()
+   endif()
+endif()
+list(LENGTH SOCI_LIBRARIES SOCI_LIB_COUNT)
+
+if (SOCI_LIB_COUNT EQUAL 0)
+   message(FATAL_ERROR "No SOCI libraries found under ${SOCI_LIBRARY_DIR}. Ensure the SOCI dependency is installed and try again.")
+endif()
+
+message(STATUS "SOCI libraries found under ${SOCI_LIBRARY_DIR}")
+set(RSTUDIO_HAS_SOCI 1)
+add_definitions(-DRSTUDIO_HAS_SOCI)
+
+if(RSTUDIO_USE_POSTGRESQL)
+   add_definitions(-DRSTUDIO_HAS_SOCI_POSTGRESQL)
+endif()
+
+if(UNIX)
+
+   if(APPLE)
+
+      # Older configures cached Homebrew's OpenSSL as an INTERNAL value: opt/openssl@3,
+      # opt/openssl, or (before #14718) Cellar/openssl/<version>. A -DOPENSSL_ROOT_DIR
+      # re-types the entry as UNINITIALIZED, so an explicit root is never dropped here.
+      get_property(_openssl_root_type CACHE OPENSSL_ROOT_DIR PROPERTY TYPE)
+      string(FIND "${OPENSSL_ROOT_DIR}" "${HOMEBREW_PREFIX}/" _openssl_brew_index)
+      if(_openssl_root_type STREQUAL "INTERNAL" AND _openssl_brew_index EQUAL 0)
+         string(LENGTH "${HOMEBREW_PREFIX}/" _openssl_brew_length)
+         string(SUBSTRING "${OPENSSL_ROOT_DIR}" ${_openssl_brew_length} -1 _openssl_brew_path)
+         if(_openssl_brew_path MATCHES "^(opt/openssl(@3)?|Cellar/openssl/[^/]+)$")
+            unset(OPENSSL_ROOT_DIR CACHE)
+         endif()
+      endif()
+
+      # link the static OpenSSL that dependencies/osx/build-openssl builds and
+      # install-openssl puts in the tools root, unless -DOPENSSL_ROOT_DIR names
+      # another
+      if(NOT DEFINED OPENSSL_ROOT_DIR)
+         # read the pin rather than source the script, which has side effects
+         set(_openssl_pin_file "${RSTUDIO_PROJECT_ROOT}/dependencies/tools/rstudio-tools.sh")
+         set(_openssl_pin_regex "^export RSTUDIO_OPENSSL_VERSION=\"([0-9]+\\.[0-9]+\\.[0-9]+)\"$")
+         file(STRINGS "${_openssl_pin_file}" _openssl_pin REGEX "^export RSTUDIO_OPENSSL_VERSION=")
+         if(NOT _openssl_pin MATCHES "${_openssl_pin_regex}")
+            message(FATAL_ERROR
+               "Expected one line 'export RSTUDIO_OPENSSL_VERSION=\"<x.y.z>\"' in "
+               "'${_openssl_pin_file}', but found '${_openssl_pin}'.")
+         endif()
+         set(RSTUDIO_OPENSSL_VERSION "${CMAKE_MATCH_1}")
+         set(OPENSSL_ROOT_DIR "${RSTUDIO_TOOLS_ROOT}/openssl-${RSTUDIO_OPENSSL_VERSION}")
+         set(OPENSSL_USE_STATIC_LIBS TRUE)
+         if(NOT EXISTS "${OPENSSL_ROOT_DIR}/lib/libcrypto.a")
+            message(FATAL_ERROR
+               "OpenSSL not found at '${OPENSSL_ROOT_DIR}'. "
+               "Install it with dependencies/osx/install-openssl and reconfigure.")
+         endif()
+      endif()
+
+      # find_package keeps paths cached by an earlier configure, which may name
+      # another OpenSSL (e.g. Homebrew's, or an older version of ours). Compare
+      # real paths: the root may hold a /../ (as make-package passes), and the
+      # cached paths don't.
+      get_filename_component(_openssl_root "${OPENSSL_ROOT_DIR}" REALPATH)
+      foreach(_openssl_var OPENSSL_INCLUDE_DIR OPENSSL_CRYPTO_LIBRARY OPENSSL_SSL_LIBRARY)
+         get_filename_component(_openssl_real_path "${${_openssl_var}}" REALPATH)
+         cmake_path(IS_PREFIX _openssl_root "${_openssl_real_path}" NORMALIZE _openssl_in_root)
+         if(NOT _openssl_in_root)
+            unset(${_openssl_var} CACHE)
+         endif()
+      endforeach()
+
+   endif()
+
+   find_package(OpenSSL REQUIRED)
+
+   # FindOpenSSL also searches pkg-config's hints, so a root missing headers or
+   # a library could quietly yield parts of another OpenSSL
+   if(APPLE)
+      foreach(_openssl_path ${OPENSSL_INCLUDE_DIR} ${OPENSSL_CRYPTO_LIBRARY} ${OPENSSL_SSL_LIBRARY})
+         get_filename_component(_openssl_real_path "${_openssl_path}" REALPATH)
+         cmake_path(IS_PREFIX _openssl_root "${_openssl_real_path}" NORMALIZE _openssl_in_root)
+         if(NOT _openssl_in_root)
+            message(FATAL_ERROR
+               "Found OpenSSL at '${_openssl_path}', outside OPENSSL_ROOT_DIR "
+               "'${OPENSSL_ROOT_DIR}'. Check that it holds include/, lib/libcrypto "
+               "and lib/libssl, then reconfigure.")
+         endif()
+      endforeach()
+   endif()
+
+   # Add the headers as a normal (non-SYSTEM) include placed BEFORE the others,
+   # for the same reason as the bundled {fmt} headers below: on macOS, clang
+   # searches the driver-added /usr/local/include ahead of every -isystem
+   # directory, so an OpenSSL installed under the /usr/local prefix (e.g. an
+   # x86_64 Homebrew on Apple Silicon) would otherwise shadow the headers of
+   # the OpenSSL we actually link against.
+   include_directories(BEFORE "${OPENSSL_INCLUDE_DIR}")
+
+endif()
+
+if(WIN32)
+
+     # openssl for Windows
+     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(OPENSSL_BUILD_TYPE "debug")
+     else()
+        set(OPENSSL_BUILD_TYPE "release")
+     endif()
+
+     if(RSTUDIO_SESSION_WIN32)
+        set(OPENSSL_BITNESS "32")
+     else()
+        set(OPENSSL_BITNESS "64")
+     endif()
+
+     set(OPENSSL_NAME "openssl-3.5.9")
+     set(OPENSSL_ROOT_DIR "${RSTUDIO_WINDOWS_DEPENDENCIES_DIR}/${OPENSSL_NAME}/${OPENSSL_NAME}-${OPENSSL_BUILD_TYPE}-${OPENSSL_BITNESS}")
+     set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include")
+     set(OPENSSL_LIBRARY_DIR "${OPENSSL_ROOT_DIR}/lib")
+     set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_LIBRARY_DIR}/libcrypto.lib")
+     set(OPENSSL_SSL_LIBRARY "${OPENSSL_LIBRARY_DIR}/libssl.lib")
+     list(APPEND OPENSSL_LIBRARIES "${OPENSSL_CRYPTO_LIBRARY}")
+     list(APPEND OPENSSL_LIBRARIES "${OPENSSL_SSL_LIBRARY}")
+
+     include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR})
+endif()
+
+# automatically build addins found in the addins subdirectory
+# (if another path wasn't already specified)
+if(NOT RSTUDIO_ADDINS_PATH)
+   set(RSTUDIO_DEFAULT_ADDINS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/addins")
+   if(EXISTS ${RSTUDIO_DEFAULT_ADDINS_PATH})
+      set(RSTUDIO_ADDINS_PATH ${RSTUDIO_DEFAULT_ADDINS_PATH})
+   endif()
+endif()
+
+# debuginfo tools
+if(LINUX)
+   add_subdirectory(debuginfo)
+endif()
+
+# external libraries
+option(RSTUDIO_USE_CMARK_GFM "Use the cmark-gfm Markdown renderer" ON)
+add_subdirectory(ext)
+
+# Make the bundled {fmt} headers available to all targets. We deliberately add
+# this as a normal (non-SYSTEM) include placed BEFORE the other directories,
+# rather than via include_directories(SYSTEM ...). On macOS, clang searches the
+# driver-added /usr/local/include ahead of every -isystem directory, so a stray
+# fmt installed there (e.g. a Homebrew fmt under the /usr/local prefix) would
+# shadow our bundled headers and pull in a different fmt ABI version -- yielding
+# undefined fmt::v<N> symbols at link time against the bundled libfmt. A -I entry
+# is searched before /usr/local/include, so this guarantees the bundled headers
+# win regardless of what is installed on the system.
+include_directories(BEFORE "${FMT_SOURCE_DIR}/include")
+
+# shared library
+add_subdirectory(shared_core)
+
+# core library
+add_subdirectory(core)
+
+# server core library
+if (RSTUDIO_SERVER)
+   add_subdirectory(server_core)
+endif()
+
+# echo configuration modes
+if(RSTUDIO_DEVELOPMENT)
+   message(STATUS "Configured to build DEVELOPMENT")
+endif()
+if(RSTUDIO_SERVER)
+   message(STATUS "Configured to build SERVER")
+endif()
+if (RSTUDIO_ELECTRON)
+   message(STATUS "Configured to build ELECTRON")
+endif()
+if(RSTUDIO_CONFIG_CORE_DEV)
+   message(STATUS "Configured to build CORE_DEV")
+endif()
+if(RSTUDIO_SESSION_WIN32)
+   message(STATUS "Configured to build SESSION_WIN32")
+endif()
+if(RSTUDIO_CONFIG_MONITOR_ONLY)
+   message(STATUS "Configured to build MONITOR_ONLY")
+elseif(RSTUDIO_CONFIG_SESSION_ONLY)
+   message(STATUS, "Configured to build SESSION_ONLY")
+endif()
+
+# are we in CORE_DEV mode? if so then just add the core/dev project
+# otherwise, add the rest of our projects
+if(RSTUDIO_CONFIG_CORE_DEV)
+
+   add_subdirectory(core/dev)
+
+else()
+
+   # monitor library
+   add_subdirectory(monitor)
+
+   # add overlay if it exists
+   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/CMakeOverlay.txt")
+      include(CMakeOverlay.txt)
+   endif()
+
+   # proceed if we aren't building rstudio monitor-only
+   if(NOT RSTUDIO_CONFIG_MONITOR_ONLY)
+
+      # find LibR
+      if(RSTUDIO_SESSION_WIN32)
+         set(LIBR_FIND_WINDOWS_32BIT TRUE)
+      endif()
+      find_package(LibR REQUIRED)
+
+      # verify we got the required R version
+      if(LIBR_FOUND AND RSTUDIO_VERIFY_R_VERSION)
+         set(CMAKE_REQUIRED_INCLUDES ${LIBR_INCLUDE_DIRS})
+         execute_process(
+             COMMAND "${LIBR_EXECUTABLE}" "--vanilla" "-s" "-e" "cat(as.character(getRversion()))"
+             OUTPUT_VARIABLE LIBR_VERSION)
+         if (LIBR_VERSION VERSION_LESS "${RSTUDIO_R_VERSION_REQUIRED}")
+            message(FATAL_ERROR "Minimum R version (${RSTUDIO_R_VERSION_REQUIRED}) not found; detected version is ${LIBR_VERSION}")
+         endif()
+      endif()
+
+      # r library
+      add_subdirectory(r)
+
+      # initialize subdirectories
+      file(MAKE_DIRECTORY conf)
+
+      # test runner script
+      if(NOT WIN32)
+
+         configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/rstudio-tests.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/rstudio-tests"
+            @ONLY)
+
+         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rstudio-pro-tests.in")
+            configure_file(
+               "${CMAKE_CURRENT_SOURCE_DIR}/rstudio-pro-tests.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/rstudio-pro-tests"
+               @ONLY)
+         endif()
+
+      endif()
+
+      # add desktop subprojects if we aren't building in server only mode
+      if(RSTUDIO_ELECTRON)
+         add_subdirectory(diagnostics)
+      endif()
+
+      add_subdirectory(session)
+
+      # help RStudio find build GWT components for devmode
+      if(RSTUDIO_PACKAGE_BUILD)
+         set(WWW_LOCAL_PATH "${CMAKE_CURRENT_BINARY_DIR}/../../gwt/www")
+      else()
+         set(WWW_LOCAL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../gwt/www")
+      endif()
+
+      # desktop conf file used for dev-mode for Electron desktop
+      if(RSTUDIO_ELECTRON OR RSTUDIO_DEVELOPMENT)
+         configure_file(conf/rdesktop-dev.conf ${CMAKE_CURRENT_BINARY_DIR}/conf/rdesktop-dev.conf)
+      endif()
+
+      # configure desktop files
+      if(RSTUDIO_ELECTRON AND WIN32)
+         configure_file(rstudio-tests.bat.in ${CMAKE_CURRENT_BINARY_DIR}/rstudio-tests.bat @ONLY)
+      endif()
+
+      # add server subprojects if we aren't building in desktop only mode
+      if(RSTUDIO_SERVER)
+         add_subdirectory(server)
+         add_subdirectory(server/url-ports)
+         configure_file(rserver-dev.in ${CMAKE_CURRENT_BINARY_DIR}/rserver-dev)
+         configure_file(conf/rserver-dev.conf ${CMAKE_CURRENT_BINARY_DIR}/conf/rserver-dev.conf)
+         configure_file(conf/rsession-dev.conf ${CMAKE_CURRENT_BINARY_DIR}/conf/rsession-dev.conf)
+         configure_file(conf/database-dev.conf ${CMAKE_CURRENT_BINARY_DIR}/conf/database-dev.conf)
+      endif()
+   endif()
+
+endif()
+

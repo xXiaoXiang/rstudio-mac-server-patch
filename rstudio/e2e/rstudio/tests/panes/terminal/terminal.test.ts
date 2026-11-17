@@ -1,0 +1,361 @@
+import { test, expect } from '@fixtures/rstudio.fixture';
+import { TIMEOUTS } from '@utils/constants';
+import { ConsolePaneActions } from '@actions/console_pane.actions';
+import { AceEditor } from '@pages/ace_editor.page';
+import { clearPref, executeCommand, setPref } from '@utils/commands';
+import { useSuiteSandbox } from '@utils/sandbox';
+import { rStringLiteral } from '@utils/r';
+import {
+  XTERM_SELECTOR,
+  captureResult,
+  killAllTerminals,
+  openTerminal,
+  retryTerminalInput,
+} from '@utils/terminal';
+import type { Page } from 'playwright';
+
+// The WebGL addon appends its webgl2 render canvas plus a 2D link layer to
+// the xterm screen element (the DOM renderer uses no canvas). Find the render
+// canvas -- skip canvases already holding a 2D context, then require an
+// existing webgl2 context (getContext returns null for a mismatched type) --
+// and force a context loss on it. On loss the addon waits ~3s for the browser
+// to restore the context (WEBGL_lose_context never does without an explicit
+// restoreContext()), then fires onContextLoss; RStudio must dispose the addon
+// and fall back to the DOM renderer or the terminal stops painting (#18393).
+// The addon attaches asynchronously after the widget appears, and the caller
+// has established that this environment supports WebGL2, so a render canvas
+// that never attaches is a product failure: the poll fails the test rather
+// than skipping it.
+async function loseWebGLContext(page: Page): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const canvases = document.querySelectorAll<HTMLCanvasElement>('.xterm-screen canvas');
+          for (const el of canvases) {
+            if (el.getContext('2d')) continue;
+            const gl = el.getContext('webgl2');
+            if (gl) {
+              const ext = gl.getExtension('WEBGL_lose_context');
+              if (!ext) throw new Error('WEBGL_lose_context extension unavailable');
+              ext.loseContext();
+              return true;
+            }
+          }
+          return false;
+        }),
+      {
+        message: 'WebGL2 is available but the addon render canvas never attached',
+        timeout: TIMEOUTS.consoleReady,
+      },
+    )
+    .toBe(true);
+}
+
+// Type a command whose *output* contains a marker that the echoed command
+// line does not (the quotes split it), so the assertion can only match real
+// rendered output. Assert on the terminal's rendered DOM rows, not
+// rstudioapi::terminalBuffer(): the server-side buffer still receives output
+// when client rendering is broken, which is exactly the bug. Retyping cannot
+// mask that bug: nothing typed shows up while rendering is broken.
+async function expectTerminalRenders(page: Page, markerPrefix: string): Promise<void> {
+  await page.locator(XTERM_SELECTOR).click();
+
+  await retryTerminalInput(
+    page,
+    async () => {
+      await page.keyboard.type(`echo "${markerPrefix}""loss_ok"`);
+      await page.keyboard.press('Enter');
+    },
+    () =>
+      expect
+        .poll(
+          async () => {
+            // .xterm-rows only exists under the DOM renderer, so this throws
+            // while the dead WebGL renderer is still in place -- report that
+            // as "nothing rendered" and keep polling until the fallback
+            // happens.
+            const text = await page
+              .locator('.xterm-rows')
+              .innerText()
+              .catch(() => '');
+            // innerText yields one line per xterm row and the hard wrap can
+            // land anywhere depending on prompt width, so strip whitespace;
+            // also strip U+00B7, seen in terminal-derived text on some
+            // platforms (see the send-to-editor test above).
+            return text.replace(/[\s\u00B7]+/g, '');
+          },
+          { timeout: TIMEOUTS.consoleReady },
+        )
+        .toContain(`${markerPrefix}loss_ok`),
+  );
+}
+
+// Sandbox for file-creation test (terminal cwd is its own shell, so we
+// pass the absolute sandbox path directly to the shell command).
+const sandbox = useSuiteSandbox();
+
+test.describe.serial('Terminal pane', () => {
+  let consoleActions: ConsolePaneActions;
+
+  test.beforeAll(async ({ rstudioPage: page }) => {
+    consoleActions = new ConsolePaneActions(page);
+  });
+
+  test.afterEach(async ({ rstudioPage: page }) => {
+    await killAllTerminals(page).catch(() => {});
+    await executeCommand(page, 'activateConsole').catch(() => {});
+  });
+
+  test('a terminal can be created and is visible', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    const xterm = page.locator(XTERM_SELECTOR);
+    const box = await xterm.boundingBox();
+    expect(box, 'xterm widget should have a bounding box').not.toBeNull();
+    expect(box!.width, 'xterm width').toBeGreaterThan(0);
+    expect(box!.height, 'xterm height').toBeGreaterThan(0);
+  });
+
+  test('closing a terminal terminates its shell process', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    const pid = Number(
+      await captureResult(page, 'rstudioapi::terminalContext(rstudioapi::terminalList()[[1]])$pid'),
+    );
+    expect(pid, 'shell pid').toBeGreaterThan(0);
+
+    // "Close current terminal session", the pane's toolbar button
+    await executeCommand(page, 'closeTerminal');
+    await expect(page.locator(XTERM_SELECTOR)).toHaveCount(0, { timeout: TIMEOUTS.consoleReady });
+
+    // Closing used to merely interrupt the shell, which an interactive shell
+    // ignores: it lived on under the session, and the prompt it redrew was
+    // logged as errors (#18976). Ask the OS whether the pid still exists:
+    // signal 0 probes without killing on POSIX; tasklist filters by pid on
+    // Windows.
+    const isRunning =
+      `{ pid <- ${pid}; if (.Platform$OS.type == "windows") ` +
+      `any(grepl(sprintf('"%d"', pid), system2("tasklist", c("/FI", shQuote(sprintf("PID eq %d", pid)), "/NH", "/FO", "CSV"), stdout = TRUE), fixed = TRUE)) ` +
+      `else tools::pskill(pid, 0) }`;
+    await expect
+      .poll(() => captureResult(page, isRunning), { timeout: TIMEOUTS.consoleReady })
+      .toBe('FALSE');
+  });
+
+  test('we can run commands in the terminal', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    // After openTerminal returns, the terminal tab is selected and xterm
+    // is focused. Type the command via the page keyboard, then wait for the
+    // terminal buffer to include the result line. Poll via
+    // rstudioapi::terminalBuffer -- the xterm canvas isn't directly readable.
+    await retryTerminalInput(
+      page,
+      async () => {
+        await page.keyboard.type('expr 1 + 1');
+        await page.keyboard.press('Enter');
+      },
+      () => expect.poll(
+        () => captureResult(
+          page,
+          '{ ids <- rstudioapi::terminalList(); ' +
+          'length(ids) > 0 && any(grepl("^2$", rstudioapi::terminalBuffer(ids[[1]]))) }',
+        ),
+        { timeout: TIMEOUTS.consoleReady },
+      ).toBe('TRUE'),
+    );
+
+    // Send the terminal contents to a new editor tab.
+    await executeCommand(page, 'sendTerminalToEditor');
+
+    // Find the new editor as the active tab (sendTerminalToEditor activates
+    // it) and assert it contains both the command and the result "2" on its
+    // own line. We can't require any contiguous substring of the command --
+    // on Server-on-Linux the prompt ($USER@$HOST:$CWD$ ) pushes the command
+    // toward the xterm wrap column, and depending on the prompt length the
+    // hard wrap can land anywhere, even mid-word ("...$ exp" / "r 1 + 1" was
+    // observed when the cwd was a long sandbox path). That also rules out
+    // locating the editor by content marker. So compare with all whitespace
+    // and wrap markers (U+00B7 middle dot) stripped, which is invariant
+    // under any wrap position, and check the result "2" (a single character,
+    // so it can't wrap) on a raw line of its own. The rstudioapi::terminalBuffer ^2$
+    // poll above is the authoritative output check; this assertion only
+    // confirms the editor tab received both the command and the result.
+    const editor = new AceEditor(page, '');
+    await expect.poll(
+      async () => {
+        try {
+          const value = (await editor.getValue()).replace(/\r?\n+/g, '\n');
+          const dewrapped = value.replace(/[\s\u00B7]+/g, '');
+          return dewrapped.includes('expr1+1') && /(?:^|\n)2(?:\n|$)/.test(value);
+        } catch {
+          return false;
+        }
+      },
+      { timeout: TIMEOUTS.fileOpen },
+    ).toBe(true);
+  });
+
+  test('toolbar shows next and previous terminal buttons', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    await expect(page.locator('#rstudio_tb_nextterminal')).toBeVisible();
+    await expect(page.locator('#rstudio_tb_previousterminal')).toBeVisible();
+  });
+
+  test('R --version runs in the terminal', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    await retryTerminalInput(
+      page,
+      async () => {
+        await page.keyboard.type('R --version');
+        await page.keyboard.press('Enter');
+      },
+      () => expect.poll(
+        () => captureResult(
+          page,
+          '{ ids <- rstudioapi::terminalList(); ' +
+          'length(ids) > 0 && any(grepl("R version", rstudioapi::terminalBuffer(ids[[1]]))) }',
+        ),
+        { timeout: TIMEOUTS.consoleReady },
+      ).toBe('TRUE'),
+    );
+  });
+
+  test('a file created in the terminal appears in a directory listing', async ({
+    rstudioPage: page,
+  }) => {
+    await killAllTerminals(page);
+    await openTerminal(page);
+
+    // cd into the absolute sandbox path first, then create and list the file
+    // using a short name. The file is cleaned up by globalTeardown regardless
+    // of the terminal's working directory. terminalBuffer() returns one entry
+    // per *physical* line, and the echoed command line (prompt + command) can
+    // wrap anywhere -- on macOS CI the runner's GUID hostname makes the
+    // prompt so long that "ztestfile.txt" was seen torn across a wrap
+    // boundary mid-filename. So type the touch argument with a quote split
+    // ("ztest""file.txt"), the same trick as expectTerminalRenders: the
+    // echoed command then never contains the contiguous filename, and a
+    // single intact match can only come from the ls output, which starts at
+    // column 0 and cannot wrap. (Requiring the echo too would reintroduce
+    // the wrap dependency; this way a match still proves touch succeeded,
+    // since ls only lists the file if it exists.)
+    const sandboxDir = sandbox.dir.replace(/\\/g, '/');
+    await retryTerminalInput(
+      page,
+      async () => {
+        await page.keyboard.type(`cd ${sandboxDir}`);
+        await page.keyboard.press('Enter');
+        await page.keyboard.type('touch "ztest""file.txt"');
+        await page.keyboard.press('Enter');
+        await page.keyboard.type('ls');
+        await page.keyboard.press('Enter');
+      },
+      () => expect.poll(
+        () => captureResult(
+          page,
+          '{ ids <- rstudioapi::terminalList(); ' +
+          'buf <- rstudioapi::terminalBuffer(ids[[1]]); ' +
+          'length(ids) > 0 && any(grepl("ztestfile.txt", buf, fixed = TRUE)) }',
+        ),
+        { timeout: TIMEOUTS.consoleReady },
+      ).toBe('TRUE'),
+    );
+  });
+
+  test('terminal keeps rendering after WebGL context loss', async ({ rstudioPage: page }) => {
+    await killAllTerminals(page);
+
+    // Skip only when the environment cannot create WebGL2 contexts at all
+    // (no GPU and no software rasterizer) -- then the addon can never
+    // activate and context loss cannot occur. Capability is probed on a
+    // detached canvas, independent of the addon, so that "RStudio failed to
+    // enable WebGL in a capable environment" reads as a test failure (in
+    // loseWebGLContext) rather than an environment skip.
+    const webglCapable = await page.evaluate(
+      () => !!document.createElement('canvas').getContext('webgl2'),
+    );
+    test.skip(!webglCapable, 'environment cannot create WebGL2 contexts');
+
+    try {
+      // The "canvas" renderer preference (the default) maps to the xterm.js
+      // WebGL addon. Set it explicitly so this test doesn't depend on pref
+      // drift from earlier tests.
+      await setPref(page, 'terminal_renderer', 'canvas');
+      await openTerminal(page);
+
+      await loseWebGLContext(page);
+      await expectTerminalRenders(page, 'pw_ctx1');
+
+      // Re-enable WebGL on the same terminal (dom -> canvas reloads the
+      // addon) and lose the context again. This exercises the second
+      // subscription: unloadWebGLAddon must clear its handler-installed flag
+      // during the first fallback, or the reloaded addon has no context-loss
+      // handler and the next loss breaks the terminal again.
+      await setPref(page, 'terminal_renderer', 'dom');
+      await setPref(page, 'terminal_renderer', 'canvas');
+      await loseWebGLContext(page);
+      await expectTerminalRenders(page, 'pw_ctx2');
+    } finally {
+      // canvas is the schema default, but clear the user-layer value so the
+      // rest of the run keeps default layering.
+      await clearPref(page, 'terminal_renderer');
+    }
+  });
+
+  test(
+    'Shift+Backspace deletes the last character before submission',
+    { tag: ['@desktop_only'] },
+    async ({ rstudioPage: page }) => {
+      await killAllTerminals(page);
+      await openTerminal(page);
+
+      // Verify the deletion through a filesystem side effect rather than the
+      // terminal buffer: type a `touch` command with a stray trailing "Q",
+      // delete it with Shift+Backspace, and check which file was created.
+      // The buffer is unsuitable for this assertion: after the deletion,
+      // readline may redraw the whole (wrapped) prompt line instead of
+      // erasing in place, and the server-side buffer capture keeps the stale
+      // pre-erase command image, so a grep for the original text matches even
+      // though the deletion worked. Whether readline erases or redraws is a
+      // shell implementation detail -- the grep started failing with Ubuntu
+      // 26.04 (bash 5.3 / readline 8.3, which reworked redisplay) while
+      // older Ubuntu erased in place -- and also depends on prompt width,
+      // which varies per CI runner (hostname and sandbox path lengths).
+      const sandboxDir = sandbox.dir.replace(/\\/g, '/');
+      // If Shift+Backspace deleted the trailing "Q", the file without the
+      // "Q" exists and the file with it does not. If the keystroke had no
+      // effect, only "term_bs_test.txtQ" exists and the first condition
+      // stays false; if it deleted more than one character, neither file
+      // matches. The file is cleaned up with the sandbox by globalTeardown.
+      // A retry cannot hide a Shift+Backspace that does nothing: the "Q"
+      // file from the first attempt keeps the second condition false.
+      await retryTerminalInput(
+        page,
+        async () => {
+          await page.keyboard.type(`cd ${sandboxDir}`);
+          await page.keyboard.press('Enter');
+          await page.keyboard.type('touch term_bs_test.txtQ');
+          await page.keyboard.press('Shift+Backspace');
+          await page.keyboard.press('Enter');
+        },
+        () => expect.poll(
+          () => captureResult(
+            page,
+            `{ file.exists(file.path(${rStringLiteral(sandboxDir)}, "term_bs_test.txt")) && ` +
+            `!file.exists(file.path(${rStringLiteral(sandboxDir)}, "term_bs_test.txtQ")) }`,
+          ),
+          { timeout: TIMEOUTS.consoleReady },
+        ).toBe('TRUE'),
+      );
+    },
+  );
+});
