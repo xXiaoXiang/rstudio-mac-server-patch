@@ -1,0 +1,2042 @@
+/*
+ * CompilationDatabase.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include "CompilationDatabase.hpp"
+
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <gsl/gsl-lite.hpp>
+
+#include <boost/format.hpp>
+#include <boost/regex.hpp>
+#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/trim_all.hpp>
+
+#include <shared_core/Hash.hpp>
+
+#include <core/Algorithm.hpp>
+#include <core/Debug.hpp>
+#include <core/FileSerializer.hpp>
+#include <core/libclang/LibClang.hpp>
+#include <core/PerformanceTimer.hpp>
+#include <core/r_util/RToolsInfo.hpp>
+#include <core/system/FileScanner.hpp>
+#include <core/system/ProcessArgs.hpp>
+
+#include <r/RExec.hpp>
+#include <r/ROptions.hpp>
+#include <r/RVersionInfo.hpp>
+
+#include <session/projects/SessionProjects.hpp>
+#include <session/SessionModuleContext.hpp>
+
+#include "CodeCompletion.hpp"
+#include "SourceIndex.hpp"
+
+using namespace rstudio::core;
+using namespace rstudio::core::libclang;
+using namespace boost::placeholders;
+
+// The compilation database version.
+//
+// Bump this version if you'd like newer versions of RStudio
+// to be forced to rebuild the compilation database, e.g. because
+// the methodology used to infer compilation flags has changed.
+#define kCompilationDatabaseVersion 6
+
+// The precompiled header version.
+//
+// Bump this version when the way precompiled headers are built changes
+// (e.g. the options passed to libclang), so that ones built by an older
+// version of RStudio are discarded rather than reused.
+#define kPrecompiledHeaderVersion "2"
+
+namespace rstudio {
+namespace session {
+namespace modules { 
+namespace clang {
+
+namespace {
+
+// whether the compilation database needs to be rebuilt
+bool s_rebuildCompilationDatabase = false;
+
+// whether re-generation of compiler definitions is required
+bool s_regenerateCompilerDefinitions = false;
+
+LibClang& clang()
+{
+   return libclang::clang();
+}
+
+bool verbose(int level)
+{
+   return sourceIndex().verbose() >= level;
+}
+
+bool precompiledHeadersEnabled()
+{
+   return r::options::getOption<bool>("rstudio.libclang.usePrecompiledHeaders", true, false);
+}
+
+FilePath compilerDatabaseDirImpl()
+{
+   FilePath path = module_context::scopedScratchPath().completeChildPath("compilation-database");
+
+   // on Windows, use different compilation databases for different architectures
+#ifdef _WIN32
+# ifdef _WIN64
+   path = path.completeChildPath("mingw64");
+# else
+   path = path.completeChildPath("mingw32");
+# endif
+#endif
+
+   Error error = path.ensureDirectory();
+   if (error)
+      LOG_ERROR(error);
+
+   return path;
+}
+
+FilePath compilerDatabaseDir()
+{
+   static FilePath instance = compilerDatabaseDirImpl();
+   return instance;
+}
+
+FilePath compilationConfigFilePath()
+{
+   return compilerDatabaseDir().completeChildPath("config.json");
+}
+
+#ifdef _WIN32
+
+FilePath compilerDefinitionsPath(bool isCpp)
+{
+   std::string name = isCpp ? "cpp-definitions.h" : "c-definitions.h";
+   return compilerDatabaseDir().completeChildPath(name);
+}
+
+void generateCompilerDefinitions(FilePath defnPath, bool isCpp)
+{
+   Error error = r::exec::RFunction(".rs.libclang.generateCompilerDefinitions")
+         .addUtf8Param(defnPath)
+         .addParam(isCpp)
+         .call();
+   if (error)
+      LOG_ERROR(error);
+}
+
+void generateCompilerDefinitions()
+{
+   // update C definitions
+   FilePath cDefnPath = compilerDefinitionsPath(false);
+   if (s_regenerateCompilerDefinitions || !cDefnPath.exists())
+      generateCompilerDefinitions(cDefnPath, false);
+
+   // update C++ definitions
+   FilePath cppDefnPath = compilerDefinitionsPath(true);
+   if (s_regenerateCompilerDefinitions || !cppDefnPath.exists())
+      generateCompilerDefinitions(cppDefnPath, true);
+
+   // we've re-generated our definitions, so unset flag
+   s_regenerateCompilerDefinitions = false;
+}
+
+#endif
+
+FilePath precompiledHeaderDir(const std::string& pkgName)
+{
+   return module_context::tempDir()
+         .completeChildPath("rstudio/libclang/precompiled")
+         .completeChildPath(pkgName);
+}
+
+// Marks a PCH (and its source) built with flags from a 'compile_flags.txt';
+// the hash of those flags follows
+const char* const kUserFlagsPchInfix = "-flags-";
+
+std::string userFlagsPchSuffix(const std::vector<std::string>& userFlags)
+{
+   return kUserFlagsPchInfix + core::hash::crc32HexHash(core::algorithm::join(userFlags, "\n"));
+}
+
+// Removes the package's PCHs (and their sources) from a platform directory,
+// or only those built with user flags
+void removePrecompiledHeaders(const FilePath& platformPath,
+                              const std::string& pkgName,
+                              bool userFlagsOnly)
+{
+   std::vector<FilePath> children;
+   Error error = platformPath.getChildren(children);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return;
+   }
+
+   for (const FilePath& child : children)
+   {
+      std::string name = child.getFilename();
+      bool isUserFlagsPch = name.find(kUserFlagsPchInfix) != std::string::npos;
+      if (boost::algorithm::starts_with(name, pkgName) && (isUserFlagsPch || !userFlagsOnly))
+      {
+         error = child.removeIfExists();
+         if (error)
+            LOG_ERROR(error);
+      }
+   }
+}
+
+struct SourceCppFileInfo
+{
+   SourceCppFileInfo() : disableIndexing(false) {}
+   bool empty() const { return hash.empty(); }
+   std::string hash;
+   std::string cppPkg;
+   bool disableIndexing;
+};
+
+// Flags last read from each 'compile_flags.txt', keyed by the file's path
+std::map<std::string, std::vector<std::string>> s_compileFlagsCache;
+
+} // anonymous namespace
+
+FilePath findCompileFlagsFile(const FilePath& dir, const FilePath& stopDir)
+{
+   FilePath current = dir;
+   while (true)
+   {
+      FilePath candidate = current.completeChildPath("compile_flags.txt");
+      if (candidate.exists())
+         return candidate;
+
+      // isEquivalentTo() tolerates a trailing separator or symlink on either side
+      if (current == stopDir || current.isEquivalentTo(stopDir))
+         return FilePath();
+
+      // guard against a stop directory we never reach
+      FilePath parent = current.getParent();
+      if (parent.isEmpty() || parent == current)
+         return FilePath();
+
+      current = parent;
+   }
+}
+
+FilePath compileFlagsFileForSource(const FilePath& srcFile)
+{
+   using namespace projects;
+
+   // only look beyond the file's own directory when it belongs to the open
+   // project, so a stray flags file higher up the tree isn't picked up
+   FilePath dir = srcFile.getParent();
+   FilePath stopDir = dir;
+   if (projectContext().hasProject() && dir.isWithin(projectContext().directory()))
+      stopDir = projectContext().directory();
+
+   return findCompileFlagsFile(dir, stopDir);
+}
+
+std::vector<std::string> readCompileFlags(const FilePath& flagsFile)
+{
+   // one argument per line (the clangd convention); blank lines are ignored
+   std::vector<std::string> flags;
+   Error error = core::readStringVectorFromFile(flagsFile, &flags);
+   if (error)
+      LOG_ERROR(error);
+
+   return flags;
+}
+
+// A relative path in compile_flags.txt is relative to the file, as in clangd,
+// but libclang would resolve it against the session's working directory. We
+// make such paths absolute here rather than passing '-working-directory', so
+// that the flags we generate (which can carry relative paths from Makevars)
+// keep resolving as they always have, and so that header completion, which
+// only reads '-I<dir>' arguments, sees the resolved directory.
+std::vector<std::string> resolveCompileFlagPaths(const std::vector<std::string>& flags,
+                                                 const FilePath& dir)
+{
+   // how clang accepts the operand of each path option: joined to it
+   // ('-Iinc'), after an '=' ('--include-directory=inc'), or only as the
+   // next argument ('-include-pch x.pch'); all of them also take it as the
+   // next argument. Longer spellings come before the ones they extend, so
+   // '-isystem-after' isn't read as '-isystem' with a '-after...' operand.
+   // The long include options are emitted as the short options they alias,
+   // which is the spelling header completion looks for.
+   enum OperandStyle { Joined, Equals, Separate };
+   struct PathOption { const char* spelling; OperandStyle style; const char* alias; };
+   static const PathOption kPathOptions[] = {
+      { "--include-directory-after", Equals, "-idirafter" },
+      { "--include-directory", Equals, "-I" },
+      { "--gcc-toolchain", Equals, nullptr },
+      { "--sysroot", Equals, nullptr },
+      { "-fmodule-map-file", Equals, nullptr },
+      { "-include-pch", Separate, nullptr },
+      { "-isystem-after", Joined, nullptr },
+      { "-cxx-isystem", Joined, nullptr },
+      { "-ivfsoverlay", Joined, nullptr },
+      { "-iframework", Joined, nullptr },
+      { "-idirafter", Joined, nullptr },
+      { "-isysroot", Joined, nullptr },
+      { "-imacros", Joined, nullptr },
+      { "-include", Joined, nullptr },
+      { "-isystem", Joined, nullptr },
+      { "-iquote", Joined, nullptr },
+      { "-F", Joined, nullptr },
+      { "-I", Joined, nullptr },
+   };
+
+   std::vector<std::string> resolved;
+   for (std::size_t i = 0; i < flags.size(); i++)
+   {
+      const std::string& flag = flags[i];
+
+      const PathOption* option = nullptr;
+      bool separate = false;
+      std::string path;
+      for (const PathOption& candidate : kPathOptions)
+      {
+         if (!boost::algorithm::starts_with(flag, candidate.spelling))
+            continue;
+
+         std::string rest = flag.substr(std::strlen(candidate.spelling));
+         if (rest.empty())
+            separate = true;
+         else if (candidate.style == Joined)
+            path = rest;
+         else if (candidate.style == Equals && rest[0] == '=')
+            path = rest.substr(1);
+         else
+            continue;
+
+         option = &candidate;
+         break;
+      }
+
+      // not a path option, or one with no operand at all (left for clang to report)
+      if (option == nullptr || (separate && i + 1 == flags.size()))
+      {
+         resolved.push_back(flag);
+         continue;
+      }
+
+      if (separate)
+         path = flags[++i];
+
+      // clang replaces a leading '=' or '$SYSROOT' with the sysroot, so
+      // such an operand isn't relative to the flags file
+      bool sysrootRelative =
+            boost::algorithm::starts_with(path, "=") ||
+            boost::algorithm::starts_with(path, "$SYSROOT");
+      if (!sysrootRelative)
+         path = dir.completePath(path).getAbsolutePath();
+
+      // emit each option in a single spelling, so the same flags hash alike
+      if (option->alias != nullptr)
+      {
+         resolved.push_back(option->alias + path);
+         continue;
+      }
+
+      switch (option->style)
+      {
+      case Joined:
+         resolved.push_back(option->spelling + path);
+         break;
+      case Equals:
+         resolved.push_back(option->spelling + ("=" + path));
+         break;
+      case Separate:
+         resolved.push_back(option->spelling);
+         resolved.push_back(path);
+         break;
+      }
+   }
+
+   return resolved;
+}
+
+// Extra compiler flags from a 'compile_flags.txt', following the clangd
+// convention of one argument per line. We look in the source file's directory
+// and its parents, up to the project directory, so a project can append to or
+// override the flags we generate (the last occurrence of a flag wins).
+std::vector<std::string> compileFlagsForSource(const FilePath& srcFile)
+{
+   FilePath flagsFile = compileFlagsFileForSource(srcFile);
+   if (flagsFile.isEmpty())
+      return {};
+
+   // a file with no flags in it is the same as no file, so it keeps
+   // sharing the default precompiled header
+   std::vector<std::string> flags = readCompileFlags(flagsFile);
+   if (flags.empty())
+      return {};
+
+   // relative paths in the file resolve against its directory, as in clangd
+   flags = resolveCompileFlagPaths(flags, flagsFile.getParent());
+
+   // the file is small, so re-reading it is cheaper and more reliable than
+   // watching its timestamp; we only remember it to report changes
+   std::string key = flagsFile.getAbsolutePath();
+   auto it = s_compileFlagsCache.find(key);
+   if (it == s_compileFlagsCache.end() || it->second != flags)
+   {
+      if (verbose(1))
+      {
+         std::cerr << "# COMPILE FLAGS FROM " << key << " ----" << std::endl;
+         core::debug::print(flags);
+         std::cerr << std::endl;
+      }
+
+      s_compileFlagsCache[key] = flags;
+   }
+
+   return flags;
+}
+
+// A user-flags PCH would otherwise outlive its 'compile_flags.txt': once the
+// file is gone (or emptied) its sources share the default PCH again, and
+// nothing else touches the variant. So drop the variants built from any
+// flags file we have read that no longer supplies flags.
+void removeOrphanedUserFlagsPchs(const FilePath& platformPath,
+                                 const std::string& pkgName)
+{
+   for (auto it = s_compileFlagsCache.begin(); it != s_compileFlagsCache.end(); )
+   {
+      FilePath flagsFile(it->first);
+      if (flagsFile.exists() && !readCompileFlags(flagsFile).empty())
+      {
+         ++it;
+         continue;
+      }
+
+      std::string suffix = userFlagsPchSuffix(it->second);
+      std::vector<FilePath> children;
+      Error error = platformPath.getChildren(children);
+      if (error)
+         LOG_ERROR(error);
+
+      for (const FilePath& child : children)
+      {
+         std::string name = child.getFilename();
+         if (boost::algorithm::starts_with(name, pkgName) && name.find(suffix) != std::string::npos)
+         {
+            error = child.removeIfExists();
+            if (error)
+               LOG_ERROR(error);
+         }
+      }
+
+      it = s_compileFlagsCache.erase(it);
+   }
+}
+
+namespace {
+
+std::string guessCppPackage(const std::string& contents)
+{
+   auto packages = { "cpp11", "Rcpp11", "RcppArmadillo", "Rcpp" };
+   for (auto&& package : packages)
+   {
+      boost::regex pattern("#include\\s*[<\"]" + std::string(package));
+      if (regex_utils::search(contents, pattern))
+         return package;
+   }
+
+   return "";
+}
+
+SourceCppFileInfo sourceCppFileInfo(const core::FilePath& srcPath)
+{
+   // read file
+   std::string contents;
+   Error error = core::readStringFromFile(srcPath, &contents);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return SourceCppFileInfo();
+   }
+
+   // info to return
+   SourceCppFileInfo info;
+
+   // check for C++ package
+   info.cppPkg = guessCppPackage(contents);
+   info.hash.append(info.cppPkg);
+
+   // find dependency attributes
+   boost::regex re(
+            "^\\s*//\\s*\\[\\[Rcpp::(\\w+)(\\(.*?\\))?\\]\\]\\s*$");
+   try
+   {
+      boost::sregex_token_iterator it(contents.begin(), contents.end(), re, 0);
+      boost::sregex_token_iterator end;
+      for ( ; it != end; ++it)
+      {
+         std::string attrib = *it;
+         boost::algorithm::trim_all(attrib);
+         info.hash.append(attrib);
+      }
+   }
+   CATCH_UNEXPECTED_EXCEPTION
+
+   // using RcppNT2/Boost.SIMD means don't index (expression templates
+   // are too much for the way we do indexing)
+   if (boost::algorithm::contains(info.hash, "RcppNT2"))
+      info.disableIndexing = true;
+
+   // return info
+   return info;
+}
+
+std::vector<std::string> extractCompileArgs(const std::string& line)
+{
+   std::vector<std::string> compileArgs;
+
+   // find arguments libclang might care about
+   // (we implement a poor man's shell arguments parser here:
+   // consider a true solution using e.g. a tokenizer)
+   try
+   {
+      boost::regex re(
+               "([ \\t])"                           // look for preceding space
+               "(-(?:isysroot|isystem|std|[IDif]))" // find flags we care about
+               "([ \\t]+)?"                         // allow for optional whitespace
+               "(\\\"[^\\\"]+\\\"|[^ ]+)");         // parse the argument passed
+
+      boost::sregex_iterator it(line.begin(), line.end(), re);
+      boost::sregex_iterator end;
+      for ( ; it != end; ++it)
+      {
+         boost::smatch match = *it;
+
+         std::string whitespace = match[3];
+         if (whitespace.empty())
+         {
+            std::string argument = match[2] + match[4];
+            boost::algorithm::replace_all(argument, "\"", "");
+            compileArgs.push_back(argument);
+         }
+         else
+         {
+            std::string first = match[2];
+            boost::algorithm::replace_all(first, "\"", "");
+            compileArgs.push_back(first);
+
+            std::string second = match[4];
+            boost::algorithm::replace_all(second, "\"", "");
+            compileArgs.push_back(second);
+         }
+      }
+   }
+   CATCH_UNEXPECTED_EXCEPTION
+
+   return compileArgs;
+}
+
+std::string extractStdArg(const std::vector<std::string>& args)
+{
+   // return the last '-std=' flag, since when multiple flags are present
+   // the last one takes precedence (matching compiler semantics)
+   std::string result;
+   for (const std::string& arg : args)
+   {
+      if (boost::algorithm::starts_with(arg, "-std="))
+         result = arg;
+   }
+   return result;
+}
+
+// When R embeds a default standard in CXX (e.g. '-std=gnu++17') and the
+// package requests a different one via CXX_STD in Makevars, R CMD SHLIB
+// produces both flags. Compilers handle this via "last flag wins", but
+// libclang can get confused (especially with precompiled headers).
+// Deduplicate by keeping only the last '-std=' flag.
+void deduplicateStdArgs(std::vector<std::string>& args)
+{
+   std::string lastStd = extractStdArg(args);
+   if (lastStd.empty())
+      return;
+
+   auto count = std::count_if(args.begin(), args.end(), [](const std::string& arg) {
+      return boost::algorithm::starts_with(arg, "-std=");
+   });
+
+   if (count <= 1)
+      return;
+
+   if (verbose(3))
+      std::cerr << "Deduplicating -std= flags (keeping: " << lastStd << ")" << std::endl;
+
+   core::algorithm::expel_if(args, [](const std::string& arg) {
+      return boost::algorithm::starts_with(arg, "-std=");
+   });
+
+   args.push_back(lastStd);
+}
+
+std::string buildFileHash(const FilePath& filePath)
+{
+   if (filePath.exists())
+   {
+      std::ostringstream ostr;
+      ostr << filePath.getLastWriteTime();
+      return ostr.str();
+   }
+   else
+   {
+      return std::string();
+   }
+}
+
+std::string computeCompilerHashImpl(bool isCpp)
+{
+   // include hash of default compiler version, so we can
+   // detect cases where the compiler version has changed
+   FilePath rHomeBinDir;
+   Error error = module_context::rBinDir(&rHomeBinDir);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return std::string();
+   }
+   
+   // retrieve compiler command
+   std::string compilerCommand;
+   {
+      shell_utils::ShellCommand rCmd = module_context::rCmd(rHomeBinDir);
+      rCmd << "config";
+      
+      if (isCpp)
+      {
+         rCmd << "CXX";
+      }
+      else
+      {
+         rCmd << "CC";
+      }
+   
+      core::system::ProcessOptions options;
+      core::system::ProcessResult result;
+      error = core::system::runCommand(rCmd, options, &result);
+      if (error)
+      {
+         LOG_ERROR(error);
+         return std::string();
+      }
+      
+      compilerCommand = string_utils::trimWhitespace(result.stdOut);
+   }
+   
+   // ask the compiler what version it is
+   core::system::ProcessOptions options;
+   core::system::ProcessResult result;
+   error = core::system::runCommand(
+            compilerCommand + " --version",
+            options,
+            &result);
+   
+   if (error)
+   {
+      LOG_ERROR(error);
+      return std::string();
+   }
+   
+   std::stringstream ss;
+   ss << std::hash<std::string>{}(string_utils::trimWhitespace(result.stdOut));
+   std::string hash = ss.str();
+   
+   return hash;
+}
+
+// NOTE: We assume that the compiler will not change within a single R session.
+// If the user wants to change the compiler they're using, they should restart R.
+std::string computeCompilerHash(bool isCpp)
+{
+   if (isCpp)
+   {
+      static std::string hash = computeCompilerHashImpl(true);
+      return hash;
+   }
+   else
+   {
+      static std::string hash = computeCompilerHashImpl(false);
+      return hash;
+   }
+}
+
+std::string computePackageBuildFileHash()
+{
+   std::ostringstream ostr;
+   
+   using namespace module_context;
+   ostr << buildFileHash(resolveAliasedPath("~/.R/Makevars"));
+   ostr << buildFileHash(resolveAliasedPath("~/.R/Makevars.win"));
+   
+   FilePath buildPath = projects::projectContext().buildTargetPath();
+   ostr << buildFileHash(buildPath.completeChildPath("DESCRIPTION"));
+   
+   FilePath srcPath = buildPath.completeChildPath("src");
+   if (srcPath.exists())
+   {
+      ostr << buildFileHash(srcPath.completeChildPath("Makevars"));
+      ostr << buildFileHash(srcPath.completeChildPath("Makevars.win"));
+   }
+   
+   return ostr.str();
+}
+
+std::vector<std::string> parseCompilationResults(const std::string& results)
+{
+   // compile args to return
+   std::vector<std::string> compileArgs;
+
+   // break into lines
+   std::vector<std::string> lines;
+   boost::algorithm::split(lines, results, boost::algorithm::is_any_of("\r\n"));
+
+   // find the line with the compilation and add it's args
+   boost::regex re("-c [^\\.]+\\.c\\w* -o");
+   for (const std::string& line : lines)
+   {
+      if (regex_utils::search(line, re))
+      {
+         // extract compilation args
+         compileArgs = extractCompileArgs(line);
+         
+         // we found the compilation line; we're done parsing
+         break;
+      }
+   }
+   
+#ifdef _WIN32
+   // remove collision with built-in compilation arguments
+   // (we need to ensure system headers are included in the right order)
+   auto version = r::version_info::currentRVersion();
+   if (version.versionMajor() == 4 && version.versionMinor() >= 2)
+   {
+      core::algorithm::expel_if(compileArgs, [](const std::string& arg)
+      {
+         return arg.find("x86_64-w64-mingw32.static.posix") != std::string::npos;
+      });
+   }
+#endif
+
+   if (verbose(3))
+   {
+      std::cerr << "# PARSE COMPILATION RESULTS ----" << std::endl;
+      core::debug::print(compileArgs);
+      std::cerr << std::endl;
+   }
+
+   // return the args
+   return compileArgs;
+}
+
+std::string packagePCH(const std::string& linkingTo)
+{
+   std::string pch;
+   r::exec::RFunction func(".rs.packagePCH", linkingTo);
+   Error error = func.call(&pch);
+   if (error)
+   {
+      error.addProperty("linking-to", linkingTo);
+      LOG_ERROR(error);
+   }
+
+   if (verbose(1))
+   {
+      std::cerr << "PACKAGE PCH: " << (pch.empty() ? "(none)" : pch) << std::endl;
+   }
+
+   return pch;
+}
+
+bool packageIsCpp(const std::string& linkingTo, const FilePath& srcDir)
+{
+   // check first for LinkingTo with C++ package
+   if (boost::algorithm::contains(linkingTo, "Rcpp") || boost::algorithm::contains(linkingTo, "cpp11"))
+      return true;
+   
+   // otherwise, check the src directory for C++ files
+   if (!srcDir.exists())
+      return false;
+      
+   std::vector<FilePath> allSrcFiles;
+   Error error = srcDir.getChildren(allSrcFiles);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return false;
+   }
+
+   for (const FilePath& srcFile : allSrcFiles)
+   {
+      // some projects that are otherwise pure C might depend on some
+      // C++ extensions from rlang; ignore those if they exist
+      std::string name = srcFile.getFilename();
+      if (name == "rlang-rcc.cpp")
+         continue;
+      
+      // otherwise, check for a file containing a C++ extension
+      std::string ext = srcFile.getExtensionLowerCase();
+      if (ext == ".cpp" || ext == ".cc")
+         return true;
+   }
+
+   return false;
+}
+
+std::vector<std::string> includesForLinkingTo(const std::string& linkingTo)
+{
+   std::vector<std::string> includes;
+   r::exec::RFunction func(".rs.includesForLinkingTo", linkingTo);
+   Error error = func.call(&includes);
+   if (error)
+   {
+      error.addProperty("linking-to", linkingTo);
+      LOG_ERROR(error);
+   }
+
+   if (verbose(3))
+   {
+      std::cerr << "# LINKINGTO INCLUDES ----" << std::endl;
+      core::debug::print(includes);
+      std::cerr << std::endl;
+   }
+
+   return includes;
+}
+
+} // anonymous namespace
+
+
+ClangCompilationDatabase::ClangCompilationDatabase()
+   : usePrecompiledHeaders_(true),
+     forceRebuildPrecompiledHeaders_(false),
+     restoredCompilationConfig_(false)
+{
+}
+
+void ClangCompilationDatabase::updateForCurrentPackage()
+{
+   // one time restore of compilation config
+   if (!restoredCompilationConfig_)
+   {
+      restorePackageCompilationConfig();
+      restoredCompilationConfig_ = true;
+   }
+
+   // check hash to see if we can avoid this computation
+   std::string packageBuildFileHash = computePackageBuildFileHash();
+   std::string compilerHash = computeCompilerHash(packageCompilationConfig_.isCpp);
+   
+   bool isCurrent =
+         kCompilationDatabaseVersion == databaseVersion_ &&
+         packageBuildFileHash == packageBuildFileHash_ &&
+         compilerHash == compilerHash_ &&
+         module_context::rVersion() == rVersion_;
+
+   if (isCurrent && !s_rebuildCompilationDatabase)
+      return;
+   
+   if (verbose(2))
+   {
+      std::cerr << "[!] The compilation database is out-of-date and will be rebuilt." << std::endl << std::endl;
+   }
+
+   // we're about to rebuild the database, so unset flag now
+   s_rebuildCompilationDatabase = false;
+
+   // compilation config has changed; rebuild pch
+   forceRebuildPrecompiledHeaders_ = true;
+   s_regenerateCompilerDefinitions = true;
+
+   // start with base args
+   bool isCpp = true;
+   core::r_util::RPackageInfo pkgInfo;
+   std::vector<std::string> args = packageCompilationArgs(&pkgInfo, &isCpp);
+   if (!args.empty())
+   {
+      // set the args and build file hash (to avoid recomputation)
+      packageCompilationConfig_.args = args;
+      packageCompilationConfig_.PCH = packagePCH(pkgInfo.linkingTo());
+      packageCompilationConfig_.isCpp = isCpp;
+      packageBuildFileHash_ = packageBuildFileHash;
+      compilerHash_ = compilerHash;
+      rVersion_ = module_context::rVersion();
+      databaseVersion_ = kCompilationDatabaseVersion;
+
+      // save them to disk
+      savePackageCompilationConfig();
+   }
+
+}
+
+std::vector<std::string> ClangCompilationDatabase::compileArgsForPackage(
+      const core::system::Options& env,
+      const FilePath& srcDir,
+      bool isCpp)
+{
+   // find an appropriate source file to use as the target for compilation
+   auto isCompatibleSrcFile = [=](const FilePath& filePath)
+   {
+      if (isCpp)
+      {
+         return filePath.hasExtension(".cpp") || filePath.hasExtension(".cc");
+      }
+      else
+      {
+         return filePath.hasExtension(".c");
+      }
+   };
+   
+   std::vector<FilePath> srcFiles;
+   Error error = srcDir.getChildren(srcFiles);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return {};
+   }
+   
+   FilePath targetSrcFile;
+   for (auto&& srcFile : srcFiles)
+   {
+      if (isCompatibleSrcFile(srcFile))
+      {
+         targetSrcFile = srcFile;
+         break;
+      }
+   }
+   
+   // if we couldn't find a source file for some reason, just try to rebuild
+   // the compilation database again next time
+   if (!targetSrcFile.exists())
+   {
+      s_rebuildCompilationDatabase = true;
+      return {};
+   }
+   
+   // call R CMD shlib on that file
+   std::vector<std::string> compileArgs = argsForRCmdSHLIB(env, targetSrcFile);
+
+   // diagnostics
+   if (verbose(3))
+   {
+      std::cerr << "# PACKAGE COMPILATION ARGS ----" << std::endl;
+      core::debug::print(compileArgs);
+      std::cerr << std::endl;
+   }
+
+   // return the compileArgs
+   return compileArgs;
+}
+
+
+void ClangCompilationDatabase::savePackageCompilationConfig()
+{
+   json::Object configJson;
+   configJson["args"] = json::toJsonArray(packageCompilationConfig_.args);
+   configJson["pch"] = packageCompilationConfig_.PCH;
+   configJson["is_cpp"] = packageCompilationConfig_.isCpp;
+   configJson["hash"] = packageBuildFileHash_;
+   configJson["compiler"] = compilerHash_;
+   configJson["rversion"] = rVersion_;
+   configJson["dbversion"] = databaseVersion_;
+
+   FilePath configFilePath = compilationConfigFilePath();
+   std::string jsonFormatted = configJson.writeFormatted();
+   
+   if (verbose(1))
+   {
+      std::cerr << "# SAVING PACKAGE COMPILATION CONFIG ----" << std::endl;
+      std::cerr << configFilePath.getAbsolutePath() << std::endl;
+      std::cerr << jsonFormatted << std::endl << std::endl;
+   }
+   
+   Error error = writeStringToFile(configFilePath, jsonFormatted);
+   if (error)
+      LOG_ERROR(error);
+   
+}
+
+void ClangCompilationDatabase::restorePackageCompilationConfig()
+{
+   FilePath configFilePath = compilationConfigFilePath();
+   if (!configFilePath.exists())
+      return;
+
+   std::string contents;
+   Error error = readStringFromFile(compilationConfigFilePath(), &contents);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return;
+   }
+
+   json::Value configJson;
+   if (configJson.parse(contents) ||
+       !json::isType<json::Object>(configJson))
+   {
+      LOG_ERROR_MESSAGE("Error parsing compilation config: " + contents);
+      return;
+   }
+
+   json::Array argsJson;
+   error = json::readObject(configJson.getObject(),
+                            "args", argsJson,
+                            "pch", packageCompilationConfig_.PCH,
+                            "is_cpp", packageCompilationConfig_.isCpp,
+                            "hash", packageBuildFileHash_);
+   if (error)
+   {
+      error.addProperty("json", contents);
+      LOG_ERROR(error);
+      return;
+   }
+   
+   // also attempt to read 'compiler' field (added in 1.4 Juliet Rose)
+   // errors can be ignored here since this field won't exist in older databases
+   json::readObject(configJson.getObject(), "compiler", compilerHash_);
+   json::readObject(configJson.getObject(), "rversion", rVersion_);
+   json::readObject(configJson.getObject(), "dbversion", databaseVersion_);
+
+   // unpack compiler arguments
+   std::vector<std::string> args;
+   for (const json::Value& argJson : argsJson)
+   {
+      if (json::isType<std::string>(argJson))
+         args.push_back(argJson.getString());
+   }
+
+   // if the config references an '-include' that no longer exists,
+   // then force the database to be rebuilt
+   for (std::size_t i = 0, n = args.size(); i < n - 1; i++)
+   {
+      if (args[i] == "-include")
+      {
+         if (!FilePath(args[i + 1]).exists())
+            s_rebuildCompilationDatabase = true;
+      }
+   }
+
+   // update args
+   packageCompilationConfig_.args = args;
+   
+   if (verbose(1))
+   {
+      std::cerr << "# RESTORING PACKAGE COMPILATION CONFIG ----" << std::endl;
+      std::cerr << configFilePath.getAbsolutePath() << std::endl;
+      std::cerr << configJson.writeFormatted() << std::endl << std::endl;
+   }
+}
+
+void ClangCompilationDatabase::updateForSourceCpp(const core::FilePath& srcFile)
+{
+   // read the the source cpp hash for this file
+   SourceCppFileInfo info = sourceCppFileInfo(srcFile);
+
+   // check if we already have the args for this hash value
+   std::string filename = srcFile.getAbsolutePath();
+   SourceCppHashes::const_iterator it = sourceCppHashes_.find(filename);
+   if (it != sourceCppHashes_.end() && it->second == info.hash)
+      return;
+
+   // if there is no info then bail
+   if (info.empty())
+      return;
+
+   // if we are disabling indexing then bail
+   if (info.disableIndexing)
+   {
+      if (verbose(1))
+         std::cerr << "CLANG SKIP INDEXING (disabled): " << srcFile << std::endl;
+
+      return;
+   }
+
+   // get config
+   CompilationConfig config = configForSourceCpp(info.cppPkg, srcFile);
+
+   // save it
+   if (!config.empty())
+   {
+      // update map
+      sourceCppConfigMap_[filename] = config;
+
+      // save hash to prevent recomputation
+      sourceCppHashes_[filename] = info.hash;
+   }
+}
+
+
+Error ClangCompilationDatabase::executeSourceCpp(
+                                      core::system::Options env,
+                                      const std::string& cppPkg,
+                                      const core::FilePath& srcPath,
+                                      core::system::ProcessResult* pResult)
+{
+   // get path to R script
+   FilePath rScriptPath;
+   Error error = module_context::rScriptPath(&rScriptPath);
+   if (error)
+      return error;
+
+   // establish options
+   core::system::ProcessOptions options;
+
+   // always run as a slave
+   std::vector<std::string> args;
+   args.push_back("-s");
+
+   // for packrat projects we execute the profile and set the working
+   // directory to the project directory; for other contexts we just
+   // propagate the R_LIBS
+   if (module_context::packratContext().modeOn)
+   {
+      options.workingDir = projects::projectContext().directory();
+      args.push_back("--no-save");
+      args.push_back("--no-restore");
+   }
+   else
+   {
+      args.push_back("--vanilla");
+      std::string libPaths = module_context::libPathsString();
+      if (!libPaths.empty())
+         core::system::setenv(&env, "R_LIBS", libPaths);
+   }
+
+   // execute code
+   args.push_back("-e");
+
+   // difference sequence depending on the version of Rcpp we are using
+   if (cppPkg == "Rcpp" || cppPkg == "RcppArmadillo")
+   {
+      // we try to force --dry-run differently depending on the version of Rcpp
+      std::string extraParams;
+      if (module_context::isPackageVersionInstalled("Rcpp", "0.11.3"))
+         extraParams = ", dryRun = TRUE";
+      else
+         core::system::setenv(&env, "MAKE", "make --dry-run");
+
+      // add command to arguments
+      boost::format fmt("Rcpp::sourceCpp('%1%', showOutput = TRUE%2%)");
+      args.push_back(boost::str(fmt % srcPath.getAbsolutePath() % extraParams));
+   }
+   else if (cppPkg == "Rcpp11")
+   {
+      core::system::setenv(&env, "MAKE", "make --dry-run");
+      boost::format fmt("attributes::sourceCpp('%1%', verbose = TRUE)");
+      args.push_back(boost::str(fmt % srcPath.getAbsolutePath()));
+   }
+   else if (cppPkg == "cpp11")
+   {
+      core::system::setenv(&env, "MAKE", "make --dry-run");
+      boost::format fmt("cpp11::cpp_source('%1%', quiet = FALSE)");
+      args.push_back(boost::str(fmt % srcPath.getAbsolutePath()));
+   }
+
+
+   // set environment into options
+   options.environment = env;
+
+   // execute and capture output
+   return core::system::runProgram(
+            core::string_utils::utf8ToSystem(rScriptPath.getAbsolutePath()),
+            args,
+            "",
+            options,
+            pResult);
+}
+
+core::Error ClangCompilationDatabase::executeRCmdSHLIB(
+                                 core::system::Options env,
+                                 const core::FilePath& srcPath,
+                                 core::system::ProcessResult* pResult)
+{
+   // get R bin directory
+   FilePath rBinDir;
+   Error error = module_context::rBinDir(&rBinDir);
+   if (error)
+      return error;
+   
+   // compile the file as dry-run
+   module_context::RCommand rCmd(rBinDir);
+   rCmd << "SHLIB";
+   rCmd << "--dry-run";
+   rCmd << srcPath.getFilename();
+   
+   // a dirty trick to inject '--always-make' into the make invocation
+   rCmd << "\"' --always-make IGNORED='\"";
+   
+   if (verbose(3))
+   {
+      std::cerr << "EXECUTING R CMD SHLIB ----" << std::endl;
+      std::cerr << rCmd.commandString() << std::endl;
+   }
+
+   // set options and run
+   core::system::ProcessOptions options;
+   options.workingDir = srcPath.getParent();
+   options.environment = env;
+   Error result = core::system::runCommand(
+            rCmd.shellCommand(),
+            options,
+            pResult);
+   
+   if (verbose(3))
+   {
+      std::cerr << "stdout: " << pResult->stdOut << std::endl;
+      std::cerr << "stderr: " << pResult->stdErr << std::endl;
+   }
+   
+   return result;
+}
+
+bool ClangCompilationDatabase::isProjectTranslationUnit(
+                                          const std::string& filename) const
+{
+   using namespace projects;
+
+   if (projectContext().config().buildType != r_util::kBuildTypePackage)
+      return false;
+
+   FilePath filePath(filename);
+   FilePath pkgPath = projectContext().buildTargetPath();
+   FilePath srcDirPath = pkgPath.completeChildPath("src");
+   FilePath includePath = pkgPath.completeChildPath("inst/include");
+   return
+         filePath.isWithin(srcDirPath) ||
+         filePath.isWithin(includePath);
+}
+
+namespace {
+
+// allow only non-hidden directories and source files through
+// the translation filters (we'll remove the directories
+// in a separate pass)
+bool translationUnitFilter(const FileInfo& fileInfo,
+                           const FilePath& pkgSrcDir,
+                           const FilePath& pkgIncludeDir)
+{
+   FilePath filePath(fileInfo.absolutePath());
+   if (core::system::isHiddenFile(fileInfo))
+      return false;
+   else if (filePath.isDirectory())
+      return true;
+   else
+      return isIndexableFile(fileInfo, pkgSrcDir, pkgIncludeDir);
+}
+
+bool isNotDirectory(const FileInfo& fileInfo)
+{
+   return !fileInfo.isDirectory();
+}
+
+} // anonymous namespace
+
+std::vector<std::string> ClangCompilationDatabase::projectTranslationUnits() const
+{
+   // units to return
+   std::vector<std::string> units;
+
+   using namespace projects;
+   using namespace rstudio::core::system;
+   if (projectContext().hasProject())
+   {
+      // setup options for file scanning (including filter)
+      FilePath pkgPath = projectContext().buildTargetPath();
+      FilePath srcDirPath = pkgPath.completeChildPath("src");
+      FilePath includePath = pkgPath.completeChildPath("inst/include");
+      FileScannerOptions options;
+      options.recursive = true;
+      options.filter =
+            boost::bind(translationUnitFilter, _1, srcDirPath, includePath);
+
+      // scan the files
+      tree<FileInfo> files;
+      Error error = scanFiles(FileInfo(pkgPath), options, &files);
+      if (error)
+         LOG_ERROR(error);
+
+      // copy them to the out vector if they aren't directories
+      core::algorithm::copy_transformed_if(
+                              files.begin(),
+                              files.end(),
+                              std::back_inserter(units),
+                              isNotDirectory,
+                              fileInfoAbsolutePath);
+   }
+
+   return units;
+}
+
+void ClangCompilationDatabase::rebuildPackageCompilationDatabase()
+{
+   packageBuildFileHash_.clear();
+   compilerHash_.clear();
+   rVersion_.clear();
+}
+
+bool ClangCompilationDatabase::shouldIndexConfig(const CompilationConfig& config)
+{
+   // no args
+   if (config.args.empty())
+      return false;
+
+   // using RcppNT2/Boost.SIMD means don't index (expression templates
+   // are too much for the way we do indexing)
+   for (const std::string& arg : config.args)
+   {
+      if (boost::algorithm::contains(arg, "RcppNT2"))
+         return false;
+   }
+
+   return true;
+}
+
+
+bool ClangCompilationDatabase::configForTranslationUnit(const FilePath& filePath,
+                                                        CompilationConfig* pConfig)
+{
+   // if this is a package source file then return the package args
+   CompilationConfig config;
+   if (isProjectTranslationUnit(filePath.getAbsolutePath()))
+   {
+      // (re-)create on demand
+      updateForCurrentPackage();
+
+      // if we have args then capture them
+      config = packageCompilationConfig_;
+   }
+   // otherwise lookup in the global dictionary
+   else
+   {
+      // (re-)create on demand
+      updateForSourceCpp(filePath);
+
+      // if we have args then capture them
+      std::string filename = filePath.getAbsolutePath();
+      ConfigMap::const_iterator it = sourceCppConfigMap_.find(filename);
+      if (it != sourceCppConfigMap_.end())
+         config = it->second;
+   }
+
+   // bail if we aren't able to index this config
+   if (!shouldIndexConfig(config))
+   {
+      if (verbose(1))
+         std::cerr << "CLANG SKIP INDEXING (no config available): " << filePath << std::endl;
+
+      return false;
+   }
+
+   *pConfig = config;
+   return true;
+}
+
+std::vector<std::string> ClangCompilationDatabase::generatedCompileArgs(
+      const std::string& filename)
+{
+   FilePath filePath(filename);
+   CompilationConfig config;
+   if (!configForTranslationUnit(filePath, &config))
+      return std::vector<std::string>();
+
+   std::vector<std::string> args = config.args;
+
+   // force C++ for a .h file in a C++ config, as compileArgsForTranslationUnit() does
+   if (filePath.getExtensionLowerCase() == ".h" && config.isCpp)
+   {
+      args.push_back("-x");
+      args.push_back("c++");
+   }
+
+   return args;
+}
+
+std::vector<std::string> ClangCompilationDatabase::compileArgsForTranslationUnit(
+      const std::string& filename,
+      bool usePrecompiledHeaders)
+{
+   // args to return
+   std::vector<std::string> args;
+
+   // get a file path object
+   FilePath filePath(filename);
+
+   CompilationConfig config;
+   if (!configForTranslationUnit(filePath, &config))
+      return std::vector<std::string>();
+
+   // copy the args
+   std::copy(
+            config.args.begin(),
+            config.args.end(),
+            std::back_inserter(args));
+
+   // any user-provided flags; these also feed into the precompiled header,
+   // since libclang rejects a PCH built with different language options
+   std::vector<std::string> userFlags = compileFlagsForSource(filePath);
+
+   // add precompiled headers if necessary
+   if (usePrecompiledHeaders && usePrecompiledHeaders_ &&
+       precompiledHeadersEnabled() &&
+       !config.PCH.empty() && config.isCpp &&
+       (filePath.getExtensionLowerCase() != ".c") &&
+       (filePath.getExtensionLowerCase() != ".m"))
+   {
+      // extract any -std= argument
+      std::vector<std::string> pchArgs = precompiledHeaderArgs(config, userFlags);
+      std::copy(pchArgs.begin(),
+                pchArgs.end(),
+                std::back_inserter(args));
+   }
+
+   // if this is a .h file and it's a C++ config then force C++ for
+   // libclang (this is necessary because many C++ header files in
+   // the R ecosystem use .h
+   if (filePath.getExtensionLowerCase() == ".h" && config.isCpp)
+   {
+      args.push_back("-x");
+      args.push_back("c++");
+   }
+
+   // append the user-provided flags last so they take precedence
+   args.insert(args.end(), userFlags.begin(), userFlags.end());
+
+   // return args
+   return args;
+}
+
+ClangCompilationDatabase::CompilationConfig
+         ClangCompilationDatabase::configForSourceCpp(const std::string& cppPkg,
+                                                  FilePath srcFile)
+{
+   // validation: if this is Rcpp11 and we don't have the attributes
+   // package then there's no way for us to execute sourceCpp
+   using namespace module_context;
+   if (cppPkg == "Rcpp11" && !isPackageInstalled("attributes"))
+      return CompilationConfig();
+
+   // validation: if we don't have any version of Rcpp installed then
+   // we can't do sourceCpp
+   if ((cppPkg == "Rcpp" || cppPkg == "RcppArmadillo") && !isPackageVersionInstalled("Rcpp", "0.10.1"))
+      return CompilationConfig();
+
+   if (cppPkg == "RcppArmadillo" && !isPackageInstalled("RcppArmadillo"))
+      return CompilationConfig();
+
+   if (cppPkg == "cpp11" && !isPackageInstalled("cpp11"))
+      return CompilationConfig();
+
+   // start with base args
+   std::vector<std::string> args = baseCompilationArgs(true);
+
+   // if this is a header file we need to rename it as a temporary .cpp
+   // file so that R CMD SHLIB is willing to compile it
+   FilePath tempSrcFile = srcFile.getParent().completeChildPath(
+      kCompilationDbPrefix + core::system::generateUuid() + ".cpp");
+   RemoveOnExitScope removeOnExit(tempSrcFile, ERROR_LOCATION);
+   if (SourceIndex::isHeaderFile(srcFile))
+   {
+      Error error = srcFile.copy(tempSrcFile);
+      if (error)
+      {
+         LOG_ERROR(error);
+         return CompilationConfig();
+      }
+      srcFile = tempSrcFile;
+   }
+
+   // execute sourceCpp
+   core::system::ProcessResult result;
+   core::system::Options env = compilationEnvironment();
+   Error error = executeSourceCpp(env, cppPkg, srcFile, &result);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return CompilationConfig();
+   }
+
+   // parse the compilation results
+   std::vector<std::string> compileArgs = parseCompilationResults(result.stdOut);
+
+   // add them to the compile args
+   args.insert(args.begin(), compileArgs.begin(), compileArgs.end());
+
+   // deduplicate '-std=' flags
+   deduplicateStdArgs(args);
+
+   CompilationConfig config;
+   config.args = args;
+   config.PCH = cppPkg;
+   config.isCpp = true;
+   return config;
+
+}
+
+std::vector<std::string> ClangCompilationDatabase::argsForRCmdSHLIB(
+      core::system::Options env,
+      FilePath srcFile)
+{
+   // execute R CMD SHLIB
+   core::system::ProcessResult result;
+   Error error = executeRCmdSHLIB(env, srcFile, &result);
+
+   // process results of R CMD SHLIB
+   if (error)
+   {
+      LOG_ERROR(error);
+      return {};
+   }
+   else if (result.exitStatus != EXIT_SUCCESS)
+   {
+      LOG_ERROR_MESSAGE("Error performing R CMD SHLIB: " + result.stdErr);
+      return {};
+   }
+   else
+   {
+      // parse the compilation results
+      if (verbose(3))
+      {
+         std::cerr << "# PARSING COMPILATION OUTPUT ----" << std::endl;
+         std::cerr << result.stdOut << std::endl;
+      }
+
+      return parseCompilationResults(result.stdOut);
+   }
+}
+
+
+// The arguments for the include directories reported by the compiler, in the
+// order it reported them. They are passed with '-isystem' so that libclang
+// searches them in that order: clang drops a '-I' directory that is also one
+// of its own system directories, which can leave another of these (say, the
+// compiler's builtin headers) ahead of the C++ standard library's, and libc++
+// requires that its <stddef.h> be found before the builtin one.
+std::vector<std::string> systemIncludeArgs(const std::vector<std::string>& includes)
+{
+   std::vector<std::string> args;
+   for (const std::string& include : includes)
+      args.push_back("-isystem" + include);
+
+   return args;
+}
+
+std::vector<std::string> ClangCompilationDatabase::baseCompilationArgs(bool isCpp) const
+{
+   std::vector<std::string> args;
+   
+   // ask Eigen not to try to vectorize, since that involves
+   // including intrinsics that aren't compatible with libclang
+   args.push_back("-DEIGEN_DONT_VECTORIZE");
+
+   // clang stops parsing after 19 errors by default, which silently ends
+   // diagnostics and completions for the rest of the file (#19367)
+   args.push_back("-ferror-limit=0");
+
+#ifdef _WIN32
+   // add built-in clang compiler headers
+   // built-in headers are not required with Rtools40 or newer
+   r_util::RVersionNumber version = r::version_info::currentRVersion();
+
+   if (version.versionMajor() < 4)
+   {
+      auto clArgs = clang().compileArgs(isCpp);
+      args.insert(args.end(), clArgs.begin(), clArgs.end());
+   }
+   
+   // disable inclusion of default system headers
+   // otherwise, libclang will discover and use headers as provided with
+   // an installation of Visual Studio (if available), and those headers
+   // may not be compatible with the Rtools headers
+   args.push_back("-nostdinc");
+
+   if (version < r_util::RVersionNumber(4, 2, 0))
+   {
+      // add Rtools arguments
+      auto rtInfo = rToolsInfo();
+      auto rtArgs = rtInfo.clangArgs(isCpp);
+      args.insert(args.end(), rtArgs.begin(), rtArgs.end());
+   }
+   else
+   {
+      // add system include headers as reported by compiler
+      std::vector<std::string> includes;
+      discoverSystemIncludePaths(&includes);
+      for (auto&& include : includes) {
+         FilePath includePath = FilePath(include);
+         args.push_back("-I" + includePath.getAbsolutePath());
+      }
+   }
+
+   // re-generate compiler definitions
+   generateCompilerDefinitions();
+
+   // include compiler definitions on Windows, as libclang may not
+   // define all of the requisite gcc defines here
+   FilePath defnPath = compilerDefinitionsPath(isCpp);
+   if (defnPath.exists())
+   {
+      args.push_back("-include");
+      args.push_back(defnPath.getAbsolutePath());
+   }
+   
+#else
+   // add built-in clang compiler headers
+   auto clArgs = clang().compileArgs(isCpp);
+   args.insert(args.end(), clArgs.begin(), clArgs.end());
+   
+   // add system include headers as reported by compiler
+   std::vector<std::string> includes;
+   discoverSystemIncludePaths(&includes);
+   std::vector<std::string> includeArgs = systemIncludeArgs(includes);
+   args.insert(args.end(), includeArgs.begin(), includeArgs.end());
+#endif
+
+   if (verbose(3))
+   {
+      std::cerr << "# BASE COMPILATION ARGS ----" << std::endl;
+      core::debug::print(args);
+      std::cerr << std::endl;
+   }
+
+   return args;
+}
+
+std::vector<std::string> ClangCompilationDatabase::packageCompilationArgs(
+      core::r_util::RPackageInfo* pPkgInfo,
+      bool* pIsCpp)
+{
+   // read the package description file
+   using namespace projects;
+   FilePath pkgPath = projectContext().buildTargetPath();
+   core::r_util::RPackageInfo pkgInfo;
+   Error error = pkgInfo.read(pkgPath);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return {};
+   }
+
+   // determine if package is cpp
+   FilePath srcDir = pkgPath.completeChildPath("src");
+   bool isCpp = packageIsCpp(pkgInfo.linkingTo(), srcDir);
+
+   // start with base args
+   std::vector<std::string> args = baseCompilationArgs(isCpp);
+
+   // Discover all of the LinkingTo relationships and add -I
+   // arguments for them
+   if (!pkgInfo.linkingTo().empty())
+   {
+      // Get includes implied by the LinkingTo field
+      std::vector<std::string> includes = includesForLinkingTo(pkgInfo.linkingTo());
+
+      // add them to args
+      args.insert(args.begin(), includes.begin(), includes.end());
+   }
+
+   // get the build environment (e.g. Rtools config)
+   core::system::Options env = compilationEnvironment();
+
+   // Check for C++11 in SystemRequirements
+   if (boost::algorithm::icontains(pkgInfo.systemRequirements(), "C++11"))
+   {
+      env.push_back(std::make_pair("USE_CXX1X", "1"));
+      env.push_back(std::make_pair("USE_CXX11", "1"));
+   }
+   else if (boost::algorithm::icontains(pkgInfo.systemRequirements(), "C++14"))
+   {
+      env.push_back(std::make_pair("USE_CXX1Y", "1"));
+      env.push_back(std::make_pair("USE_CXX14", "1"));
+   }
+   else if (boost::algorithm::icontains(pkgInfo.systemRequirements(), "C++17"))
+   {
+      env.push_back(std::make_pair("USE_CXX1Z", "1"));
+      env.push_back(std::make_pair("USE_CXX17", "1"));
+   }
+   else if (boost::algorithm::icontains(pkgInfo.systemRequirements(), "C++20"))
+   {
+      env.push_back(std::make_pair("USE_CXX20", "1"));
+   }
+   else if (boost::algorithm::icontains(pkgInfo.systemRequirements(), "C++23"))
+   {
+      env.push_back(std::make_pair("USE_CXX23", "1"));
+   }
+
+   // Run R CMD SHLIB
+   std::vector<std::string> compileArgs = compileArgsForPackage(env, srcDir, isCpp);
+
+   // perform path substitution
+   std::transform(
+            compileArgs.begin(),
+            compileArgs.end(),
+            compileArgs.begin(),
+            [&](std::string arg)
+   {
+      boost::algorithm::replace_first(
+               arg,
+               "-I..",
+               "-I" + srcDir.getParent().getAbsolutePath());
+
+      boost::algorithm::replace_first(
+               arg,
+               "-I.",
+               "-I" + srcDir.getAbsolutePath());
+
+      return arg;
+
+   });
+
+   // add these to our args
+   args.insert(args.begin(), compileArgs.begin(), compileArgs.end());
+
+   // deduplicate '-std=' flags
+   deduplicateStdArgs(args);
+
+   if (pPkgInfo)
+      *pPkgInfo = pkgInfo;
+
+   if (pIsCpp)
+      *pIsCpp = isCpp;
+
+   if (verbose(3))
+   {
+      std::cerr << "# PACKAGE COMPILATION ARGS ----" << std::endl;
+      core::debug::print(args);
+      std::cerr << std::endl;
+   }
+
+   return args;
+
+}
+
+#ifdef _WIN32
+
+core::r_util::RToolsInfo findRtools()
+{
+   // scan for Rtools
+   std::string rVersion = module_context::rVersion();
+   std::vector<core::r_util::RToolsInfo> rTools;
+   core::r_util::scanForRTools(rVersion, &rTools);
+
+   // enumerate them to see if we have a compatible version
+   // (go in reverse order for most recent first)
+   std::vector<r_util::RToolsInfo>::const_reverse_iterator it = rTools.rbegin();
+   for ( ; it != rTools.rend(); ++it)
+   {
+      if (module_context::isRtoolsCompatible(*it))
+      {
+         return *it;
+      }
+   }
+
+   return core::r_util::RToolsInfo();
+}
+
+core::r_util::RToolsInfo& ClangCompilationDatabase::rToolsInfo() const
+{
+   static core::r_util::RToolsInfo instance = findRtools();
+   return instance;
+}
+
+#endif
+
+core::system::Options ClangCompilationDatabase::compilationEnvironment() const
+{
+   // rtools on windows
+   core::system::Options env;
+   core::system::environment(&env);
+#if defined(_WIN32)
+   std::string warning;
+   module_context::addRtoolsToPathIfNecessary(&env, &warning);
+#endif
+   return env;
+}
+
+std::vector<std::string> ClangCompilationDatabase::precompiledHeaderArgs(
+      const CompilationConfig& config,
+      const std::vector<std::string>& userFlags)
+{
+   // args to return
+   std::vector<std::string> args;
+
+   // the PCH must be built with the same language options and macros the
+   // translation unit is parsed with, so the user flags are part of it (and
+   // of its name, so different flags don't share a PCH)
+   std::vector<std::string> baseArgs = config.args;
+   baseArgs.insert(baseArgs.end(), userFlags.begin(), userFlags.end());
+
+   // the PCH is always C++, so a C-only standard (say '-std=c11' from a
+   // mixed C/C++ package's flags file) is dropped here just as
+   // SourceIndex drops it when parsing the C++ sources themselves
+   core::algorithm::expel_if(baseArgs, [](const std::string& arg) {
+      return boost::algorithm::starts_with(arg, "-std=") && arg.find("++") == std::string::npos;
+   });
+
+   // get package name
+   std::string pkgName = config.PCH;
+
+   // precompiled header dir
+   FilePath precompiledDir = precompiledHeaderDir(pkgName);
+
+   // further scope to actual path of package (as the locations of the
+   // header files must be stable)
+   std::string pkgPath;
+   Error error = r::exec::RFunction("find.package")
+         .addParam(pkgName)
+         .addParam("quiet", true)
+         .call(&pkgPath);
+   
+   if (error)
+   {
+      LOG_ERROR(error);
+      return std::vector<std::string>();
+   }
+   
+   pkgPath = core::hash::crc32HexHash(pkgPath);
+   precompiledDir = precompiledDir.completeChildPath(pkgPath);
+
+   // platform / cpp version specific directory name
+   std::string clangVersion = clang().version().asString();
+   std::string platformDir;
+   error = r::exec::RFunction(".rs.clangPCHPath")
+         .addParam(pkgName)
+         .addParam(clangVersion)
+         .call(&platformDir);
+
+   if (error)
+   {
+      LOG_ERROR(error);
+      return std::vector<std::string>();
+   }
+
+   platformDir += "-pch" kPrecompiledHeaderVersion;
+
+   // if this path doesn't exist then blow away all precompiled paths
+   // and re-create this one. this enforces only storing precompiled headers
+   // for the current version of R/Rcpp/pkg -- if we didn't do this then the
+   // storage cost could really pile up over time (~25MB per PCH)
+   FilePath platformPath = precompiledDir.completeChildPath(platformDir);
+   if (!platformPath.exists())
+   {
+      // delete root directory
+      Error error = precompiledDir.removeIfExists();
+      if (error)
+      {
+         LOG_ERROR(error);
+         return std::vector<std::string>();
+      }
+
+      // create platform directory
+      error = platformPath.ensureDirectory();
+      if (error)
+      {
+         LOG_ERROR(error);
+         return std::vector<std::string>();
+      }
+   }
+
+   removeOrphanedUserFlagsPchs(platformPath, pkgName);
+
+   // now create the PCH if we need to
+   std::string stdArg = extractStdArg(baseArgs);
+   std::string pchName = pkgName + stdArg;
+   if (!userFlags.empty())
+      pchName += userFlagsPchSuffix(userFlags);
+   FilePath pchPath = platformPath.completeChildPath(pchName + ".pch");
+
+   // a changed compilation database gets a fresh start
+   if (forceRebuildPrecompiledHeaders_)
+   {
+      rebuiltPrecompiledHeaders_.clear();
+      unusablePrecompiledHeaders_.clear();
+   }
+
+   // libclang couldn't load this PCH for a file parsed with it (say, a header
+   // it was built from has changed since), so the file was parsed without.
+   // Rebuild it, but only once: if libclang rejects the rebuilt one as well,
+   // do without for the rest of the session rather than rebuild it for
+   // every parse.
+   std::string pch = pchPath.getAbsolutePath();
+   bool rejected = takeRejectedPrecompiledHeader(pch);
+   if (rejected && !rebuiltPrecompiledHeaders_.insert(pch).second)
+   {
+      unusablePrecompiledHeaders_.insert(pch);
+
+      Error removeError = pchPath.removeIfExists();
+      if (removeError)
+         LOG_ERROR(removeError);
+   }
+
+   if (unusablePrecompiledHeaders_.count(pch) > 0)
+      return std::vector<std::string>();
+
+   if (forceRebuildPrecompiledHeaders_ || rejected || !pchPath.exists())
+   {
+      // a forced rebuild (the package's compilation database changed) has
+      // to take every variant with it, not just the one requested first
+      if (forceRebuildPrecompiledHeaders_)
+         removePrecompiledHeaders(platformPath, pkgName, false);
+      forceRebuildPrecompiledHeaders_ = false;
+
+      // each distinct set of user flags gets its own PCH (~25MB), so keep
+      // only the one in use rather than one per edit of compile_flags.txt
+      if (!userFlags.empty())
+         removePrecompiledHeaders(platformPath, pkgName, true);
+      
+      // state cpp file for creating precompiled headers
+      FilePath cppPath = platformPath.completeChildPath(pchName + ".cpp");
+
+      boost::format fmt("#include <%1%>\n");
+      std::string headerName = pkgName == "cpp11" ? "cpp11.hpp" : (pkgName + ".h");
+      std::string contents = boost::str(fmt % headerName);
+      error = core::writeStringToFile(cppPath, contents);
+      if (error)
+      {
+         LOG_ERROR(error);
+         return std::vector<std::string>();
+      }
+
+      // get common compilation args
+      std::vector<std::string> args = baseArgs;
+
+      // get the appropriate include paths for this package
+      std::vector<std::string> pkgArgs;
+      error = r::exec::RFunction(".rs.includesForPackage")
+            .addParam(pkgName)
+            .call(&pkgArgs);
+      if (error)
+         LOG_ERROR(error);
+
+      args.insert(args.begin(), pkgArgs.begin(), pkgArgs.end());
+
+      // enforce compilation with requested standard
+      core::algorithm::expel_if(args, [](const std::string& arg) {
+         return arg.find("-std=") == 0;
+      });
+
+      // add in '-std' argument (if any)
+      if (!stdArg.empty())
+         args.push_back(stdArg);
+
+      // create args array
+      if (sourceIndex().verbose() > 0)
+      {
+         std::cerr << "# GENERATING PRECOMPILED HEADERS (" << pkgName << ") ----" << std::endl;
+         core::debug::print(args);
+         std::cerr << std::endl;
+      }
+
+      core::system::ProcessArgs argsArray(args);
+
+      int verboseCompile = verbose(2) ? 1 : 0;
+      CXIndex index = clang().createIndex(0, verboseCompile);
+
+      CXTranslationUnit tu = clang().parseTranslationUnit(
+                            index,
+                            cppPath.getAbsolutePath().c_str(),
+                            argsArray.args(),
+                            gsl::narrow_cast<int>(argsArray.argCount()),
+                            nullptr,
+                            0,
+                            precompiledHeaderOptions());
+
+      if (tu == nullptr)
+      {
+         LOG_ERROR_MESSAGE("Error parsing translation unit " +
+                              cppPath.getAbsolutePath());
+         clang().disposeIndex(index);
+
+         // when the user's flags are at fault, the default PCH is still good
+         Error removeError = userFlags.empty()
+               ? precompiledDir.removeIfExists()
+               : cppPath.removeIfExists();
+         if (removeError)
+            LOG_ERROR(removeError);
+
+         return std::vector<std::string>();
+      }
+
+      int ret = clang().saveTranslationUnit(tu,
+                                            pchPath.getAbsolutePath().c_str(),
+                                            clang().defaultSaveOptions(tu));
+      if (ret != CXSaveError_None)
+      {
+         boost::format fmt("Error %1% saving translation unit %2%");
+         std::string msg = boost::str(fmt % ret % pchPath.getAbsolutePath());
+         LOG_ERROR_MESSAGE(msg);
+
+         Error removeError = userFlags.empty()
+               ? precompiledDir.removeIfExists()
+               : pchPath.removeIfExists();
+         if (removeError)
+            LOG_ERROR(removeError);
+
+         // parse without the PCH rather than with '-include-pch' naming a
+         // file that no longer exists
+         clang().disposeTranslationUnit(tu);
+         clang().disposeIndex(index);
+         return std::vector<std::string>();
+      }
+
+      clang().disposeTranslationUnit(tu);
+
+      clang().disposeIndex(index);
+   }
+
+   // return the pch header file args
+   args.push_back("-include-pch");
+   args.push_back(pchPath.getAbsolutePath());
+   return args;
+}
+
+core::libclang::CompilationDatabase clangCompilationDatabase()
+{
+   static ClangCompilationDatabase instance;
+
+   CompilationDatabase compilationDatabase;
+
+   compilationDatabase.hasTranslationUnit =
+      boost::bind(&ClangCompilationDatabase::isProjectTranslationUnit,
+                  &instance, _1);
+   compilationDatabase.translationUnits =
+      boost::bind(&ClangCompilationDatabase::projectTranslationUnits,
+                  &instance);
+   compilationDatabase.compileArgsForTranslationUnit =
+      boost::bind(&ClangCompilationDatabase::compileArgsForTranslationUnit,
+                  &instance, _1, _2);
+   compilationDatabase.generatedCompileArgs =
+      boost::bind(&ClangCompilationDatabase::generatedCompileArgs,
+                  &instance, _1);
+   compilationDatabase.rebuildPackageCompilationDatabase =
+         boost::bind(&ClangCompilationDatabase::rebuildPackageCompilationDatabase,
+                     &instance);
+
+   return compilationDatabase;
+}
+
+
+} // namespace clang
+} // namespace modules
+} // namespace session
+} // namespace rstudio
+

@@ -1,0 +1,663 @@
+/*
+ * ChatSlotsTests.cpp
+ *
+ * Copyright (C) 2026 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include "ChatSlots.hpp"
+
+#include <algorithm>
+#include <clocale>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#include <gtest/gtest.h>
+
+#include <core/FileSerializer.hpp>
+#include <shared_core/FilePath.hpp>
+
+using namespace rstudio::core;
+using namespace rstudio::session::modules::chat::slots;
+
+namespace {
+
+const char* const kServerScript = "dist/server/main.js";
+const char* const kIndexHtml = "dist/client/index.html";
+const char* const kHostname = "test-host";
+
+// Sets LC_CTYPE for one test and restores it afterwards. The old sanitizer let
+// a byte above 0x7F through only in a locale whose isalnum() accepts it:
+// Windows code-page locales and macOS UTF-8 locales. glibc's accepts none, so
+// on Linux the tests using this pass with or without the fix. Elsewhere the test
+// fails if neither locale can be set, since it would otherwise pass vacuously.
+class ScopedHighByteCType
+{
+public:
+   ScopedHighByteCType()
+   {
+      const char* current = std::setlocale(LC_CTYPE, nullptr);
+      previous_ = current != nullptr ? current : "C";
+
+      for (const char* name : { ".1252", "en_US.UTF-8" })
+      {
+         if (std::setlocale(LC_CTYPE, name) != nullptr)
+            return;
+      }
+
+#ifndef __linux__
+      ADD_FAILURE() << "Could not set LC_CTYPE to .1252 or en_US.UTF-8";
+#endif
+   }
+
+   ~ScopedHighByteCType()
+   {
+      std::setlocale(LC_CTYPE, previous_.c_str());
+   }
+
+private:
+   std::string previous_;
+};
+
+class ChatSlots : public testing::Test
+{
+protected:
+   void SetUp() override
+   {
+      FilePath tempPath;
+      ASSERT_FALSE(FilePath::tempFilePath(tempPath));
+      storageDir_ = tempPath.completePath("pai");
+      versionsDir_ = versionsDir(storageDir_);
+      ASSERT_FALSE(versionsDir_.ensureDirectory());
+   }
+
+   void TearDown() override
+   {
+      storageDir_.getParent().removeIfExists();
+   }
+
+   void writeFile(const FilePath& filePath, const std::string& content)
+   {
+      ASSERT_FALSE(filePath.getParent().ensureDirectory());
+      ASSERT_FALSE(writeStringToFile(filePath, content));
+   }
+
+   // Values are interpolated into JSON string literals, so they have to be
+   // encoded rather than pasted: an unescaped backslash would start an escape
+   // sequence, and a raw control character is not legal JSON at all. Without
+   // this, a test aiming at a rejected slot name would instead be testing an
+   // unparseable package.json.
+   static std::string jsonEscaped(const std::string& value)
+   {
+      std::string escaped;
+      for (char c : value)
+      {
+         if (c == '\\' || c == '"')
+         {
+            escaped += '\\';
+            escaped += c;
+         }
+         else if (static_cast<unsigned char>(c) < 0x20)
+         {
+            char unicode[8];
+            std::snprintf(unicode, sizeof(unicode), "\\u%04x", c);
+            escaped += unicode;
+         }
+         else
+         {
+            escaped += c;
+         }
+      }
+      return escaped;
+   }
+
+   // A slot exactly as an install leaves it: the tree a Posit Assistant
+   // package extracts to, in miniature.
+   void makeSlot(const FilePath& dir,
+                 const std::string& version,
+                 const std::string& protocol)
+   {
+      writeFile(dir.completeChildPath(kServerScript), "console.log('hi');");
+      writeFile(dir.completeChildPath(kIndexHtml), "<html></html>");
+      writeFile(dir.completeChildPath("package.json"),
+                "{\"version\":\"" + jsonEscaped(version) + "\"}");
+      writeFile(dir.completeChildPath("protocol.json"),
+                "{\"protocol\":\"" + jsonEscaped(protocol) + "\"}");
+   }
+
+   // A slot that will not verify: its server script is gone.
+   void makeDamagedSlot(const FilePath& dir,
+                        const std::string& version,
+                        const std::string& protocol)
+   {
+      makeSlot(dir, version, protocol);
+      ASSERT_FALSE(dir.completeChildPath(kServerScript).remove());
+   }
+
+   FilePath slot(const std::string& name)
+   {
+      return versionsDir_.completeChildPath(name);
+   }
+
+   // A staged install belonging to some session. Named directly rather than
+   // through prepareStagingDir() so one test can model several sessions.
+   FilePath staging(const std::string& session)
+   {
+      return versionsDir_.completeChildPath(".tmp-" + session);
+   }
+
+   FilePath storageDir_;
+   FilePath versionsDir_;
+};
+
+// ============================================================================
+// verifySlot
+// ============================================================================
+
+TEST_F(ChatSlots, VerifiesAFreshInstall)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   EXPECT_TRUE(verifySlot(slot("1.1.0")));
+}
+
+TEST_F(ChatSlots, ReportsWhatTheSlotSaysAboutItself)
+{
+   // The slot name says 1.1.0-2, which is valid semver for something older
+   // than 1.1.0; identity has to come from inside the slot instead.
+   makeSlot(slot("1.1.0-2"), "1.1.0", "11.0");
+
+   SlotInfo info;
+   ASSERT_TRUE(verifySlot(slot("1.1.0-2"), &info));
+   EXPECT_EQ(info.name, "1.1.0-2");
+   EXPECT_EQ(info.version, "1.1.0");
+   EXPECT_EQ(info.protocol, "11.0");
+   EXPECT_TRUE(info.path.isEquivalentTo(slot("1.1.0-2")));
+}
+
+TEST_F(ChatSlots, RejectsAnAbsentSlot)
+{
+   EXPECT_FALSE(verifySlot(slot("1.1.0")));
+}
+
+TEST_F(ChatSlots, RejectsAMissingServerScript)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   ASSERT_FALSE(dir.completeChildPath(kServerScript).remove());
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAnEmptyServerScript)
+{
+   // The check this replaces tested only for existence, so a truncated
+   // download left a zero-byte main.js that passed.
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath(kServerScript), "");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAnEmptyIndexHtml)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath(kIndexHtml), "");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAMissingClientDirectory)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   ASSERT_FALSE(dir.completeChildPath("dist/client").remove());
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAnUnparseablePackageJson)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath("package.json"), "{ not json");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAPackageJsonWithoutAVersion)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath("package.json"), "{\"name\":\"assistant\"}");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAnEmptyVersion)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "", "11.0");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAnUnparseableProtocolJson)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath("protocol.json"), "[]");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+TEST_F(ChatSlots, RejectsAProtocolJsonWithoutAProtocol)
+{
+   FilePath dir = slot("1.1.0");
+   makeSlot(dir, "1.1.0", "11.0");
+   writeFile(dir.completeChildPath("protocol.json"), "{\"version\":\"11.0\"}");
+
+   EXPECT_FALSE(verifySlot(dir));
+}
+
+#ifndef _WIN32
+
+TEST_F(ChatSlots, RejectsASlotThatIsALink)
+{
+   // Everything about the slot would be read from a tree the slot does not
+   // contain and cannot promise stays put.
+   FilePath elsewhere = storageDir_.getParent().completeChildPath("elsewhere");
+   makeSlot(elsewhere, "1.1.0", "11.0");
+   ASSERT_TRUE(verifySlot(elsewhere));
+
+   ASSERT_EQ(::symlink(elsewhere.getAbsolutePath().c_str(),
+                       slot("1.1.0").getAbsolutePath().c_str()),
+             0);
+
+   EXPECT_FALSE(verifySlot(slot("1.1.0")));
+   EXPECT_TRUE(verifiedSlots(versionsDir_, "11.0").empty());
+}
+
+#endif // !_WIN32
+
+// ============================================================================
+// verifiedSlots
+// ============================================================================
+
+TEST_F(ChatSlots, ListsOnlyVerifyingSlots)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   makeSlot(slot("1.0.4"), "1.0.4", "11.0");
+   makeDamagedSlot(slot("0.9.0"), "0.9.0", "11.0");
+
+   std::vector<SlotInfo> found = verifiedSlots(versionsDir_, "11.0");
+   ASSERT_EQ(found.size(), 2u);
+
+   std::vector<std::string> names;
+   for (const SlotInfo& info : found)
+      names.push_back(info.name);
+   std::sort(names.begin(), names.end());
+   EXPECT_EQ(names[0], "1.0.4");
+   EXPECT_EQ(names[1], "1.1.0");
+}
+
+TEST_F(ChatSlots, ListsOnlySlotsForTheRequestedProtocol)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   makeSlot(slot("1.0.4"), "1.0.4", "10.0");
+   makeDamagedSlot(slot("1.0.3"), "1.0.3", "10.0");
+
+   std::vector<SlotInfo> found = verifiedSlots(versionsDir_, "10.0");
+   ASSERT_EQ(found.size(), 1u);
+   EXPECT_EQ(found[0].name, "1.0.4");
+
+   EXPECT_TRUE(verifiedSlots(versionsDir_, "12.0").empty());
+}
+
+TEST_F(ChatSlots, SkipsStagingDirectories)
+{
+   // A staged install is a complete tree that would otherwise verify; it must
+   // not be resolvable before the rename publishes it.
+   makeSlot(staging("session-a"), "1.1.0", "11.0");
+
+   EXPECT_TRUE(verifiedSlots(versionsDir_, "11.0").empty());
+}
+
+TEST_F(ChatSlots, ListsOnlySlotsWhoseNamesCouldBeSelected)
+{
+   // A complete tree under a name isUsableSlotName() rejects is not a slot:
+   // recorded as a fallback it would be rejected on the next read and
+   // recorded again on every resolve. A leading '-' is the one rejected
+   // shape every platform can create.
+   makeSlot(slot("-1.1.0"), "1.1.0", "11.0");
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+
+   std::vector<SlotInfo> found = verifiedSlots(versionsDir_, "11.0");
+   ASSERT_EQ(found.size(), 1u);
+   EXPECT_EQ(found[0].name, "1.1.0");
+}
+
+TEST_F(ChatSlots, FindsNothingBeforeTheFirstInstall)
+{
+   ASSERT_FALSE(versionsDir_.remove());
+   EXPECT_TRUE(verifiedSlots(versionsDir_, "11.0").empty());
+}
+
+// ============================================================================
+// prepareStagingDir
+// ============================================================================
+
+TEST_F(ChatSlots, PreparesAnEmptyStagingDirectory)
+{
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &stagingDir));
+
+   EXPECT_TRUE(stagingDir.isDirectory());
+   EXPECT_TRUE(stagingDir.getParent().isEquivalentTo(versionsDir_));
+
+   std::vector<FilePath> children;
+   ASSERT_FALSE(stagingDir.getChildren(children));
+   EXPECT_TRUE(children.empty());
+}
+
+TEST_F(ChatSlots, NamesStagingInAsciiForAUtf8Hostname)
+{
+   // "jose-MacBook" with an accented e, as UTF-8. macOS kept the accent's lead
+   // byte, and APFS refused the invalid UTF-8 name with EILSEQ.
+   ScopedHighByteCType ctype;
+
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, "jos\xC3\xA9-MacBook", &stagingDir));
+
+   EXPECT_TRUE(stagingDir.isDirectory());
+   EXPECT_EQ(0u, stagingDir.getFilename().find(".tmp-jos__-MacBook-"))
+      << stagingDir.getFilename();
+}
+
+TEST_F(ChatSlots, NamesStagingInAsciiForACodePageHostname)
+{
+   // "jose-PC" with an accented e, in code page 1252 as Windows gethostname()
+   // returns it under R < 4.2.
+   ScopedHighByteCType ctype;
+
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, "jos\xE9-PC", &stagingDir));
+
+   EXPECT_TRUE(stagingDir.isDirectory());
+   EXPECT_EQ(0u, stagingDir.getFilename().find(".tmp-jos_-PC-"))
+      << stagingDir.getFilename();
+}
+
+TEST_F(ChatSlots, AStagedInstallIsNotResolvableBeforeItIsPublished)
+{
+   // Enters through the code that names the staging directory rather than a
+   // hand-built name, so the name and the rule that hides it cannot drift
+   // apart and make a half-extracted tree resolvable.
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &stagingDir));
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   ASSERT_TRUE(verifySlot(stagingDir));
+   EXPECT_TRUE(verifiedSlots(versionsDir_, "11.0").empty());
+}
+
+TEST_F(ChatSlots, DoesNotDisturbAnotherSessionsStagedInstall)
+{
+   // Two sessions sharing an NFS home once computed the same staging path, so
+   // the second one's prepare deleted the first one's half-extracted tree.
+   FilePath first;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &first));
+   makeSlot(first, "1.1.0", "11.0");
+
+   FilePath second;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &second));
+
+   EXPECT_FALSE(second.isEquivalentTo(first));
+   EXPECT_TRUE(first.completeChildPath(kServerScript).exists());
+
+   std::vector<FilePath> children;
+   ASSERT_FALSE(second.getChildren(children));
+   EXPECT_TRUE(children.empty());
+}
+
+TEST_F(ChatSlots, CreatesTheVersionsDirectoryOnFirstUse)
+{
+   ASSERT_FALSE(versionsDir_.remove());
+
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &stagingDir));
+   EXPECT_TRUE(versionsDir_.isDirectory());
+}
+
+// ============================================================================
+// allocateSlot
+// ============================================================================
+
+TEST_F(ChatSlots, PublishesAStagedInstallUnderItsVersion)
+{
+   FilePath stagingDir;
+   ASSERT_FALSE(prepareStagingDir(versionsDir_, kHostname, &stagingDir));
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0");
+   EXPECT_TRUE(verifySlot(slotDir));
+   EXPECT_FALSE(stagingDir.exists());
+}
+
+TEST_F(ChatSlots, AdoptsAnExistingVerifyingSlot)
+{
+   // The rename loser: another session published this version first, and its
+   // slot is intact, so there is nothing to add.
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0");
+   EXPECT_FALSE(slot("1.1.0-2").exists());
+   EXPECT_FALSE(stagingDir.exists());
+}
+
+TEST_F(ChatSlots, BumpsPastAnExistingSlotThatDoesNotVerify)
+{
+   FilePath damaged = slot("1.1.0");
+   makeDamagedSlot(damaged, "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-2");
+   EXPECT_TRUE(verifySlot(slotDir));
+   // The damaged slot is left alone -- another session may be running from it.
+   EXPECT_TRUE(damaged.exists());
+}
+
+TEST_F(ChatSlots, AdoptsALaterOrdinalWhenTheFirstIsDamaged)
+{
+   makeDamagedSlot(slot("1.1.0"), "1.1.0", "11.0");
+   makeSlot(slot("1.1.0-2"), "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-c");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-2");
+   EXPECT_FALSE(slot("1.1.0-3").exists());
+}
+
+TEST_F(ChatSlots, ForcedAllocationNeverAdopts)
+{
+   // Reinstall exists to replace bits that verification cannot fault, so it
+   // has to end up in a directory it wrote itself.
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AlwaysFresh, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-2");
+   EXPECT_TRUE(verifySlot(slot("1.1.0")));
+   EXPECT_TRUE(verifySlot(slotDir));
+}
+
+TEST_F(ChatSlots, ForcedAllocationTakesThePlainNameWhenItIsFree)
+{
+   FilePath stagingDir = staging("session-a");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AlwaysFresh, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0");
+}
+
+TEST_F(ChatSlots, AllocatesPastTheSecondOrdinal)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   makeSlot(slot("1.1.0-2"), "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-c");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AlwaysFresh, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-3");
+   EXPECT_TRUE(verifySlot(slotDir));
+}
+
+TEST_F(ChatSlots, DoesNotCollideWithAnUnrelatedVersion)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "11.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.0.4", "10.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.0.4");
+   EXPECT_TRUE(verifySlot(slot("1.1.0")));
+}
+
+TEST_F(ChatSlots, NamesTheSlotAfterThePackageNotTheStagingDirectory)
+{
+   // The staging directory name says nothing about what was extracted into it.
+   FilePath stagingDir = staging("session-a");
+   makeSlot(stagingDir, "1.0.4", "10.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.0.4");
+}
+
+TEST_F(ChatSlots, DoesNotAdoptASlotHoldingADifferentVersion)
+{
+   // A directory named 1.1.0 is not evidence that it holds 1.1.0. Adopting it
+   // would silently leave the session running a version nobody asked for.
+   makeSlot(slot("1.1.0"), "1.0.4", "11.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-2");
+   EXPECT_TRUE(verifySlot(slotDir));
+}
+
+TEST_F(ChatSlots, DoesNotAdoptASlotServingADifferentProtocol)
+{
+   makeSlot(slot("1.1.0"), "1.1.0", "10.0");
+   FilePath stagingDir = staging("session-b");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+
+   FilePath slotDir;
+   ASSERT_FALSE(allocateSlot(stagingDir,
+                             SlotPolicy::AdoptExisting, &slotDir));
+
+   EXPECT_EQ(slotDir.getFilename(), "1.1.0-2");
+}
+
+TEST_F(ChatSlots, RejectsAVersionThatCannotNameADirectory)
+{
+   // The version comes from the package.json of a downloaded archive, so it is
+   // not trusted to be a bare version string.
+   const char* const badVersions[] = {
+      ".", "..", ".hidden", "-2", "a/b", "a\\b", "C:evil", "a\tb",
+      // Rejected by Win32, but checked everywhere so a home reached from both
+      // Windows and Linux agrees on which names are slots.
+      "1.0*", "1.0?", "1.0|x", "1.0<x", "1.0>x", "1.0\"x", "nul", "COM1",
+      // A device name stays reserved with an extension after it.
+      "nul.txt", "COM1.log", "aux.1.0",
+      // Win32 strips these silently, so the directory would not match the
+      // name recorded in the selector.
+      "1.1.0.", "1.1.0 "};
+   for (const char* version : badVersions)
+   {
+      FilePath stagingDir = staging("session-a");
+      ASSERT_FALSE(stagingDir.removeIfExists());
+      makeSlot(stagingDir, version, "11.0");
+
+      FilePath slotDir;
+      EXPECT_TRUE(allocateSlot(stagingDir,
+                               SlotPolicy::AdoptExisting, &slotDir) != Success())
+         << "accepted version '" << version << "'";
+      EXPECT_TRUE(stagingDir.exists()) << "consumed staging for '" << version << "'";
+   }
+}
+
+TEST_F(ChatSlots, RejectsAStagedInstallThatDoesNotVerify)
+{
+   // Publishing happens only after the staged tree is checked, so a torn
+   // install can never appear under a name a session might resolve.
+   FilePath stagingDir = staging("session-a");
+   makeSlot(stagingDir, "1.1.0", "11.0");
+   ASSERT_FALSE(stagingDir.completeChildPath(kServerScript).remove());
+
+   FilePath slotDir;
+   EXPECT_TRUE(allocateSlot(stagingDir,
+                            SlotPolicy::AdoptExisting, &slotDir) != Success());
+   EXPECT_FALSE(slot("1.1.0").exists());
+}
+
+TEST_F(ChatSlots, RejectsAnAbsentStagingDirectory)
+{
+   FilePath slotDir;
+   EXPECT_TRUE(allocateSlot(staging("never-created"),
+                            SlotPolicy::AdoptExisting, &slotDir) != Success());
+}
+
+} // anonymous namespace

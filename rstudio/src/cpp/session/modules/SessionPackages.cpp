@@ -1,0 +1,949 @@
+/*
+ * SessionPackages.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+// boost requires that winsock2.h must be included before windows.h
+#ifdef _WIN32
+#include <winsock2.h>
+#endif
+
+#ifdef __APPLE__
+// dyld.h's DYLD_BOOL enum redefines R's TRUE / FALSE; this is its opt-out
+#define ENUM_DYLD_BOOL
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#endif
+
+#include "SessionPackages.hpp"
+
+#include <boost/format.hpp>
+#include <boost/bind/bind.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/regex.hpp>
+
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+#include <shared_core/SafeConvert.hpp>
+
+#include <core/Algorithm.hpp>
+#include <core/Exec.hpp>
+#include <core/Thread.hpp>
+
+#include <r/RExec.hpp>
+#include <r/RFunctionHook.hpp>
+#include <r/RInterface.hpp>
+#include <r/RJson.hpp>
+#include <r/ROptions.hpp>
+#include <r/RRoutines.hpp>
+#include <r/RSexp.hpp>
+
+#include <session/SessionModuleContext.hpp>
+#include <session/projects/SessionProjects.hpp>
+#include <session/prefs/UserPrefs.hpp>
+
+#include "SessionPackrat.hpp"
+#include "SessionPPM.hpp"
+
+#include "session-config.h"
+
+using namespace rstudio::core;
+using namespace boost::placeholders;
+
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace packages {
+
+namespace {
+
+// store the last user input
+std::string s_lastInput;
+
+// the current value of the 'repos' R option
+r::sexp::PreservedSEXP s_reposSEXP;
+
+class AvailablePackagesCache : public boost::noncopyable
+{
+public:
+
+   static AvailablePackagesCache& get()
+   {
+      static AvailablePackagesCache instance;
+      return instance;
+   }
+
+private:
+
+   AvailablePackagesCache() = default;
+
+public:
+
+   void insert(const std::string& contribUrl,
+               const std::vector<std::string>& availablePackages)
+   {
+      cache_[contribUrl] = availablePackages;
+   }
+
+   bool find(const std::string& contribUrl)
+   {
+      return cache_.find(contribUrl) != cache_.end();
+   }
+
+
+   bool lookup(const std::string& contribUrl,
+               std::vector<std::string>* pAvailablePackages)
+   {
+      std::map<std::string, std::vector<std::string> >::const_iterator it =
+                                                         cache_.find(contribUrl);
+      if (it != cache_.end())
+      {
+         core::algorithm::append(pAvailablePackages, it->second);
+         return true;
+      }
+      else
+      {
+         return false;
+      }
+   }
+
+   void ensurePopulated(const std::string& contribUrl)
+   {
+      if (cache_.find(contribUrl) != cache_.end())
+         return;
+
+      // build code to execute
+      boost::format fmt(
+               "row.names(available.packages(contriburl = '%1%'))");
+      std::string code = boost::str(fmt % contribUrl);
+
+      // get the packages
+      std::vector<std::string> packages;
+      Error error = r::exec::evaluateString(code, &packages);
+      if (error)
+      {
+         // log error if it wasn't merely a null return value
+         if (error != r::errc::UnexpectedDataTypeError)
+            LOG_ERROR(error);
+         return;
+      }
+
+      // put them in the cache
+      cache_[contribUrl] = packages;
+   }
+
+private:
+   std::map<std::string, std::vector<std::string> > cache_;
+};
+
+void downloadAvailablePackages(const std::string& contribUrl,
+                               std::vector<std::string>* pAvailablePackages)
+{
+   AvailablePackagesCache& cache = AvailablePackagesCache::get();
+   cache.ensurePopulated(contribUrl);
+   cache.lookup(contribUrl, pAvailablePackages);
+}
+
+void downloadAvailablePackages(const std::string& contribUrl)
+{
+   AvailablePackagesCache& cache = AvailablePackagesCache::get();
+   cache.ensurePopulated(contribUrl);
+}
+
+// Populate the package cache for a particular URL
+SEXP rs_downloadAvailablePackages(SEXP contribUrlSEXP)
+{
+   std::string contribUrl = r::sexp::asString(contribUrlSEXP);
+   downloadAvailablePackages(contribUrl);
+   return R_NilValue;
+}
+
+SEXP rs_getCachedAvailablePackages(SEXP contribUrlSEXP)
+{
+   r::sexp::Protect protect;
+   std::string contribUrl = r::sexp::asString(contribUrlSEXP);
+   AvailablePackagesCache& s_availablePackagesCache = AvailablePackagesCache::get();
+
+   std::vector<std::string> availablePackages;
+   if (s_availablePackagesCache.lookup(contribUrl, &availablePackages))
+      return r::sexp::create(availablePackages, &protect);
+   else
+      return R_NilValue;
+}
+
+Error availablePackages(const core::json::JsonRpcRequest&,
+                        core::json::JsonRpcResponse* pResponse)
+{
+   // get contrib urls
+   std::vector<std::string> contribUrls;
+   Error error = r::exec::evaluateString<std::vector<std::string> >(
+                  "contrib.url(getOption('repos'), getOption('pkgType'))",
+                  &contribUrls);
+   if (error)
+      return error;
+
+
+   // download available packages
+   std::vector<std::string> availablePackages;
+   std::for_each(contribUrls.begin(),
+                 contribUrls.end(),
+                 boost::bind(&downloadAvailablePackages, _1, &availablePackages));
+
+   // order and remove duplicates
+   std::stable_sort(availablePackages.begin(), availablePackages.end());
+   availablePackages.erase(std::unique(availablePackages.begin(), availablePackages.end()),
+                           availablePackages.end());
+
+   // return as json
+   json::Array jsonResults;
+   for (std::string& availablePackage : availablePackages)
+      jsonResults.push_back(json::Value(availablePackage));
+   pResponse->setResult(jsonResults);
+   return Success();
+}
+
+// Package-list builds can nest. The DESCRIPTION scan in
+// .rs.listInstalledPackages() runs long enough for R to service polled events,
+// which run the scheduled-command queue -- including the PPM batch completion,
+// which requests a package list of its own (see SessionPPM.cpp) -- and, while
+// the console is busy, dequeue pending RPCs such as get_package_state. Left to
+// run freely, the nested build finishes and is delivered first, and the outer
+// build then overwrites it with an older list (rstudio/rstudio-pro#13167).
+//
+// Every build therefore goes through s_packageStateBuilder (below), which
+// folds requests that arrive mid-build into the build in progress and runs it
+// again. If the pass cap leaves work pending, defer the event to an idle build
+// rather than enqueue a stale list. A capped RPC returns its last scan, and the
+// deferred event supplies the fresh state afterward.
+// An event that a failed build could not deliver stays owed until the next
+// build, from any trigger, delivers it.
+//
+// Main thread only: every build goes through r::exec, so this is re-entrancy
+// on one thread, not concurrent access.
+Error buildPackageStateJson(json::Object* pJson)
+{
+   using namespace module_context;
+
+   Error error = Success();
+
+   PackratContext packratContext = module_context::packratContext();
+   core::json::Value renvContext = module_context::renvContextAsJson();
+
+   json::Value packageListJson;
+   r::sexp::Protect protect;
+   SEXP packageListSEXP = R_NilValue;
+
+   bool renvActive = renvContext.getObject()["active"].getBool();
+
+   // determine the appropriate package listing method from the current
+   // packrat mode status
+   if (packratContext.modeOn)
+   {
+      FilePath projectDir = projects::projectContext().directory();
+      error = r::exec::RFunction(".rs.listPackagesPackrat",
+                                 string_utils::utf8ToSystem(
+                                    projectDir.getAbsolutePath()))
+              .call(&packageListSEXP, &protect);
+   }
+   else if (renvActive)
+   {
+      FilePath projectDir = projects::projectContext().directory();
+      error = r::exec::RFunction(".rs.renv.listPackages")
+            .addParam(string_utils::utf8ToSystem(projectDir.getAbsolutePath()))
+            .call(&packageListSEXP, &protect);
+   }
+   else
+   {
+      error = r::exec::RFunction(".rs.listInstalledPackages")
+              .call(&packageListSEXP, &protect);
+   }
+
+   if (error)
+   {
+      LOG_ERROR(error);
+      return error;
+   }
+
+   // return the generated package list and the Packrat context
+   r::json::jsonValueFromObject(packageListSEXP, &packageListJson);
+
+   (*pJson)["package_list"] = packageListJson;
+   (*pJson)["packrat_context"] = packrat::contextAsJson(packratContext);
+   (*pJson)["renv_context"] = renvContext;
+
+   json::Object activeRepository;
+   error = r::exec::RFunction(".rs.ppm.getActiveRepository").call(&activeRepository);
+   if (error)
+      LOG_ERROR(error);
+   (*pJson)["active_repository"] = activeRepository;
+
+   // NOTE: vulnerability data is intentionally not part of the package state.
+   // It is fetched asynchronously (see ppm::refreshVulnerabilitiesAsync) so that
+   // a slow or unreachable PPM can't block the package list -- and therefore IDE
+   // startup -- and delivered separately via the kPackageVulnerabilitiesReady
+   // event.
+
+   return Success();
+}
+
+PackageStateBuilder s_packageStateBuilder(buildPackageStateJson);
+
+void enquePackageState(const json::Object& pkgState)
+{
+   ClientEvent event(client_events::kPackageStateChanged, pkgState);
+   module_context::enqueClientEvent(event);
+}
+
+bool s_packageStateRefreshScheduled = false;
+
+void schedulePackageStateRefresh()
+{
+   if (s_packageStateRefreshScheduled || !s_packageStateBuilder.needsDeferredBuild())
+      return;
+
+   s_packageStateRefreshScheduled = true;
+   module_context::scheduleDelayedWork(
+      boost::posix_time::milliseconds(100),
+      []() {
+         // An intervening build may already have satisfied the refresh.
+         // Keep the flag set while scanning to coalesce re-entrant requests.
+         if (s_packageStateBuilder.needsDeferredBuild())
+            enquePackageStateChanged();
+
+         s_packageStateRefreshScheduled = false;
+         // Only another successful capped build needs a follow-up. A failure
+         // leaves the event owed until the next real trigger, with no timer.
+         schedulePackageStateRefresh();
+      },
+      true);
+}
+
+SEXP rs_enqueLoadedPackageUpdates(SEXP installCmdSEXP)
+{
+   std::string installCmd;
+   if (installCmdSEXP != R_NilValue)
+      installCmd = r::sexp::asString(installCmdSEXP);
+
+   ClientEvent event(client_events::kLoadedPackageUpdates, installCmd);
+   module_context::enqueClientEvent(event);
+
+   return R_NilValue;
+}
+
+SEXP rs_canInstallPackages()
+{
+   r::sexp::Protect rProtect;
+   return r::sexp::create(session::options().allowPackageInstallation(),
+                          &rProtect);
+}
+
+SEXP rs_shouldRecordPackageSources()
+{
+   r::sexp::Protect rProtect;
+   return r::sexp::create(session::options().allowPackageSourceRecording(),
+                          &rProtect);
+}
+
+SEXP rs_packageLibraryMutated()
+{
+   // broadcast event to server
+   module_context::events().onPackageLibraryMutated();
+
+   // broadcast event to client
+   enquePackageStateChanged();
+
+   return R_NilValue;
+}
+
+// Result of a background package-event scan. The background thread fills in
+// 'pkgNames' and then posts onPackageEventScanCompleted() to the main thread
+// via executeOnMainThread(); the scheduled-command queue provides the
+// happens-before edge for 'pkgNames', and the other fields are only ever
+// touched on the main thread.
+struct PackageEventScan
+{
+   std::vector<std::string> pkgNames; // written by the background thread
+   bool completed = false;            // main thread only
+   bool abandoned = false;            // main thread only
+};
+
+// Coalescing state for package-event scans; main thread only.
+bool s_packageEventScanRunning = false;
+bool s_packageEventScanPending = false;
+
+// If a scan hasn't completed after this long (e.g. a library path on a hung
+// network mount), abandon it so package-event tracking isn't wedged for the
+// rest of the session. The R option exists so tests can exercise the
+// watchdog path without waiting out the default.
+constexpr int kPackageEventScanTimeoutSeconds = 300;
+
+int packageEventScanTimeoutSeconds()
+{
+   return r::options::getOption<int>(
+            "rstudio.packageEventScanTimeout",
+            kPackageEventScanTimeoutSeconds,
+            false);
+}
+
+void startPackageEventScan();
+
+// Runs on the main thread once the background scan has finished.
+void onPackageEventScanCompleted(boost::shared_ptr<PackageEventScan> pScan)
+{
+   // if the watchdog abandoned this scan, drop its (very late) result: the
+   // coalescing state no longer tracks it, and a fresh scan may be in flight
+   if (pScan->abandoned)
+      return;
+
+   pScan->completed = true;
+
+   Error error = r::exec::RFunction(".rs.registerPackageEventHooks", pScan->pkgNames).call();
+   if (error)
+      LOG_ERROR(error);
+
+   s_packageEventScanRunning = false;
+
+   // if another scan was requested while this one was in flight (e.g. an
+   // install completed), run it now so newly-installed packages get hooked
+   if (s_packageEventScanPending)
+   {
+      s_packageEventScanPending = false;
+      startPackageEventScan();
+   }
+}
+
+// Watchdog, on the main thread: if the scan hasn't completed (e.g. blocked on
+// a hung network mount), abandon it rather than wedge package-event tracking
+// for the rest of the session; later library mutations can start fresh scans.
+// We don't run a pending pass here -- it would most likely hang the same way
+// and pile up abandoned threads. Note that a scan completing right at the
+// timeout boundary loses the race with this watchdog (it is queued ahead of
+// the scan's completion command): the completion then sees 'abandoned' and
+// drops the result, and hooks wait for the next library mutation to trigger
+// a fresh scan.
+void onPackageEventScanTimeout(boost::shared_ptr<PackageEventScan> pScan,
+                               int timeoutSeconds)
+{
+   if (pScan->completed)
+      return;
+
+   LOG_WARNING_MESSAGE("Abandoning package event scan; it did not complete within " +
+                       safe_convert::numberToString(timeoutSeconds) +
+                       " seconds");
+
+   pScan->abandoned = true;
+   s_packageEventScanRunning = false;
+   s_packageEventScanPending = false;
+}
+
+// Runs on a background thread: filesystem access only, no R. No exception may
+// escape (safeLaunchThread doesn't guard the thread body, so one would
+// terminate the process). The completion callback is posted on every exit
+// path; if the post itself fails, the watchdog reclaims the scan state after
+// the timeout.
+void scanForInstalledPackages(std::vector<FilePath> libPaths,
+                              boost::shared_ptr<PackageEventScan> pScan)
+{
+   std::vector<std::string> pkgNames;
+
+   try
+   {
+      for (const FilePath& libPath : libPaths)
+      {
+         if (!libPath.exists())
+            continue;
+
+         std::vector<FilePath> children;
+         Error error = libPath.getChildren(children);
+         if (error)
+         {
+            LOG_ERROR(error);
+            continue;
+         }
+
+         for (const FilePath& child : children)
+         {
+            if (child.isDirectory())
+               pkgNames.push_back(child.getFilename());
+         }
+      }
+   }
+   CATCH_UNEXPECTED_EXCEPTION
+
+   // guard the post separately: its allocations (binding the callback,
+   // scheduling the delayed work) can throw under memory pressure, and an
+   // exception here would escape the thread body
+   try
+   {
+      pScan->pkgNames = std::move(pkgNames);
+      module_context::executeOnMainThread(
+               boost::bind(onPackageEventScanCompleted, pScan));
+   }
+   CATCH_UNEXPECTED_EXCEPTION
+}
+
+void startPackageEventScan()
+{
+   s_packageEventScanRunning = true;
+
+   // resolve library paths and the watchdog timeout on the main thread;
+   // both call into R
+   std::vector<FilePath> libPaths = module_context::getLibPaths();
+   int timeoutSeconds = packageEventScanTimeoutSeconds();
+
+   auto pScan = boost::make_shared<PackageEventScan>();
+
+   // queue the watchdog before launching the thread, so that it is always
+   // ordered ahead of the scan's completion command in the scheduled-command
+   // queue (and still reclaims the scan state if the launch itself fails)
+   module_context::scheduleDelayedWork(
+            boost::posix_time::seconds(timeoutSeconds),
+            boost::bind(onPackageEventScanTimeout, pScan, timeoutSeconds),
+            false);
+
+   core::thread::safeLaunchThread(
+            boost::bind(scanForInstalledPackages, libPaths, pScan));
+}
+
+// Enumerating the library paths can be slow on remote filesystems, so it runs
+// on a background thread; if a scan is already in flight, just request another
+// pass once it completes (the running scan may have raced with the library
+// mutation that triggered this call). Returns true if a new scan was started,
+// false if one was already in flight and a follow-up pass was queued.
+bool updatePackageEventsAsync()
+{
+   if (s_packageEventScanRunning)
+   {
+      s_packageEventScanPending = true;
+      return false;
+   }
+
+   startPackageEventScan();
+   return true;
+}
+
+SEXP rs_updatePackageEvents()
+{
+   bool started = updatePackageEventsAsync();
+   r::sexp::Protect protect;
+   return r::sexp::create(started, &protect);
+}
+
+void detectLibPathsChanges()
+{
+   static std::vector<std::string> s_lastLibPaths;
+   std::vector<std::string> libPaths;
+   Error error = r::exec::RFunction("base:::.libPaths").call(&libPaths);
+   if (error)
+   {
+      LOG_ERROR(error);
+      return;
+   }
+
+   if (s_lastLibPaths.empty())
+   {
+      s_lastLibPaths = libPaths;
+   }
+   else if (libPaths != s_lastLibPaths)
+   {
+      module_context::events().onLibPathsChanged(libPaths);
+      enquePackageStateChanged();
+      s_lastLibPaths = libPaths;
+   }
+}
+
+void onConsoleInput(const std::string& input)
+{
+   // record last console input
+   s_lastInput += input;
+   
+   // record prior repository
+   SEXP reposSEXP = r::options::getOption("repos");
+   s_reposSEXP.set(reposSEXP);
+}
+
+// A cheap pre-filter that just asks "does this input contain a function call?".
+// It matches an identifier (the function name) followed by '(', which also
+// covers namespace-qualified calls like 'pkg::fn(' since the 'fn(' portion
+// matches. The character class includes '.' because R identifiers may contain
+// it ('install.packages'). This intentionally accepts any call, not just
+// package-management ones: it only decides whether to run the precise,
+// namespace-resolving check in '.rs.isPackageManagementCall'. Keeping the
+// syntactic gate dumb means the authoritative list of package-management
+// functions lives in exactly one place (that R function) rather than being
+// mirrored here.
+boost::regex buildCallSyntaxRegex()
+{
+   return boost::regex("[\\w.]+\\s*\\(");
+}
+
+void onConsolePrompt(const std::string&)
+{
+   // skip if we're being invoked within a readline call
+   bool isReadingUserInput = false;
+   Error error = r::exec::RFunction(".rs.isReadingUserInput").call(&isReadingUserInput);
+   if (error)
+      LOG_ERROR(error);
+
+   if (isReadingUserInput)
+      return;
+
+   // consume last input
+   std::string lastInput = s_lastInput;
+   s_lastInput.clear();
+
+   // A cheap regex pre-filter skips call-free console input without touching R;
+   // anything that contains a call is handed to the precise check, which parses
+   // it and resolves each call's namespace. This keeps a false positive (e.g.
+   // 'remove' in a comment, or base R's remove()/update()) from triggering an
+   // expensive package-library scan -- see issue #17758.
+   if (containsCallSyntax(lastInput))
+   {
+      bool isPackageCall = false;
+      Error error = r::exec::RFunction(".rs.isPackageManagementCall", lastInput)
+                       .call(&isPackageCall);
+      if (error)
+         LOG_ERROR(error);
+
+      if (isPackageCall)
+      {
+         rs_packageLibraryMutated();
+         return;
+      }
+   }
+
+   // check and see if the 'repos' option has been mutated
+   SEXP reposSEXP = r::options::getOption("repos");
+   if (reposSEXP != s_reposSEXP.get())
+   {
+      enquePackageStateChanged();
+      return;
+   }
+}
+
+void onDetectChanges(module_context::ChangeSource source)
+{
+   // silently drop attempts to call this from non-main thread
+   if (!core::thread::isMainThread())
+      return;
+   
+   // check for libPaths changes if we're evaluating a change from the REPL at
+   // the top-level (i.e. not while debugging, as we don't want to mutate any
+   // state that might be under inspection)
+   if (source == module_context::ChangeSourceREPL &&
+       core::thread::isMainThread() &&
+       r::exec::atTopLevelContext())
+   {
+      detectLibPathsChanges();
+   }
+}
+
+#ifdef __APPLE__
+
+// R's bundled OpenMP runtime (libomp.dylib) and other builds of it export the
+// same weak C++ template symbols, which dyld coalesces across images: with two
+// copies loaded, one copy's internal calls land in the other, and a copy that
+// was never initialized crashes the session on the first OpenMP region
+// (#18937). These routines let the R side spot a second copy the moment a
+// package brings it in.
+bool isOpenMPRuntime(const std::string& path)
+{
+   // an exact match: LLVM's libomptarget.dylib and libompd.dylib aren't runtimes,
+   // while Intel's libiomp5.dylib (e.g. MKL builds of Python packages) shares
+   // libomp's code base and its coalesced symbols
+   std::string filename = FilePath(path).getFilename();
+   return filename == "libomp.dylib" || filename == "libiomp5.dylib";
+}
+
+// the dylibs an image links against, as recorded in its load commands
+std::vector<std::string> linkedLibraries(const struct mach_header* pHeader)
+{
+   std::vector<std::string> libraries;
+   if (pHeader->magic != MH_MAGIC_64)
+      return libraries;
+
+   const char* pCommand = reinterpret_cast<const char*>(pHeader) + sizeof(struct mach_header_64);
+   for (uint32_t i = 0; i < pHeader->ncmds; i++)
+   {
+      const struct load_command* pLoad = reinterpret_cast<const struct load_command*>(pCommand);
+      switch (pLoad->cmd)
+      {
+      case LC_LOAD_DYLIB:
+      case LC_LOAD_WEAK_DYLIB:
+      case LC_REEXPORT_DYLIB:
+      case LC_LOAD_UPWARD_DYLIB:
+      {
+         const struct dylib_command* pDylib = reinterpret_cast<const struct dylib_command*>(pLoad);
+         libraries.push_back(pCommand + pDylib->dylib.name.offset);
+         break;
+      }
+      default:
+         break;
+      }
+
+      pCommand += pLoad->cmdsize;
+   }
+
+   return libraries;
+}
+
+#endif
+
+// paths of the OpenMP runtimes currently loaded, in load order
+SEXP rs_loadedOpenMPRuntimes()
+{
+   std::vector<std::string> runtimes;
+
+#ifdef __APPLE__
+   uint32_t count = _dyld_image_count();
+   for (uint32_t i = 0; i < count; i++)
+   {
+      const char* pName = _dyld_get_image_name(i);
+      if (pName != nullptr && isOpenMPRuntime(pName))
+         runtimes.push_back(pName);
+   }
+#endif
+
+   r::sexp::Protect protect;
+   return r::sexp::create(runtimes, &protect);
+}
+
+// each loaded image that links an OpenMP runtime, paired with the runtime path
+// from its load commands (which may be an @rpath reference)
+SEXP rs_openMPRuntimeUsers()
+{
+   std::vector<std::string> images;
+   std::vector<std::string> runtimes;
+
+#ifdef __APPLE__
+   uint32_t count = _dyld_image_count();
+   for (uint32_t i = 0; i < count; i++)
+   {
+      const char* pName = _dyld_get_image_name(i);
+      const struct mach_header* pHeader = _dyld_get_image_header(i);
+      if (pName == nullptr || pHeader == nullptr)
+         continue;
+
+      for (const std::string& library : linkedLibraries(pHeader))
+      {
+         if (isOpenMPRuntime(library))
+         {
+            images.push_back(pName);
+            runtimes.push_back(library);
+         }
+      }
+   }
+#endif
+
+   r::sexp::Protect protect;
+   r::sexp::ListBuilder builder(&protect);
+   builder.add("image", images);
+   builder.add("runtime", runtimes);
+   return r::sexp::create(builder, &protect);
+}
+
+void onInitComplete()
+{
+   s_reposSEXP.set(r::options::getOption("repos"));
+}
+
+void onDeferredInit(bool /* newSession */)
+{
+   // Ensure we have a writeable user library
+   Error error = r::exec::RFunction(".rs.ensureWriteableUserLibrary").call();
+   if (error)
+      LOG_ERROR(error);
+
+   // subscribe to package attach / detach events. this happens here (rather
+   // than at module init) both to keep the scan off the startup critical path
+   // and because the rs_* routines it relies upon are only registered with R
+   // once the init sequence has completed
+   updatePackageEventsAsync();
+
+   // monitor libPaths for changes
+   detectLibPathsChanges();
+   module_context::events().onDetectChanges.connect(onDetectChanges);
+
+   // kick off the initial (asynchronous) vulnerability check
+   ppm::refreshVulnerabilitiesAsync();
+}
+
+Error getPackageState(const json::JsonRpcRequest& ,
+                      json::JsonRpcResponse* pResponse)
+{
+   json::Object result;
+   bool deliverEvent = false;
+   Error error = s_packageStateBuilder.build(&result, &deliverEvent);
+   if (error)
+      LOG_ERROR(error);
+   else
+      pResponse->setResult(result);
+
+   // a package-state change that arrived while we were building is delivered
+   // here, so that event-only listeners see it too
+   if (deliverEvent)
+      enquePackageState(result);
+
+   schedulePackageStateRefresh();
+
+   // The package list returns immediately without vulnerability data, which
+   // arrives later via kPackageVulnerabilitiesReady. This RPC is the only path
+   // for a re-join/reconnect to an already-running session (where onDeferredInit
+   // won't fire again) and for the user-facing Refresh command, so kick off a
+   // refresh here too -- otherwise a reconnected client would show no badges
+   // until some incidental package mutation happened to trigger one.
+   ppm::refreshVulnerabilitiesAsync();
+
+   return error;
+}
+
+} // anonymous namespace
+
+bool containsCallSyntax(const std::string& input)
+{
+   static const boost::regex s_pattern = buildCallSyntaxRegex();
+   return boost::regex_search(input, s_pattern);
+}
+
+void enquePackageStateChanged()
+{
+   // a request that lands inside another build is folded into it, and that
+   // build delivers the event once it has run again
+   json::Object pkgState;
+   bool deliverEvent = false;
+   Error error = s_packageStateBuilder.buildForEvent(&pkgState, &deliverEvent);
+   if (error)
+      LOG_ERROR(error);
+   else if (deliverEvent)
+      enquePackageState(pkgState);
+
+   schedulePackageStateRefresh();
+
+   // the package set or active repository may have changed; refresh
+   // vulnerability data asynchronously to match
+   ppm::refreshVulnerabilitiesAsync();
+}
+
+PackageStateBuilder::PackageStateBuilder(const BuildFunction& build)
+   : build_(build)
+{
+}
+
+Error PackageStateBuilder::build(json::Object* pJson, bool* pDeliverEvent)
+{
+   return run(true, false, pJson, pDeliverEvent);
+}
+
+Error PackageStateBuilder::buildForEvent(json::Object* pJson, bool* pDeliverEvent)
+{
+   return run(false, true, pJson, pDeliverEvent);
+}
+
+bool PackageStateBuilder::eventPending() const
+{
+   return eventPending_;
+}
+
+bool PackageStateBuilder::needsDeferredBuild() const
+{
+   return depth_ == 0 && rebuildPending_;
+}
+
+Error PackageStateBuilder::run(bool needsResult,
+                               bool wantsEvent,
+                               json::Object* pJson,
+                               bool* pDeliverEvent)
+{
+   *pDeliverEvent = false;
+   eventPending_ = eventPending_ || wantsEvent;
+
+   // fold the request into the build in progress: it runs again before handing
+   // anything back, and delivers the event on our behalf
+   if (depth_ > 0 && !needsResult)
+   {
+      rebuildPending_ = true;
+      return Success();
+   }
+
+   // build, and build again if a request arrived while we were scanning, so
+   // that the list we hand back reflects it
+   ++depth_;
+   Error error;
+   for (int pass = 0; pass < kMaxPasses; pass++)
+   {
+      rebuildPending_ = false;
+      error = build_(pJson);
+      if (error || !rebuildPending_)
+         break;
+   }
+   --depth_;
+
+   // we built inside another build (we needed a result of our own); its list
+   // is now older than ours, so have it run again
+   if (depth_ > 0)
+   {
+      rebuildPending_ = true;
+      return error;
+   }
+
+   // Failures keep any owed event, but never request an automatic retry.
+   if (error)
+      rebuildPending_ = false;
+   else if (rebuildPending_)
+      eventPending_ = true; // even an RPC-only build needs a fresh event at the cap
+
+   // A capped build leaves its event and refresh pending for the idle build.
+   // Only a successful scan with no outstanding requests can deliver it.
+   *pDeliverEvent = !error && !rebuildPending_ && eventPending_;
+   if (*pDeliverEvent)
+      eventPending_ = false;
+
+   return error;
+}
+
+Error initialize()
+{
+   // register deferred init
+   module_context::events().onInitComplete.connect(onInitComplete);
+   module_context::events().onDeferredInit.connect(onDeferredInit);
+   module_context::events().onConsoleInput.connect(onConsoleInput);
+   module_context::events().onConsolePrompt.connect(onConsolePrompt);
+
+   // register routines
+   RS_REGISTER_CALL_METHOD(rs_enqueLoadedPackageUpdates);
+   RS_REGISTER_CALL_METHOD(rs_canInstallPackages);
+   RS_REGISTER_CALL_METHOD(rs_shouldRecordPackageSources);
+   RS_REGISTER_CALL_METHOD(rs_packageLibraryMutated);
+   RS_REGISTER_CALL_METHOD(rs_getCachedAvailablePackages);
+   RS_REGISTER_CALL_METHOD(rs_downloadAvailablePackages);
+   RS_REGISTER_CALL_METHOD(rs_updatePackageEvents);
+   RS_REGISTER_CALL_METHOD(rs_loadedOpenMPRuntimes);
+   RS_REGISTER_CALL_METHOD(rs_openMPRuntimeUsers);
+
+   using boost::bind;
+   using namespace module_context;
+   ExecBlock initBlock;
+   initBlock.addFunctions()
+      (bind(sourceModuleRFile, "SessionPackages.R"))
+      (bind(registerRpcMethod, "available_packages", availablePackages))
+      (bind(registerRpcMethod, "get_package_state", getPackageState))
+      (bind(r::exec::executeString, ".rs.packages.initialize()"));
+   return initBlock.execute();
+}
+
+
+} // namespace packages
+} // namespace modules
+} // namespace session
+} // namespace rstudio
+

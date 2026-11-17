@@ -1,0 +1,309 @@
+/*
+ * SessionRTests.cpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include <gtest/gtest.h>
+
+#include <boost/scope_exit.hpp>
+
+#include <clocale>
+#include <memory>
+#include <string>
+#include <thread>
+
+#include <core/system/Environment.hpp>
+
+#include <r/RExec.hpp>
+#include <r/RSexp.hpp>
+#include <r/RErrorCategory.hpp>
+#include <r/RInterface.hpp>
+#include <r/RUtil.hpp>
+
+using namespace rstudio::core;
+
+namespace rstudio {
+namespace session {
+namespace tests {
+
+TEST(SessionRTest, RFunctionErrorsDontSetResultToNull) {
+   SEXP result = R_NilValue;
+   r::sexp::Protect protect;
+   
+   Error error = r::exec::RFunction("NoSuchFunction")
+         .call(&result, &protect);
+   
+   EXPECT_NE(Success(), error);
+   EXPECT_NE(nullptr, result);
+   EXPECT_EQ(R_NilValue, result);
+}
+
+// matcher for the guard failure produced by off-main-thread RFunction use;
+// checking the message distinguishes it from unrelated evaluation errors,
+// which share the CodeExecutionError code
+static void expectNonMainThreadError(const Error& error)
+{
+   EXPECT_TRUE(error == r::errc::CodeExecutionError);
+   EXPECT_TRUE(error.getProperty("errormsg").find("non-main thread") != std::string::npos);
+}
+
+TEST(SessionRTest, RFunctionRefusesNonMainThread) {
+   // the R runtime is single-threaded; RFunction must refuse to touch it
+   // from other threads rather than race code running on the main thread.
+   // note that the sub-cases use calls that would succeed if the guards
+   // were absent (identity("x"), getwd(), list()), so a missing guard
+   // yields Success() rather than an unrelated evaluation error
+
+   // a full construct-and-call chain off the main thread errors cleanly
+   Error error;
+   std::thread([&error]()
+   {
+      error = r::exec::RFunction("identity")
+            .addParam("x")
+            .call();
+   }).join();
+   expectNonMainThreadError(error);
+
+   // a function constructed off the main thread is poisoned, so it stays
+   // unusable even when called from the main thread; getwd() succeeds with
+   // no arguments, so only the poisoning can make this fail
+   std::unique_ptr<r::exec::RFunction> pFunction;
+   std::thread([&pFunction]()
+   {
+      pFunction.reset(new r::exec::RFunction("getwd"));
+   }).join();
+   error = pFunction->call();
+   expectNonMainThreadError(error);
+
+   // the same holds for a function wrapping an already-resolved SEXP
+   SEXP functionSEXP = R_NilValue;
+   r::sexp::Protect protect;
+   error = r::exec::evaluateString("base::getwd", &functionSEXP, &protect);
+   ASSERT_FALSE(error);
+
+   std::unique_ptr<r::exec::RFunction> pSexpFunction;
+   std::thread([&pSexpFunction, functionSEXP]()
+   {
+      pSexpFunction.reset(new r::exec::RFunction(functionSEXP));
+   }).join();
+   error = pSexpFunction->call();
+   expectNonMainThreadError(error);
+
+   // parameters added from a background thread are refused and poison the
+   // function: a later main-thread call must fail rather than execute with
+   // missing parameters (list() would otherwise succeed with no arguments)
+   r::exec::RFunction listFunction("list");
+   std::thread([&listFunction]()
+   {
+      listFunction.addParam("x");
+      listFunction.addUtf8Param("y");
+   }).join();
+   error = listFunction.call();
+   expectNonMainThreadError(error);
+
+   // the same call made entirely on the main thread succeeds
+   std::string result;
+   error = r::exec::RFunction("identity")
+         .addParam("x")
+         .call(&result);
+   EXPECT_FALSE(error);
+   EXPECT_EQ("x", result);
+}
+
+TEST(SessionRTest, SysGetenvSeesCoreSetenv) {
+   // on Windows, the write-through only reaches R when R resolves getenv()
+   // to the same CRT module we do. each module snapshots the Win32
+   // environment block once, lazily, and never re-reads it, so a write into
+   // another module's table stays invisible to R; only the r::util::setenv
+   // bridge helps there
+#if defined(_WIN32) && defined(_DEBUG)
+   // debug builds link ucrtbased.dll, whereas R.dll always links the release
+   // ucrtbase.dll
+   GTEST_SKIP() << "debug builds link ucrtbased.dll; R links ucrtbase.dll";
+#elif defined(_WIN32)
+   // msvcrt builds of R (R < 4.2) keep their own copy of the environment
+   bool sharedRuntime = false;
+   Error versionError = r::exec::evaluateString("getRversion() >= '4.2.0'", &sharedRuntime);
+   ASSERT_FALSE(versionError);
+   if (!sharedRuntime)
+      GTEST_SKIP() << "R < 4.2 links against msvcrt, which has its own environment";
+#endif
+
+   // Sys.getenv reads the environment via R's C runtime; on Windows,
+   // core::system::setenv historically wrote only the Win32 environment
+   // block, so variables set after R started were visible to child
+   // processes but not to R code. setenv now writes through the C runtime
+   // as well, so this must hold even with R running
+   core::system::setenv("RSTUDIO_ENV_BRIDGE_TEST", "42");
+
+   std::string value;
+   Error error = r::exec::RFunction("Sys.getenv")
+         .addParam("RSTUDIO_ENV_BRIDGE_TEST")
+         .call(&value);
+   EXPECT_FALSE(error);
+   EXPECT_EQ("42", value);
+
+   // deletion must be visible to R as well
+   core::system::unsetenv("RSTUDIO_ENV_BRIDGE_TEST");
+
+   error = r::exec::RFunction("Sys.getenv")
+         .addParam("RSTUDIO_ENV_BRIDGE_TEST")
+         .call(&value);
+   EXPECT_FALSE(error);
+   EXPECT_EQ("", value);
+}
+
+TEST(SessionRTest, RActiveBindingDetection) {
+   // Create an active binding in R
+   Error error = r::exec::executeString(R"EOF({
+      make_counter <- function() {
+        count <- 0L
+        function() {
+          count <<- count + 1L
+          count
+        }
+      }
+      makeActiveBinding("counter", make_counter(), env = globalenv())
+   })EOF");
+   
+   EXPECT_FALSE(error) << "Failed to create active binding";
+   
+   // Check that it behaves as expected
+   int v1 = 0;
+   error = r::exec::evaluateString("counter", &v1);
+   EXPECT_FALSE(error);
+   EXPECT_EQ(1, v1);
+   
+   int v2 = 0;
+   error = r::exec::evaluateString("counter", &v2);
+   EXPECT_FALSE(error);
+   EXPECT_EQ(2, v2);
+   
+   // Check that regular bindings are not considered active
+   EXPECT_FALSE(r::sexp::isActiveBinding("data.frame", R_GlobalEnv));
+   
+   // Check that we can detect it
+   EXPECT_TRUE(r::sexp::isActiveBinding("counter", R_GlobalEnv));
+  
+   // Check that undefined variables aren't an error
+   EXPECT_FALSE(r::sexp::isActiveBinding("noBindingWithThisNameExists", R_GlobalEnv));
+   
+   // Remove it when we're done
+   error = r::exec::executeString(R"EOF(
+      rm(counter, make_counter)
+   )EOF");
+   EXPECT_FALSE(error);
+}
+
+// constructed during static initialization, before R has initialized
+// R_NilValue, like the session's own file-scope instances
+static r::sexp::PreservedSEXP s_staticPreservedSEXP;
+
+TEST(SessionRTest, PreservedSEXPUnsetStaticReadsAsNil) {
+   // a never-set instance must hand back R's NULL, not a null pointer
+   ASSERT_NE(nullptr, R_NilValue);
+   EXPECT_TRUE(s_staticPreservedSEXP.isNil());
+   EXPECT_EQ(R_NilValue, s_staticPreservedSEXP.get());
+
+   // the first set() has nothing to release
+   r::sexp::Protect protect;
+   SEXP valueSEXP = r::sexp::create("value", &protect);
+   s_staticPreservedSEXP.set(valueSEXP);
+   EXPECT_FALSE(s_staticPreservedSEXP.isNil());
+   EXPECT_EQ(valueSEXP, s_staticPreservedSEXP.get());
+
+   s_staticPreservedSEXP.releaseNow();
+   EXPECT_TRUE(s_staticPreservedSEXP.isNil());
+   EXPECT_EQ(R_NilValue, s_staticPreservedSEXP.get());
+}
+
+TEST(SessionRTest, PreservedSEXPTreatsRNullAsEmpty) {
+   r::sexp::PreservedSEXP preserved(R_NilValue);
+   EXPECT_TRUE(preserved.isNil());
+   EXPECT_EQ(R_NilValue, preserved.get());
+
+   r::sexp::Protect protect;
+   SEXP valueSEXP = r::sexp::create("value", &protect);
+   preserved.set(valueSEXP);
+   EXPECT_FALSE(preserved.isNil());
+
+   preserved.set(R_NilValue);
+   EXPECT_TRUE(preserved.isNil());
+   EXPECT_EQ(R_NilValue, preserved.get());
+}
+
+TEST(SessionRTest, PreservedSEXPMovedFromIsEmpty) {
+   r::sexp::Protect protect;
+   SEXP valueSEXP = r::sexp::create("value", &protect);
+
+   r::sexp::PreservedSEXP source(valueSEXP);
+   r::sexp::PreservedSEXP constructed(std::move(source));
+   EXPECT_EQ(valueSEXP, constructed.get());
+   EXPECT_TRUE(source.isNil());
+   EXPECT_EQ(R_NilValue, source.get());
+
+   r::sexp::PreservedSEXP assigned;
+   assigned = std::move(constructed);
+   EXPECT_EQ(valueSEXP, assigned.get());
+   EXPECT_TRUE(constructed.isNil());
+   EXPECT_EQ(R_NilValue, constructed.get());
+}
+
+#ifdef _WIN32
+
+TEST(SessionRTest, SynchronizeLocaleRepairsAClobberedLocale) {
+   // Before R 4.2, R and rsession use different C runtimes. There is no
+   // shared locale for code outside R to clobber, so the repair path does not
+   // apply.
+   bool sharedRuntime = false;
+   Error versionError = r::exec::evaluateString(
+            "getRversion() >= '4.2.0'", &sharedRuntime);
+   ASSERT_FALSE(versionError);
+   if (!sharedRuntime)
+      GTEST_SKIP() << "R < 4.2 links against a separate C runtime";
+
+   // rsession and UCRT builds of R share one C runtime, so code that switches
+   // to the "C" locale and then fails to restore it leaves the session there
+   // while R goes on believing it is in its original locale. Everything that
+   // trusts the C runtime locale then corrupts non-ASCII text.
+   // https://github.com/rstudio/rstudio/issues/18139
+   const wchar_t* pLocale = ::_wsetlocale(LC_CTYPE, nullptr);
+   ASSERT_NE(nullptr, pLocale);
+
+   std::wstring locale(pLocale);
+   if (locale == L"C")
+      GTEST_SKIP() << "session is already running in the C locale";
+
+   BOOST_SCOPE_EXIT(&locale)
+   {
+      ::_wsetlocale(LC_CTYPE, locale.c_str());
+   }
+   BOOST_SCOPE_EXIT_END
+
+   // let synchronizeLocale() record the session locale, then move the C
+   // runtime behind R's back the way a failed save/restore would
+   r::util::synchronizeLocale();
+   ASSERT_NE(nullptr, ::_wsetlocale(LC_CTYPE, L"C"));
+
+   r::util::synchronizeLocale();
+
+   const wchar_t* pRepaired = ::_wsetlocale(LC_CTYPE, nullptr);
+   ASSERT_NE(nullptr, pRepaired);
+   EXPECT_STREQ(locale.c_str(), pRepaired);
+}
+
+#endif
+
+} // namespace tests
+} // namespace session
+} // namespace rstudio

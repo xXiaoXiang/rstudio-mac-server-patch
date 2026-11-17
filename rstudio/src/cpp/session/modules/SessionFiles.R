@@ -1,0 +1,266 @@
+#
+# SessionFiles.R
+#
+# Copyright (C) 2022 by Posit Software, PBC
+#
+# Unless you have received this program directly from Posit Software pursuant
+# to the terms of a commercial license agreement with Posit Software, then
+# this program is licensed to you under the terms of version 3 of the
+# GNU Affero General Public License. This program is distributed WITHOUT
+# ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+# AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+#
+#
+
+.rs.setVar("files.savedBindings", new.env(parent = emptyenv()))
+
+# save old implementations, in case we need to restore them
+bindings <- c("list.files", "list.dirs", "dir")
+for (binding in bindings)
+{
+   original <- get(binding, envir = baseenv(), inherits = FALSE)
+   assign(binding, original, envir = .rs.files.savedBindings)
+}
+
+
+.rs.addJsonRpcHandler("list_all_files", function(path, pattern)
+{
+   list.files(path, pattern = pattern, recursive = TRUE)
+})
+
+.rs.addJsonRpcHandler("ensure_file_exists", function(path)
+{
+   if (!file.exists(path))
+      if (!file.create(path, recursive = TRUE))
+         return(.rs.scalar(FALSE))
+   
+   .rs.scalar(identical(file.info(path)$isdir, FALSE))
+})
+
+.rs.addJsonRpcHandler("ensure_editable_file", function(path)
+{
+   # resolve the folder against the working directory, but keep the file's own
+   # name, so a symlinked file opens under the same path as it does from the
+   # Files pane or file.edit(), rather than as a second copy under its target
+   path <- path.expand(path)
+   parent <- dirname(path)
+   if (dir.exists(parent))
+   {
+      parent <- normalizePath(parent, winslash = "/", mustWork = TRUE)
+      path <- paste(sub("/$", "", parent), basename(path), sep = "/")
+   }
+
+   # file.create() doesn't create missing folders; report that rather than
+   # creating a folder from what may be a typo
+   error <- ""
+   if (dir.exists(path))
+      error <- "is_folder"
+   else if (!file.exists(path) && !file.create(path, showWarnings = FALSE))
+      error <- "not_created"
+
+   list(
+      path  = .rs.scalar(.rs.createAliasedPath(path)),
+      error = .rs.scalar(error)
+   )
+})
+
+.rs.addJsonRpcHandler("create_aliased_path", function(path)
+{
+   if (!file.exists(path))
+      return(.rs.scalar(""))
+   
+   # make sure we use forward slashes here, since otherwise our
+   # home path detection will fail to work
+   # https://github.com/rstudio/rstudio/issues/13134
+   normalized <- normalizePath(path, winslash = "/", mustWork = FALSE)
+   .rs.scalar(.rs.createAliasedPath(normalized))
+})
+
+.rs.addJsonRpcHandler("recover_package_source", function(path)
+{
+   # given a package source path which no longer exists (e.g. a srcref
+   # path recorded when the package was installed from sources), try to
+   # recover a copy of the file from the package's srcref database
+   recovered <- .rs.recoverPackageSourcePath(path)
+   if (nzchar(recovered))
+   {
+      normalized <- normalizePath(recovered, winslash = "/", mustWork = FALSE)
+      recovered <- .rs.createAliasedPath(normalized)
+   }
+
+   .rs.scalar(recovered)
+})
+
+.rs.addJsonRpcHandler("get_issue_url", function(id)
+{
+   project <- .rs.getProjectDirectory()
+   if (is.null(project)) {
+      return(.rs.scalar(""))
+   }
+   
+   DESCRIPTION <- file.path(project, "DESCRIPTION")
+   if (!file.exists(DESCRIPTION)) {
+      return(.rs.scalar(""))
+   }
+
+   BugReports <- tryCatch(
+      read.dcf(DESCRIPTION, fields = "BugReports"), 
+      error = function(e) NA, 
+      warning = function(w) NA
+   )
+   if (is.na(BugReports)) {
+      return(.rs.scalar(""))
+   }
+
+   if (!is.character(BugReports) || length(BugReports) != 1L) {
+      return(.rs.scalar(""))
+   }
+
+   # make sure BugReports is a url and append the id to it
+   if (grepl("^(https?://|www.)", BugReports)) {
+      .rs.scalar(paste0(BugReports, "/", sub("#", "", id)))
+   } else {
+      .rs.scalar("")
+   }
+})
+
+
+# these hooks are added to support RStudio's transition into
+# the use of a UTF-8 code page
+.rs.addFunction("files.replaceBindings", function()
+{
+   .rs.replaceBinding("list.files", "base", function(path = ".",
+                                                     pattern = NULL,
+                                                     all.files = FALSE,
+                                                     full.names = FALSE,
+                                                     recursive = FALSE,
+                                                     ignore.case = FALSE,
+                                                     include.dirs = FALSE,
+                                                     no.. = FALSE)
+   {
+      "RStudio hook: restore original with `.rs.files.restoreBindings()`"
+      .Call(
+         "rs_listFiles",
+         path,
+         pattern,
+         all.files,
+         full.names,
+         recursive,
+         ignore.case,
+         include.dirs,
+         no..,
+         PACKAGE = "(embedding)"
+      )
+   })
+
+   .rs.replaceBinding("list.dirs", "base", function(path = ".",
+                                                    full.names = TRUE,
+                                                    recursive = TRUE)
+   {
+      "RStudio hook: restore original with `.rs.files.restoreBindings()`"
+      .Call(
+         "rs_listDirs",
+         path,
+         full.names,
+         recursive,
+         PACKAGE = "(embedding)"
+      )
+   })
+
+   # dir and list.files should refer to the same thing
+   .rs.replaceBinding("dir", "base", list.files)
+
+})
+
+# this is provided just in case users need an escape hatch
+# from our overridden list.files() implementations on windows
+.rs.addFunction("files.restoreBindings", function()
+{
+   bindings <- ls(envir = .rs.files.savedBindings)
+   for (binding in bindings)
+      .rs.replaceBinding(binding, "base", .rs.files.savedBindings[[binding]])
+})
+
+.rs.addFunction("listFiles", function(path = ".",
+                                      pattern = NULL,
+                                      all.files = FALSE,
+                                      full.names = FALSE,
+                                      recursive = FALSE,
+                                      ignore.case = FALSE,
+                                      include.dirs = FALSE,
+                                      no.. = FALSE)
+{
+   .Call(
+      "rs_listFiles",
+      path,
+      pattern,
+      all.files,
+      full.names,
+      recursive,
+      ignore.case,
+      include.dirs,
+      no..,
+      PACKAGE = "(embedding)"
+   )
+})
+
+.rs.addFunction("listDirs", function(path = ".",
+                                     full.names = TRUE,
+                                     recursive = TRUE)
+{
+   .Call(
+      "rs_listDirs",
+      path,
+      full.names,
+      recursive,
+      PACKAGE = "(embedding)"
+   )
+})
+
+.rs.addFunction("listZipFile", function(zipfile)
+{
+   as.character(utils::unzip(zipfile, list=TRUE)$Name)
+})
+
+.rs.addFunction("createZipFile", function(zipfile, parent, files)
+{
+   # set working dir to parent (and restore on exit)
+   previous_wd = getwd()
+   setwd(parent)
+   on.exit(setwd(previous_wd))
+   
+   # build zip command
+   quotedFiles = paste(shQuote(files), collapse = " ")
+   createZipCommand = paste("zip", "-r", shQuote(zipfile), quotedFiles, "2>&1")  
+   
+   # execute the command (return output of command)
+   system(createZipCommand, intern = TRUE)
+})
+
+.rs.addFunction("scanFiles", function(path,
+                                      pattern,
+                                      asRelativePath = TRUE,
+                                      maxCount = 200L)
+{
+   .Call("rs_scanFiles",
+         as.character(path),
+         as.character(pattern),
+         as.logical(asRelativePath),
+         as.integer(maxCount),
+         PACKAGE = "(embedding)")
+})
+
+.rs.addFunction("readLines", function(filePath)
+{
+   .Call("rs_readLines", path.expand(filePath), PACKAGE = "(embedding)")
+})
+
+# Vectorized: replaces each path's HOME prefix with "~" (and HOME itself with
+# "~"), leaving paths outside HOME unchanged. Delegates to the C++
+# FilePath::createAliasedPath so the R-callable layer and the C++ session
+# share a single implementation -- see rs_createAliasedPath in SessionFiles.cpp.
+.rs.addFunction("createAliasedPath", function(path)
+{
+   .Call("rs_createAliasedPath", path, PACKAGE = "(embedding)")
+})

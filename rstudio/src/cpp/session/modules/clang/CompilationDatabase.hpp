@@ -1,0 +1,173 @@
+/*
+ * ClangCompilationDatabase.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef SESSION_MODULES_CLANG_COMPILATION_DATABASE_HPP
+#define SESSION_MODULES_CLANG_COMPILATION_DATABASE_HPP
+
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <boost/noncopyable.hpp>
+
+#include <shared_core/Error.hpp>
+#include <shared_core/FilePath.hpp>
+
+#include <core/system/Process.hpp>
+#include <core/system/Environment.hpp>
+
+#include <core/libclang/LibClang.hpp>
+
+#define kCompilationDbPrefix "clang-compilation-db-"
+
+namespace rstudio {
+namespace core {
+namespace r_util {
+class RPackageInfo;
+class RToolsInfo;
+} // namespace r_util
+} // namespace core
+} // namespace rstudio
+
+namespace rstudio {
+namespace session {
+namespace modules {      
+namespace clang {
+
+class ClangCompilationDatabase : boost::noncopyable
+{
+public:
+   ClangCompilationDatabase();
+   virtual ~ClangCompilationDatabase() {}
+
+   std::vector<std::string> compileArgsForTranslationUnit(
+           const std::string& filename, bool usePrecompiledHeaders);
+
+   // the args we derive for the file, without the precompiled header or
+   // any compile_flags.txt additions
+   std::vector<std::string> generatedCompileArgs(const std::string& filename);
+
+   bool isProjectTranslationUnit(const std::string& filename) const;
+
+   std::vector<std::string> projectTranslationUnits() const;
+
+   void rebuildPackageCompilationDatabase();
+
+private:
+
+   core::Error executeSourceCpp(core::system::Options env,
+                                const std::string& cppPkg,
+                                const core::FilePath& srcPath,
+                                core::system::ProcessResult* pResult);
+
+   core::Error executeRCmdSHLIB(core::system::Options env,
+                                const core::FilePath& srcPath,
+                                core::system::ProcessResult* pResult);
+
+   void updateForCurrentPackage();
+   void updateForSourceCpp(const core::FilePath& cppPath);
+   std::vector<std::string> compileArgsForPackage(
+                                     const core::system::Options& env,
+                                     const core::FilePath& srcDir,
+                                     bool isCpp);
+
+
+   void savePackageCompilationConfig();
+   void restorePackageCompilationConfig();
+
+   // struct used to represent compilation settings
+   struct CompilationConfig
+   {
+      bool empty() const { return args.empty(); }
+      std::vector<std::string> args;
+      std::string PCH;
+      bool isCpp;
+   };
+
+   CompilationConfig configForSourceCpp(const std::string& cppPkg,
+                                        core::FilePath srcFile);
+
+   std::vector<std::string> argsForRCmdSHLIB(core::system::Options env,
+                                             core::FilePath srcFile);
+
+   std::vector<std::string> baseCompilationArgs(bool isCppFile) const;
+   std::vector<std::string> packageCompilationArgs(
+         core::r_util::RPackageInfo* pPkgInfo = nullptr,
+         bool* pIsCpp = nullptr);
+
+#ifdef _WIN32
+   core::r_util::RToolsInfo& rToolsInfo() const;
+#endif
+
+   core::system::Options compilationEnvironment() const;
+   std::vector<std::string> precompiledHeaderArgs(
+         const CompilationConfig& config,
+         const std::vector<std::string>& userFlags);
+
+   bool shouldIndexConfig(const CompilationConfig& config);
+   bool configForTranslationUnit(const core::FilePath& filePath,
+                                 CompilationConfig* pConfig);
+
+private:
+
+   // track the sourceCpp hash values used to derive args (don't re-run
+   // detection if hash hasn't changed)
+   typedef std::map<std::string, std::string> SourceCppHashes;
+   SourceCppHashes sourceCppHashes_;
+
+   // source file compilation settings
+   typedef std::map<std::string, CompilationConfig> ConfigMap;
+   ConfigMap sourceCppConfigMap_;
+
+   // package compliation settings (track file modification times on build
+   // oriented files to avoid re-running detection)
+   std::string packageBuildFileHash_;
+   std::string compilerHash_;
+   std::string rVersion_;
+   int databaseVersion_;
+   CompilationConfig packageCompilationConfig_;
+   bool usePrecompiledHeaders_;
+   bool forceRebuildPrecompiledHeaders_;
+
+   // precompiled headers rebuilt because libclang rejected them, and the
+   // ones it rejected again after that
+   std::set<std::string> rebuiltPrecompiledHeaders_;
+   std::set<std::string> unusablePrecompiledHeaders_;
+   bool restoredCompilationConfig_;
+};
+
+core::libclang::CompilationDatabase clangCompilationDatabase();
+
+// Support for a 'compile_flags.txt' (one argument per line, as in clangd)
+// found in a source file's directory or, within a project, a parent directory.
+core::FilePath findCompileFlagsFile(const core::FilePath& dir,
+                                    const core::FilePath& stopDir);
+core::FilePath compileFlagsFileForSource(const core::FilePath& srcFile);
+std::vector<std::string> readCompileFlags(const core::FilePath& flagsFile);
+std::vector<std::string> resolveCompileFlagPaths(const std::vector<std::string>& flags,
+                                                 const core::FilePath& dir);
+std::vector<std::string> compileFlagsForSource(const core::FilePath& srcFile);
+std::vector<std::string> systemIncludeArgs(const std::vector<std::string>& includes);
+void removeOrphanedUserFlagsPchs(const core::FilePath& platformPath,
+                                 const std::string& pkgName);
+
+
+} // namespace clang
+} // namespace handlers
+} // namespace session
+} // namespace rstudio
+
+#endif // SESSION_MODULES_CLANG_COMPILATION_DATABASE_HPP

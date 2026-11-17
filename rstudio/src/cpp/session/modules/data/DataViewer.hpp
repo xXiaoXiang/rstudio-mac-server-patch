@@ -1,0 +1,74 @@
+/*
+ * DataViewer.hpp
+ *
+ * Copyright (C) 2022 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#ifndef SESSION_DATA_VIEWER_HPP
+#define SESSION_DATA_VIEWER_HPP
+
+#include <string>
+#include <vector>
+
+typedef struct SEXPREC *SEXP;
+
+namespace rstudio {
+namespace core {
+   class Error;
+}
+}
+
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace data {
+namespace viewer {
+
+core::Error initialize();
+
+// exposed for testing
+namespace detail {
+
+// whether rows matching the global search `inner` are necessarily a subset of
+// rows matching the search `outer` (bare literal substring queries, matched
+// case-insensitively)
+bool isSearchSubset(const std::string& outer, const std::string& inner);
+
+// whether rows matching the "type|value" column filter `inner` are
+// necessarily a subset of rows matching the filter `outer`
+bool isFilterSubset(const std::string& outer, const std::string& inner);
+
+// the shape of an observed object; a change in shape necessitates a full
+// reload of any displayed version of it
+struct FrameShape
+{
+   // -1 means unknown, including for an object that wasn't bound when the
+   // viewer began observing it
+   int nrow = -1;
+   int ncol = -1;
+   std::vector<std::string> colNames;
+};
+
+// the shape of `sexp`; unknown when `sexp` is null (the object isn't bound)
+FrameShape frameShape(SEXP sexp);
+
+bool shapeChanged(const FrameShape& before, const FrameShape& after);
+
+} // namespace detail
+
+} // namespace viewer
+} // namespace data
+} // namespace modules
+} // namespace session
+} // namespace rstudio
+
+#endif // SESSION_DATA_VIEWER_HPP

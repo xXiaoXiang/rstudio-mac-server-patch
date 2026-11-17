@@ -1,0 +1,398 @@
+/*
+ * ChatSlots.cpp
+ *
+ * Copyright (C) 2026 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include "ChatSlots.hpp"
+
+#include "ChatConstants.hpp"
+#include "ChatInstallation.hpp"
+#include "ChatLogging.hpp"
+
+#include <chrono>
+#include <thread>
+
+#include <boost/algorithm/string/case_conv.hpp>
+
+#include <core/system/System.hpp>
+#include <shared_core/SafeConvert.hpp>
+
+using namespace rstudio::core;
+using namespace rstudio::session::modules::chat::constants;
+using namespace rstudio::session::modules::chat::logging;
+
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace chat {
+namespace slots {
+
+namespace {
+
+// Slot names past the first for one version run 1.1.0-2, 1.1.0-3, ...; the
+// bound only exists so a filesystem that keeps producing collisions fails
+// instead of spinning.
+const int kMaxAllocationAttempts = 1000;
+
+// Device names Windows resolves no matter which directory they appear in.
+// Checked on every platform on purpose: a home directory reached from both
+// Windows and Linux sessions has to agree on which names are slots, and
+// file_utils::isWindowsReservedName is compiled only on Windows.
+bool isReservedDeviceName(const std::string& name)
+{
+   static const char* const kReserved[] = {
+      "con", "prn", "aux", "nul",
+      "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+      "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+   };
+
+   // Windows resolves the device whatever follows it, so "nul.txt" and
+   // "com1.log" are reserved too -- only the part before the first dot counts.
+   std::string stem = boost::algorithm::to_lower_copy(
+      name.substr(0, name.find('.')));
+
+   for (const char* reserved : kReserved)
+   {
+      if (stem == reserved)
+         return true;
+   }
+
+   return false;
+}
+
+std::string slotNameForOrdinal(const std::string& version, int ordinal)
+{
+   if (ordinal <= 1)
+      return version;
+
+   return version + "-" + safe_convert::numberToString(ordinal);
+}
+
+// Short on purpose: the nonce, not the hostname, is what keeps staging
+// directories distinct, and the hostname is only there to tell a cleanup pass
+// whose abandoned extraction it is looking at. A longer cap would only push
+// the deep dist/client/assets/ paths extracted beneath it towards MAX_PATH on
+// Windows. getHostname() returns the HOSTNAME environment variable verbatim
+// (only its gethostname() fallback is capped), so the truncation here is
+// what bounds the name.
+const std::string::size_type kMaxHostnameLength = 32;
+
+// Names a staging directory. The nonce is what makes it private: no other
+// session can compute this name, so nothing else can write into the tree we
+// are extracting. Host and pid carry no correctness weight
+// here -- they are in the name so a later cleanup pass can tell whose
+// abandoned extraction it is looking at.
+std::string stagingDirName(const std::string& host)
+{
+   std::string hostname = host.substr(0, kMaxHostnameLength);
+
+   // ASCII by explicit range, not std::isalnum(): in macOS UTF-8 and Windows
+   // code-page locales isalnum() accepts some bytes above 0x7F, which left an
+   // invalid UTF-8 name that APFS refuses and R < 4.2 on Windows misreads.
+   for (char& c : hostname)
+   {
+      bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '.';
+      if (!keep)
+         c = '_';
+   }
+
+   if (hostname.empty())
+      hostname = "unknown-host";
+
+   return std::string(kStagingDirPrefix) + hostname + "-" +
+      safe_convert::numberToString(
+         static_cast<int64_t>(core::system::currentProcessId())) + "-" +
+      core::system::generateUuid(false);
+}
+
+// A transient failure of the publish rename is retried this often, for this
+// long in total. On Windows, antivirus or the search indexer briefly holds a
+// handle inside a freshly extracted tree, and MoveFileEx then fails with
+// access denied for a moment even though nothing is wrong with the tree.
+// Elsewhere a rename between siblings either works or fails for good, so a
+// retry would only delay the error.
+#ifdef _WIN32
+const int kPublishAttempts = 10;
+#else
+const int kPublishAttempts = 1;
+#endif
+const std::chrono::milliseconds kPublishRetryDelay(100);
+
+// Renames the staged tree into its final name, retrying a spurious failure.
+// MoveDirect, never MoveCrossDevice: the staging directory is a sibling of the
+// slot, so a copy fallback would mean the invariant that makes this rename
+// atomic has been broken and we want to hear about it.
+//
+// The retry is bounded and only for a failure that leaves the name free: a
+// target that appeared belongs to another session's install, which the caller
+// arbitrates, and a staging directory that disappeared cannot be retried.
+Error publishStagingDir(const FilePath& stagingDir, const FilePath& target)
+{
+   Error error;
+   for (int attempt = 1; attempt <= kPublishAttempts; ++attempt)
+   {
+      error = stagingDir.move(target, FilePath::MoveDirect);
+      if (!error || target.exists() || !stagingDir.exists())
+         return error;
+
+      DLOG("Publishing {} failed (attempt {} of {}): {}",
+           target.getAbsolutePath(), attempt, kPublishAttempts,
+           error.getMessage());
+      if (attempt < kPublishAttempts)
+         std::this_thread::sleep_for(kPublishRetryDelay);
+   }
+
+   return error;
+}
+
+} // anonymous namespace
+
+bool isUsableSlotName(const std::string& name)
+{
+   if (name.empty() || name.front() == '.' || name.front() == '-')
+      return false;
+
+   // Windows silently drops a trailing dot or space, so the directory on disk
+   // would not be the name recorded in the selector -- and on a home shared
+   // with Linux sessions the two names are separate directories.
+   if (name.back() == '.' || name.back() == ' ')
+      return false;
+
+   for (char c : name)
+   {
+      // Printable ASCII only: this string becomes a directory name in the
+      // user's home, and a version is never anything else.
+      if (c < 0x20 || c > 0x7e)
+         return false;
+   }
+
+   if (isReservedDeviceName(name))
+      return false;
+
+   // Separators, the drive-letter colon, and the characters Win32 rejects
+   // outright. Catching them here turns an opaque rename failure after a full
+   // extraction into a clear message.
+   return name.find_first_of("/\\:*?\"<>|") == std::string::npos;
+}
+
+FilePath versionsDir(const FilePath& storageDir)
+{
+   return storageDir.completeChildPath(kVersionsDirName);
+}
+
+namespace {
+
+// verifySlot(), optionally stopping before the file checks when the slot
+// declares a protocol other than the one the caller is collecting. The link
+// and directory checks come first either way, and the protocol is read once,
+// so the slot returned is the one that was checked.
+bool verifySlotForProtocol(const FilePath& slotDir,
+                           const std::string* pRequiredProtocol,
+                           SlotInfo* pInfo)
+{
+   if (!slotDir.isDirectory())
+      return false;
+
+   // A slot replaced by a link is not a slot: everything in it would be read
+   // from a tree the slot does not contain and cannot promise is immutable.
+   // Junctions count, being how Windows redirects a directory without
+   // is_symlink() reporting it.
+   if (slotDir.isSymlink() || slotDir.isJunction())
+   {
+      DLOG("Slot {} is a link, not a directory", slotDir.getAbsolutePath());
+      return false;
+   }
+
+   // The protocol comes first so that a slot for another protocol costs this
+   // one small read and nothing more.
+   std::string protocol = installation::declaredProtocol(slotDir);
+   if (protocol.empty())
+   {
+      DLOG("Slot {} declares no protocol version", slotDir.getAbsolutePath());
+      return false;
+   }
+
+   if (pRequiredProtocol != nullptr && protocol != *pRequiredProtocol)
+      return false;
+
+   if (!installation::verifyInstallDir(slotDir))
+   {
+      DLOG("Slot {} is missing required files", slotDir.getAbsolutePath());
+      return false;
+   }
+
+   std::string version = installation::declaredVersion(slotDir);
+   if (version.empty())
+   {
+      DLOG("Slot {} declares no package version", slotDir.getAbsolutePath());
+      return false;
+   }
+
+   if (pInfo != nullptr)
+   {
+      pInfo->path = slotDir;
+      pInfo->name = slotDir.getFilename();
+      pInfo->version = version;
+      pInfo->protocol = protocol;
+   }
+
+   return true;
+}
+
+} // anonymous namespace
+
+bool verifySlot(const FilePath& slotDir, SlotInfo* pInfo)
+{
+   return verifySlotForProtocol(slotDir, nullptr, pInfo);
+}
+
+std::vector<SlotInfo> verifiedSlots(const FilePath& slotsDir,
+                                    const std::string& protocol)
+{
+   std::vector<SlotInfo> found;
+   if (!slotsDir.isDirectory())
+      return found;
+
+   std::vector<FilePath> children;
+   Error error = slotsDir.getChildren(children);
+   if (error)
+   {
+      WLOG("Cannot list slots in {}: {}",
+           slotsDir.getAbsolutePath(), error.getMessage());
+      return found;
+   }
+
+   for (const FilePath& child : children)
+   {
+      // The same rule selectedSlot() applies to a selection: staging
+      // directories and other dot-prefixed bookkeeping, and any name that
+      // could not be recorded and read back as a selection. Without it a
+      // hand-made directory with a trailing space would be recorded as the
+      // fallback, rejected on the next read, and recorded again on every
+      // resolve.
+      if (!isUsableSlotName(child.getFilename()))
+         continue;
+
+      SlotInfo info;
+      if (verifySlotForProtocol(child, &protocol, &info))
+         found.push_back(info);
+   }
+
+   return found;
+}
+
+Error prepareStagingDir(const FilePath& slotsDir,
+                        const std::string& hostname,
+                        FilePath* pStagingDir)
+{
+   FilePath stagingDir = slotsDir.completeChildPath(stagingDirName(hostname));
+
+   Error error = stagingDir.ensureDirectory();
+   if (error)
+      return error;
+
+   *pStagingDir = stagingDir;
+   return Success();
+}
+
+Error allocateSlot(const FilePath& stagingDir,
+                   SlotPolicy policy,
+                   FilePath* pSlotDir)
+{
+   // Verify here rather than trusting the caller, so that "a slot only reaches
+   // a final name once it has been checked" is a property of the layout
+   // instead of a rule every install path has to remember.
+   SlotInfo staged;
+   if (!verifySlot(stagingDir, &staged))
+   {
+      return systemError(boost::system::errc::invalid_argument,
+                         "Staged install at " + stagingDir.getAbsolutePath() +
+                            " is not a complete Posit Assistant installation",
+                         ERROR_LOCATION);
+   }
+
+   if (!isUsableSlotName(staged.version))
+   {
+      return systemError(boost::system::errc::invalid_argument,
+                         "Cannot name an install slot for version '" +
+                            staged.version + "'",
+                         ERROR_LOCATION);
+   }
+
+   FilePath slotsDir = stagingDir.getParent();
+
+   int ordinal = 1;
+   for (int attempt = 0; attempt < kMaxAllocationAttempts; ++attempt)
+   {
+      FilePath candidate = slotsDir.completeChildPath(
+         slotNameForOrdinal(staged.version, ordinal));
+
+      if (candidate.exists())
+      {
+         // Adopt only what is genuinely interchangeable with what we staged.
+         // A slot's name is not evidence of its contents, so the decision has
+         // to rest on the package.json and protocol.json inside it.
+         SlotInfo existing;
+         if (policy == SlotPolicy::AdoptExisting &&
+             verifySlot(candidate, &existing) &&
+             existing.version == staged.version &&
+             existing.protocol == staged.protocol)
+         {
+            DLOG("Adopting existing slot {}", candidate.getAbsolutePath());
+            Error removeError = stagingDir.removeIfExists();
+            if (removeError)
+            {
+               WLOG("Could not remove staging directory {}: {}",
+                    stagingDir.getAbsolutePath(), removeError.getMessage());
+            }
+
+            *pSlotDir = candidate;
+            return Success();
+         }
+
+         ++ordinal;
+         continue;
+      }
+
+      Error moveError = publishStagingDir(stagingDir, candidate);
+      if (!moveError)
+      {
+         DLOG("Published slot {}", candidate.getAbsolutePath());
+         *pSlotDir = candidate;
+         return Success();
+      }
+
+      // Someone renamed their own staged install into this name between the
+      // check above and the rename. Re-examine that name under the same rules
+      // rather than reading errno, which varies by platform for this case.
+      if (candidate.exists())
+      {
+         DLOG("Lost the rename race for slot {}", candidate.getAbsolutePath());
+         continue;
+      }
+
+      return moveError;
+   }
+
+   return systemError(boost::system::errc::file_exists,
+                      "No install slot available for version " + staged.version +
+                         " in " + slotsDir.getAbsolutePath(),
+                      ERROR_LOCATION);
+}
+
+} // namespace slots
+} // namespace chat
+} // namespace modules
+} // namespace session
+} // namespace rstudio

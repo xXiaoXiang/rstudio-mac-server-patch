@@ -1,0 +1,78 @@
+/*
+ * SessionPanmirrorUtils.hpp
+ *
+ * Copyright (C) 2022 by RStudio, Inc.
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+#ifndef SESSION_MODULES_PANMIRROR_UTILS_HPP
+#define SESSION_MODULES_PANMIRROR_UTILS_HPP
+
+#include <string>
+#include <core/json/JsonRpc.hpp>
+
+namespace rstudio {
+namespace core {
+   class Error;
+}
+}
+
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace panmirror {
+
+extern const char * const kStatusOK;
+extern const char * const kStatusNotFound;
+extern const char * const kStatusNoHost;
+extern const char * const kStatusError;
+
+void resolveJsonRpcContinuation(const core::json::JsonRpcFunctionContinuation& cont,
+                       const std::string& status,
+                       const core::json::Value& messageJson = core::json::Value(),
+                       const std::string& error = "");
+
+core::Error handleJsonRpcProcessResult(const core::system::ProcessResult& result,
+                                core::json::Value* pValue,
+                                const core::ErrorLocation& location);
+
+
+typedef boost::function<void(const core::json::JsonRpcFunctionContinuation&, core::json::Value)> JsonHandler;
+
+inline void jsonPassthrough(const core::json::JsonRpcFunctionContinuation& cont,
+                            const core::json::Value& value) {
+   resolveJsonRpcContinuation(cont, kStatusOK, value);
+}
+
+void jsonRpcDownloadHandler(const core::json::JsonRpcFunctionContinuation& cont,
+                            const core::system::ProcessResult& result,
+                            const core::ErrorLocation& location,
+                            const JsonHandler& jsonHandler);
+
+// R options that override the citation services' base URLs (see
+// serviceBaseUrl()). Kept together so they can't drift from the e2e mock's
+// list in e2e/rstudio/utils/citation-services.ts.
+const char * const kDOIUrlOption = "rstudio.doi_url";
+const char * const kCrossrefUrlOption = "rstudio.crossref_url";
+const char * const kDataCiteUrlOption = "rstudio.datacite_url";
+const char * const kPubMedUrlOption = "rstudio.pubmed_url";
+
+// The base URL of an external citation service: the R option `option` when
+// set (less any trailing slash, since callers append "/<resource>"), else
+// `defaultUrl`. Lets the e2e tests answer lookups from a local mock rather
+// than the live service.
+std::string serviceBaseUrl(const std::string& option, const std::string& defaultUrl);
+
+} // namespace panmirror
+} // namespace modules
+} // namespace session
+} // namespace rstudio
+
+#endif /* SESSION_MODULES_PANMIRROR_UTILS_HPP */

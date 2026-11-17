@@ -1,0 +1,146 @@
+/*
+ * ChatConstants.cpp
+ *
+ * Copyright (C) 2025 by Posit Software, PBC
+ *
+ * Unless you have received this program directly from Posit Software pursuant
+ * to the terms of a commercial license agreement with Posit Software, then
+ * this program is licensed to you under the terms of version 3 of the
+ * GNU Affero General Public License. This program is distributed WITHOUT
+ * ANY EXPRESS OR IMPLIED WARRANTY, INCLUDING THOSE OF NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE. Please refer to the
+ * AGPL (http://www.gnu.org/licenses/agpl-3.0.txt) for more details.
+ *
+ */
+
+#include "ChatConstants.hpp"
+
+#include <boost/algorithm/string/predicate.hpp>
+
+namespace rstudio {
+namespace session {
+namespace modules {
+namespace chat {
+namespace constants {
+
+// Installation paths
+// The Posit Assistant storage root in the user data directory: it holds the
+// version slots, the selector and manifest-check.json. The assistant's own
+// storage is under ~/.posit/assistant, not here. The unversioned pai/bin an
+// older RStudio installed is left alone entirely -- not read, not written,
+// not deleted -- so that release keeps working while this one installs into
+// pai/versions.
+const char* const kPositAiStorageDirName = "pai";
+// The storage root RStudio provides for all users, installed beside the
+// session binary. It is itself the copy shipped with RStudio, absent from
+// open-source builds, and also holds the administrator's slots and selector
+// in the layout of pai.
+const char* const kSystemPositAiDirName = "posit-assistant";
+const char* const kClientDirPath = "dist/client";
+const char* const kServerScriptPath = "dist/server/main.js";
+const char* const kIndexFileName = "index.html";
+const char* const kCspConfigPath = "dist/csp.json";
+const char* const kProtocolVersionFileName = "protocol.json";
+const char* const kPackageJsonFileName = "package.json";
+
+// Versioned installation layout: the storage root (pai) holds one directory
+// per installed package version ("slot") plus the selector naming the active
+// slot for each protocol.
+const char* const kVersionsDirName = "versions";
+const char* const kSelectorFileName = "selected.json";
+// Extraction staging directories are siblings of the slots they become, so the
+// rename that publishes a slot is never a cross-device copy.
+const char* const kStagingDirPrefix = ".tmp-";
+
+// Protocol Version (SUPPORTED_PROTOCOL_VERSION in the assistant). Published
+// and matched as an exact string, and always of the form <major>.0; the
+// manifest lookup, the selector and the install identity check all rely on
+// that. ChatConstantsTests pins the form.
+const char* const kProtocolVersion = "11.0";
+
+// The one capability that varies by mode; see negotiatedCapabilities().
+const char* const kCheckForUpdatesMethod = "ui/checkForUpdates";
+
+// Capabilities: JSON-RPC methods that RStudio handles
+const std::vector<std::string>& rstudioCapabilities()
+{
+   static const std::vector<std::string> s_capabilities = {
+      "runtime/getActiveSession",
+      "runtime/getDetailedContext",
+      "runtime/executeCode",
+      "runtime/executeCode/interleavingPrimitives",
+      "runtime/getConsoleContent",
+      "workspace/readFileContent",
+      "workspace/writeFileContent",
+      "workspace/editFileContent",
+      "workspace/insertIntoNewFile",
+      "workspace/insertAtCursor",
+      "ui/openDocument",
+      "ui/openDocument/line",
+      "ui/revealInFilesPane",
+      "ui/previewUrl",
+      kCheckForUpdatesMethod,
+   };
+   return s_capabilities;
+}
+
+std::vector<std::string> negotiatedCapabilities(bool installationManaged)
+{
+   const std::vector<std::string>& all = rstudioCapabilities();
+   if (!installationManaged)
+      return all;
+
+   std::vector<std::string> negotiated;
+   negotiated.reserve(all.size());
+   for (const std::string& capability : all)
+   {
+      if (capability != kCheckForUpdatesMethod)
+         negotiated.push_back(capability);
+   }
+   return negotiated;
+}
+
+std::string assembleWebSocketPath(
+   const std::string& rootPath,
+   const std::string& sessionUrl,
+   const std::string& portmappedPath)
+{
+   // Normalize root path: "/" (default) becomes empty
+   std::string root = rootPath;
+   if (root == "/")
+      root.clear();
+   if (!root.empty() && root.back() == '/')
+      root.pop_back();
+
+   // Normalize session URL: strip trailing slash
+   std::string session = sessionUrl;
+   if (!session.empty() && session.back() == '/')
+      session.pop_back();
+
+   // Normalize portmapped path: ensure leading slash, strip trailing slash
+   std::string mapped = portmappedPath;
+   if (!mapped.empty() && mapped[0] != '/')
+      mapped = "/" + mapped;
+   if (!mapped.empty() && mapped.back() == '/')
+      mapped.pop_back();
+
+   return root + session + mapped + "/ai-chat";
+}
+
+bool isValidPreviewUrlScheme(const std::string& url)
+{
+   // Case-sensitive on purpose -- see header comment.
+   return boost::algorithm::starts_with(url, "http://") ||
+          boost::algorithm::starts_with(url, "https://");
+}
+
+bool isValidPreviewUrlHeight(int height)
+{
+   return height >= -1;
+}
+
+} // namespace constants
+} // namespace chat
+} // namespace modules
+} // namespace session
+} // namespace rstudio
