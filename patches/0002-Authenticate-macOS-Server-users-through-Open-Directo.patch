@@ -1,27 +1,31 @@
-From c2c29f90ce39f0c42e21d93c21c15c6fdb92e4d0 Mon Sep 17 00:00:00 2001
+From bc34481493c1fb937a86e73cb2bd6aa54a854694 Mon Sep 17 00:00:00 2001
 From: Xiao Xiang <baron@macos.shared>
-Date: Tue, 17 Nov 2026 12:34:15 +0800
-Subject: [PATCH 2/5] Authenticate macOS Server users through Open Directory
+Date: Tue, 17 Nov 2026 16:18:58 +0800
+Subject: [PATCH 2/3] Authenticate macOS Server users through Open Directory
  PAM
 
-Allow non-login shells while keeping account policy checks, use UID 501 as the automatic macOS user threshold, and document the dedicated PAM policy. Add a disposable-account probe covering PAM, encrypted HTTP login and real rsession UID isolation.
 ---
- dependencies/osx/probe-server-accounts.py     | 429 ++++++++++++++++++
+ dependencies/osx/probe-server-accounts.py     | 434 ++++++++++++++++++
  src/cpp/server/ServerMain.cpp                 |  19 +-
  src/cpp/server/ServerOptions.cpp              |   9 +-
  src/cpp/server/extras/pam/mac/rstudio         |   5 +-
  .../include/server_core/system/Pam.hpp        |  10 +-
- 5 files changed, 452 insertions(+), 20 deletions(-)
+ 5 files changed, 457 insertions(+), 20 deletions(-)
  create mode 100644 dependencies/osx/probe-server-accounts.py
 
 diff --git a/dependencies/osx/probe-server-accounts.py b/dependencies/osx/probe-server-accounts.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2a1caaf253ca5e47746f592cb5556d9d60961b0
+index 0000000000000000000000000000000000000000..10a61d2ead8913b0c0591f5892931680a70911ee
 --- /dev/null
 +++ b/dependencies/osx/probe-server-accounts.py
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,434 @@
 +#!/usr/bin/env python3
-+"""Test macOS PAM and UID separation with disposable local accounts."""
++"""Optional developer probe for macOS PAM and UID separation.
++
++Never run by dependency installation, CMake, packaging, or the application.
++Account modes require administrator privileges and create disposable accounts;
++run them only when deliberately checking live authentication and isolation.
++"""
 +import argparse
 +import base64
 +from http.cookiejar import CookieJar
@@ -450,7 +454,7 @@ index 0000000000000000000000000000000000000000..d2a1caaf253ca5e47746f592cb5556d9
 +if __name__ == "__main__":
 +    main()
 diff --git a/src/cpp/server/ServerMain.cpp b/src/cpp/server/ServerMain.cpp
-index c838d82f84c47046256c9270f3a80ba6dda279ea..0c5bff909c475595e1b6f2f598ba968b5385a62c 100644
+index 358e99fd0c6b9d4f9f9dd9796129499b0d9dbe58..985c1a23b61e5549ffc3424a49c4250fad33c2dc 100644
 --- a/src/cpp/server/ServerMain.cpp
 +++ b/src/cpp/server/ServerMain.cpp
 @@ -733,17 +733,6 @@ int main(int argc, char * const argv[])

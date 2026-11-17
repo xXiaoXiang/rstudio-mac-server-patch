@@ -1,33 +1,31 @@
-From e07e3f4df06bd0c3865c92ad192d028b4d12d788 Mon Sep 17 00:00:00 2001
+From 22fae323a7f63a6378b0cfaccbdddfc2c2e046bf Mon Sep 17 00:00:00 2001
 From: Xiao Xiang <baron@macos.shared>
-Date: Tue, 17 Nov 2026 12:34:44 +0800
-Subject: [PATCH 3/5] Add a native macOS Server app and package lifecycle
+Date: Tue, 17 Nov 2026 16:18:59 +0800
+Subject: [PATCH 3/3] Add native macOS Server app with service and account
+ controls
 
-Install RStudioServer.app separately from Electron Desktop, manage its LaunchDaemon with ServiceManagement, and add persistent network controls plus account-management help. Package system preparation and an explicit uninstaller that preserve user data and pre-existing configuration. Include dependency-light administration and installation checks.
 ---
  cmake/globals.cmake                           |  19 +-
- dependencies/osx/SERVER.md                    | 349 ++++++++++++++++++
- .../osx/test-server-administration.py         | 199 ++++++++++
- dependencies/osx/test-server-integration.py   | 116 ++++++
+ .../osx/test-server-administration.py         | 203 ++++++++++++
+ dependencies/osx/test-server-integration.py   | 129 ++++++++
  package/CMakeLists.txt                        |   6 +-
  package/osx-server/build-pkg.sh               |  48 +++
  package/osx-server/scripts/postinstall        |  15 +
- package/osx-server/scripts/preinstall         |  38 ++
- src/cpp/server/CMakeLists.txt                 |  28 +-
- .../extras/admin/rstudio-server-install.mac   | 204 ++++++++++
- .../extras/admin/rstudio-server-users.mac     | 279 ++++++++++++++
- .../server/extras/admin/rstudio-server.mac.in | 162 ++++++--
+ package/osx-server/scripts/preinstall         |  45 +++
+ src/cpp/server/CMakeLists.txt                 |  26 +-
+ .../extras/admin/rstudio-server-install.mac   | 208 +++++++++++++
+ .../extras/admin/rstudio-server-users.mac     | 279 +++++++++++++++++
+ .../server/extras/admin/rstudio-server.mac.in | 181 +++++++++--
  .../extras/admin/uninstall-rstudio-server.mac |   4 +
  src/cpp/server/extras/conf/rserver-mac.conf   |   5 +
  .../com.rstudio.launchd.rserver.plist.in      |  19 +-
- src/cpp/server/extras/macos/CMakeLists.txt    |  19 +
+ src/cpp/server/extras/macos/CMakeLists.txt    |  19 ++
  src/cpp/server/extras/macos/Info.plist.in     |  24 ++
- src/cpp/server/extras/macos/ServerAdmin.h     |  11 +
- src/cpp/server/extras/macos/ServerAdmin.m     | 287 ++++++++++++++
- src/cpp/server/extras/macos/ServerApp.m       | 282 ++++++++++++++
+ src/cpp/server/extras/macos/ServerAdmin.h     |   8 +
+ src/cpp/server/extras/macos/ServerAdmin.m     | 184 +++++++++++
+ src/cpp/server/extras/macos/ServerApp.m       | 290 ++++++++++++++++++
  src/cpp/session/CMakeLists.txt                |   4 +-
- 21 files changed, 2075 insertions(+), 43 deletions(-)
- create mode 100644 dependencies/osx/SERVER.md
+ 20 files changed, 1673 insertions(+), 43 deletions(-)
  create mode 100644 dependencies/osx/test-server-administration.py
  create mode 100644 dependencies/osx/test-server-integration.py
  create mode 100755 package/osx-server/build-pkg.sh
@@ -44,10 +42,10 @@ Install RStudioServer.app separately from Electron Desktop, manage its LaunchDae
  create mode 100644 src/cpp/server/extras/macos/ServerApp.m
 
 diff --git a/cmake/globals.cmake b/cmake/globals.cmake
-index b01876e1599d12d9b2ed53f080673cbe975fb2df..35a126e8625c8ff11fa5696c0a0dc28dc283a9da 100644
+index 8cf634f01ad867489d8481dae4cf2a441b7e3699..986f645904cc005c4e0103fec357bd7b83fc6d55 100644
 --- a/cmake/globals.cmake
 +++ b/cmake/globals.cmake
-@@ -524,17 +524,17 @@ endif()
+@@ -497,17 +497,17 @@ endif()
  
  set(RSTUDIO_NODE_PATH "${RSTUDIO_NODE_PATH}" CACHE INTERNAL "Path to bundled node binary")
  
@@ -73,7 +71,7 @@ index b01876e1599d12d9b2ed53f080673cbe975fb2df..35a126e8625c8ff11fa5696c0a0dc28d
  else()
     if (RSTUDIO_ELECTRON)
        if (RSTUDIO_SESSION_WIN32)
-@@ -555,6 +555,9 @@ else()
+@@ -528,6 +528,9 @@ else()
  endif()
  
  # if the install prefix is /usr/local then tweak as appropriate
@@ -83,369 +81,18 @@ index b01876e1599d12d9b2ed53f080673cbe975fb2df..35a126e8625c8ff11fa5696c0a0dc28d
  if(NOT DEFINED CMAKE_INSTALL_PREFIX)
     if(APPLE)
        set(CMAKE_INSTALL_PREFIX "/Applications")
-diff --git a/dependencies/osx/SERVER.md b/dependencies/osx/SERVER.md
-new file mode 100644
-index 0000000000000000000000000000000000000000..163deaec165da155b61ef0a262b7cdb297acda63
---- /dev/null
-+++ b/dependencies/osx/SERVER.md
-@@ -0,0 +1,349 @@
-+# Native RStudio Server on macOS
-+
-+This branch adds a native Server installation for macOS 13 or newer. It installs
-+as **RStudioServer.app**. Electron Desktop continues to install as **RStudio.app**;
-+the two applications can coexist. Server's browser IDE uses the matching
-+bundled rserver and rsession binaries.
-+
-+The installable output is a **PKG containing RStudioServer.app**. The app includes
-+startup controls, Server Settings, User Accounts help, and a system uninstaller.
-+For release branches, version metadata and future rebases, see
-+[Maintaining the macOS Server patches](MAINTAINING-SERVER.md).
-+
-+## Build on Apple Silicon
-+
-+Install the Xcode Command Line Tools and native arm64 Homebrew, then run these
-+commands from the repository root. All dependency commands run as your normal
-+Mac account and request sudo only when necessary.
-+
-+    cd dependencies/osx
-+    ./install-dependencies-osx --arch=arm64
-+    cd ../..
-+    export JAVA_HOME=/opt/homebrew/opt/openjdk@17
-+    cmake -S . -B build-macos-server -G Ninja \
-+      -DRSTUDIO_TARGET=Server \
-+      -DCMAKE_BUILD_TYPE=Release \
-+      -DCMAKE_OSX_ARCHITECTURES=arm64 \
-+      -DCMAKE_INSTALL_PREFIX=/Applications \
-+      -DGWT_BUILD=ON
-+    cmake --build build-macos-server
-+    sudo cmake --install build-macos-server
-+
-+The dependency installer defaults to the host architecture, including on CI.
-+Intel Homebrew, osx-64 dependencies and Rosetta are not required. Universal
-+Desktop dependencies remain an explicit opt-in. The normal macOS Desktop
-+packaging scripts still build Electron; they do not package Server.
-+
-+The optional sccache installer falls back to ~/opt/bin if /usr/local/bin is
-+not writable. This is intentional; the binary does not need moving to /opt/bin.
-+To use it, add the following to ~/.zprofile and open a new terminal:
-+
-+    export PATH="$HOME/opt/bin:$PATH"
-+
-+The Server can be built without sccache. To enable it explicitly, configure
-+with -DSCCACHE_ENABLED=ON after adding its directory to PATH.
-+
-+The complete Server build includes the compiled GWT browser UI. Using
-+GWT_BUILD=OFF is useful for configure diagnostics but does not produce a complete
-+browser IDE on a clean checkout. The development rserver-dev launcher explicitly
-+passes auth-none=1 and is unsuitable for testing authenticated multi-user access.
-+
-+## Build the installer
-+
-+After the complete Server build, run:
-+
-+    bash package/osx-server/build-pkg.sh build-macos-server
-+
-+This produces build-macos-server/RStudioServer-arm64.pkg. It stages the complete
-+app, checks its arm64 executables, signs the app, and packages the installation
-+scripts. The default is an ad hoc signed development app in an unsigned PKG for
-+local testing. Distribution requires Developer ID signing and notarization.
-+RSTUDIO_MACOS_SIGN_IDENTITY and RSTUDIO_MACOS_INSTALLER_IDENTITY select signing
-+identities; notarization is a separate release step.
-+
-+R is installed separately; the PKG does not install R or Homebrew.
-+Quit active Server R sessions and the RStudioServer control app before
-+installing/upgrading. Closing a browser tab alone does not quit an R session.
-+Install the PKG using macOS Installer or:
-+
-+    sudo /usr/sbin/installer -pkg build-macos-server/RStudioServer-arm64.pkg -target /
-+
-+The package installs only on the running macOS startup volume. Upgrades preserve
-+existing configuration and restore an enabled startup registration; macOS may
-+request approval again when a development signature changes.
-+
-+## Install and approve startup
-+
-+The Server application contains a native control window and a bundled system
-+LaunchDaemon. It uses Apple's SMAppService API, available since macOS 13.
-+The daemon runs before graphical login and rserver can launch sessions under
-+the authenticated accounts' UIDs. Quitting the control window does not stop it.
-+
-+1. The PKG prepares the system automatically. For a manual cmake --install,
-+   install the complete app in /Applications, then run:
-+
-+       sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server install-service
-+
-+   When /etc/rstudio/rserver.conf is absent, install-service creates it with:
-+
-+       www-address=127.0.0.1
-+       auth-none=0
-+       auth-validate-users=1
-+
-+   Existing configuration is preserved. Set rsession-which-r there to choose a
-+   particular Conda or other R installation.
-+
-+   Installation creates a dedicated rstudio-server user and group with an unused
-+   system UID/GID below 500, a disabled password, /usr/bin/false shell, /var/empty
-+   home, and IsHidden=1. This is the daemon's service identity, separate from the
-+   accounts that sign in to RStudio. launchd starts rserver with root authority;
-+   rserver uses its service identity and restores privileges when launching
-+   sessions as authenticated users. Existing valid service accounts are preserved.
-+   The earlier development installation omitted this account and used upstream's
-+   root fallback; running install-service now provisions it for the next restart.
-+
-+2. Sign the completed app bundle before registration. SMAppService requires a
-+   valid code signature. A distributed build needs signing with the appropriate
-+   Developer ID identity and notarization. For development in the VM, an ad hoc
-+   signature can be tried on the completed bundle:
-+
-+       sudo codesign --force --deep --sign - /Applications/RStudioServer.app
-+
-+   Ad hoc signing and registration were validated in the development VM.
-+   Distributed Developer ID signing and notarization remain separate release
-+   steps; compiling the control window alone does not validate registration.
-+
-+3. Open /Applications/RStudioServer.app. The first launch asks whether to enable
-+   startup. After registration, if macOS reports approval is required, the app
-+   prompts to open **System Settings > Login Items**. Approve RStudio Server
-+   under background items; the precise pane name varies by macOS release.
-+   Approval is controlled by macOS and the administrator.
-+
-+   A system LaunchDaemon appears under background items, not **Open at Login**
-+   (登录时打开). Open at Login is for apps opened after a graphical login;
-+   Server's background service is configured to start before graphical login.
-+
-+4. Return to the app to refresh its registration status. The status describes
-+   startup registration, not the health of the HTTP service. Open
-+   http://127.0.0.1:8787 and sign in using an eligible Mac account.
-+
-+The LaunchDaemon stays in the app's Contents/Library/LaunchDaemons directory.
-+It is registered through SMAppService rather than copied into
-+/Library/LaunchDaemons. The daemon runs in the foreground under launchd,
-+requires authentication and system-user validation, and restarts after failure.
-+Its PATH includes the standard native Homebrew locations because launchd does
-+not read your shell profile. Set rsession-which-r explicitly to select a
-+particular Conda or other R installation.
-+The administrator can disable it in the app or in System Settings.
-+
-+The installed admin script supports status, start, stop, restart, check-config,
-+and the existing session commands. start and stop use the app's ServiceManagement
-+control executable. start returns status 3 when administrator approval is pending.
-+restart of an already loaded daemon requires sudo. install-service does not
-+register or start the daemon and preserves an existing /etc/pam.d/rstudio policy.
-+uninstall-service also reverses installer-owned system setup, while retaining the
-+app. See the removal policy below.
-+
-+## Network settings and service controls
-+
-+Open **Server Settings** in RStudioServer.app to edit the numeric IPv4/IPv6 listen
-+address and port. Save and Apply asks for administrator authorization, validates
-+the candidate configuration, preserves other settings/comments, saves the previous
-+file as /etc/rstudio/rserver.conf.previous, and atomically replaces rserver.conf.
-+It restarts a registered service; when stopped, the saved settings take effect
-+on the next start. Opening the settings window reloads the saved file. Settings
-+are not stored in a separate per-user preference that could disagree with the
-+daemon's configuration.
-+
-+Start / Enable Startup, Stop and Disable Startup, and Restart are also available
-+in this window. Stop unregisters the background service, so it remains stopped
-+after reboot until enabled again. Restart keeps startup enabled. The equivalent
-+network command is:
-+
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server configure-network 127.0.0.1 8787
-+
-+## Authentication and account preferences
-+
-+The shipped /etc/pam.d/rstudio profile uses macOS pam_opendirectory.so for both
-+password authentication and account-policy validation. no_check_shell allows
-+RStudio-only accounts with /usr/bin/false as their login shell; home-directory
-+and enabled-account checks remain in effect. Disabling an account or removing
-+its usable password also prevents this password-based web authentication.
-+
-+Normal local accounts begin at UID 501. The automatic minimum UID is therefore
-+501 on macOS, while Linux keeps its existing detection and fallback. An
-+administrator can override auth-minimum-user-id and restrict access using
-+auth-required-user-group.
-+
-+Account visibility is independent of Server support. Administrators may choose
-+visible users, hidden users, or dedicated RStudio-only users. IsHidden affects
-+login-window presentation; it is not an authentication or isolation boundary.
-+A non-login shell alone should not be treated as a complete policy forbidding
-+all graphical or remote access.
-+
-+### Create a hidden RStudio user with an explicit home
-+
-+Open **User Accounts** in the app, enter the account name and home directory,
-+choose whether it is hidden, then copy the **Create User** command into Terminal.
-+The helper uses macOS utilities and does not require Python or Homebrew. Example:
-+
-+    sudo /bin/mkdir -m 755 /Users/RStudioHomes
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server create-user rstudio_alice --home /Users/RStudioHomes/rstudio_alice --hidden
-+
-+The storage parent must already exist; mkdir is needed only once. Account
-+creation securely prompts for a password in Terminal. Sign in to the Server with
-+rstudio_alice and that password. The account has its own UID, staff primary group,
-+/usr/bin/false login shell, and a private 0700 home. Use --visible instead of
-+--hidden, or omit both, for a visible account. No existing account or home is
-+adopted, overwritten or recursively chowned.
-+
-+Storage paths must be root-owned and must not be group/world-writable, including
-+their resolved ancestors. For an external volume, mount it first and enable file
-+ownership. An administrator can prepare a dedicated APFS volume, for example:
-+
-+    sudo /usr/sbin/diskutil enableOwnership /Volumes/RStudioData
-+    sudo /usr/sbin/chown root:wheel /Volumes/RStudioData
-+    sudo /bin/chmod 755 /Volumes/RStudioData
-+    sudo /bin/mkdir -m 755 /Volumes/RStudioData/RStudioHomes
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server create-user rstudio_alice --home /Volumes/RStudioData/RStudioHomes/rstudio_alice --hidden
-+
-+Use the actual mounted volume name. The volume must be mounted and unlocked
-+before the user starts an R session; a login-screen hidden account does not
-+automatically unlock external storage.
-+
-+Choose **Change Visibility** or **Delete User** in the help window for their
-+individual commands. Only accounts created by this helper can be modified by it:
-+
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server set-user-visibility rstudio_alice visible
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server set-user-visibility rstudio_alice hidden
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server delete-user rstudio_alice
-+
-+Quit all of that user's sessions before deletion. Deletion refuses active
-+processes and changed account identities. It preserves the home and changes its
-+top directory to root:wheel, mode 0700, so another account cannot inherit access
-+through UID reuse. The helper retains its UID allocation history under the
-+root-only /var/db/rstudio-server/accounts directory. Passwords are never supplied
-+in command arguments. Server group restrictions, if configured, still apply.
-+
-+Each session uses its authenticated system account. Private home directories
-+must have restrictive ownership and permissions. Directory Service's
-+NFSHomeDirectory may point to an administrator-selected directory on another
-+volume, provided the volume enforces ownership, is mounted when needed, and is
-+accessible to the account. A shared HOME value without distinct UIDs would not
-+provide this separation.
-+
-+The old Flask portal and its Conda management routes have not been migrated by
-+these source changes. Building the Server does not itself add a portal database
-+or a per-user Conda selection interface.
-+
-+## Uninstall and retained data
-+
-+Choose **Uninstall Server** in User Accounts help for the removal command, or run:
-+
-+    sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/uninstall-rstudio-server
-+
-+First quit all Server sessions. The uninstaller unregisters/stops the LaunchDaemon,
-+removes only the service user/group created by this installer (checking their
-+identities), removes unchanged installer-created PAM/default configuration,
-+removes empty installer-created directories, forgets the package receipt and
-+removes /Applications/RStudioServer.app. It preserves pre-existing or modified
-+configuration, end-user accounts and homes, logs, database, backups and account
-+management records. Retained standard Server data/log directories become
-+root-owned/private before the installer-owned service identity is removed.
-+On reinstall rserver assigns its database/runtime ownership to its service user.
-+
-+Removing an end-user account is a separate explicit delete-user command. Use it
-+before uninstalling the app if desired. User data is never recursively deleted.
-+Dragging the app into Trash cannot execute uninstall scripts on macOS; use the
-+uninstaller first. Uninstalling does not require changing RStudio Desktop.
-+
-+## Validation
-+
-+Dependency-light checks:
-+
-+    python3 dependencies/osx/test-server-integration.py
-+    python3 dependencies/osx/test-server-administration.py
-+
-+The native control app can be compiled independently of the RStudio dependencies:
-+
-+    cmake -S src/cpp/server/extras/macos -B build-server-control -G Ninja \
-+      -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
-+    cmake --build build-server-control
-+
-+This standalone app lacks the Server binaries and service plist. It is a compile
-+check, not an installable service.
-+
-+The account probe requires sudo and creates two disposable local accounts with
-+private homes and non-login shells. It checks real Open Directory PAM acceptance
-+and rejection, UID and HOME switching without a GUI session, private-file access
-+in both directions, and cross-user process signalling. It removes its accounts,
-+private PAM profile, and temporary files afterward.
-+
-+    sudo /usr/bin/python3 dependencies/osx/probe-server-accounts.py
-+
-+After compiling the Server, also check its actual authentication helper with:
-+
-+    sudo /usr/bin/python3 dependencies/osx/probe-server-accounts.py \
-+      --pam-helper build-macos-server/src/cpp/server/pam/rserver-pam
-+
-+After installing and enabling startup, test the complete HTTP authentication
-+and R session path with:
-+
-+    sudo /usr/bin/python3 dependencies/osx/probe-server-accounts.py \
-+      --pam-helper /Applications/RStudioServer.app/Contents/Resources/app/bin/rserver-pam \
-+      --server-url http://127.0.0.1:8787
-+
-+This signs in with generated credentials using the browser's encrypted login
-+protocol, verifies rejection of an incorrect password, and starts two real R
-+sessions. It checks the authenticated UID and HOME, native arm64 R execution,
-+and cross-user private-file access from R. It stops only the disposable accounts'
-+sessions before removing those accounts and homes. The running Server may retain
-+its normal database and authentication records for the disposable usernames.
-+The test does not change the installed configuration or existing accounts.
-+
-+The anonymous sign-in check alone does not require administrator privileges:
-+
-+    /usr/bin/python3 dependencies/osx/probe-server-accounts.py --check-http
-+
-+Add --hidden to set the temporary accounts' IsHidden attribute as well. The probe
-+does not use or log an existing account's password. It prints the paths and
-+account names so any interrupted run can be inspected.
-+
-+On 2026-11-17 the account probe passed in the arm64 macOS VM, including valid
-+and invalid password tests through the newly built rserver-pam executable.
-+Account isolation and cleanup passed. The five dependency-light regression
-+tests passed.
-+
-+The full Server build succeeded, including the GWT browser UI, rserver,
-+rsession, rserver-pam and the control application. The native C++ unit suite
-+was disabled for this build. Installation into a workspace staging directory
-+succeeded; the complete staged RStudioServer.app passed ad hoc codesign
-+verification. The staged server's --check-config accepted the bundled
-+configuration and detected Homebrew R 4.6.2.
-+
-+System installation and SMAppService registration succeeded. The control app
-+reports startup enabled, and launchctl confirms a running system LaunchDaemon
-+managed by ServiceManagement. Anonymous HTTP requests redirect to the sign-in
-+page, the sign-in form includes a CSRF cookie, and an encrypted login for a
-+nonexistent account is rejected.
-+
-+The full HTTP/session probe also passed for two disposable non-login accounts:
-+valid passwords were accepted and incorrect passwords rejected through both
-+the installed rserver-pam and the encrypted HTTP sign-in endpoint. Real
-+rsession processes initialized as the authenticated accounts. R console code
-+ran natively on arm64, with the correct UID and HOME, and could neither read
-+nor write the other account's private file. Both sessions coexisted without
-+graphical login. Account, session, PAM-profile and temporary-file cleanup
-+completed successfully.
-+
-+The administrator also confirmed successful manual browser sign-in at
-+127.0.0.1:8787. The updated native settings/account-help controller compiles, and
-+14 administration safeguards plus the five integration checks pass. The tests
-+do not provision real persistent accounts or change /etc.
-+
-+The administrator confirmed successful installation of the development PKG and
-+that the updated settings/account-help buttons appear and work. The uninstaller,
-+interactive account helper, reboot behavior and release signing/notarization
-+still require explicit runtime validation. The earlier successful HTTP/session
-+probe used the development installation's root fallback; repeating it with the
-+new dedicated service identity remains a separate check.
 diff --git a/dependencies/osx/test-server-administration.py b/dependencies/osx/test-server-administration.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a0d1196d3011be15175cb9ed3e75a8183a28865d
+index 0000000000000000000000000000000000000000..55b31514a5f2751ba5149420a0af265ddd740725
 --- /dev/null
 +++ b/dependencies/osx/test-server-administration.py
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,203 @@
 +#!/usr/bin/env python3
-+"""Exercise administration safeguards without changing macOS accounts or /etc."""
++"""Optional developer checks for macOS Server administration safeguards.
++
++These checks do not change macOS accounts or /etc. Run explicitly when changing
++administration behavior; they are not a build, packaging, or installation step.
++"""
 +import hashlib
 +import os
 +from pathlib import Path
@@ -645,12 +292,16 @@ index 0000000000000000000000000000000000000000..a0d1196d3011be15175cb9ed3e75a818
 +    unittest.main(verbosity=2)
 diff --git a/dependencies/osx/test-server-integration.py b/dependencies/osx/test-server-integration.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..27e33a8dd316a4f2e1ed12f1bf110eaa7cf983f3
+index 0000000000000000000000000000000000000000..90b4ca163523d40615a4d211160bdca015eeb78a
 --- /dev/null
 +++ b/dependencies/osx/test-server-integration.py
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,129 @@
 +#!/usr/bin/env python3
-+"""Dependency-light macOS Server integration checks; no system mutations."""
++"""Optional developer integration checks; no system mutations.
++
++Run explicitly when investigating macOS Server integration changes. These checks
++are not part of dependency installation, the build, packaging, or the application.
++"""
 +import os
 +from pathlib import Path
 +import plistlib
@@ -714,10 +365,14 @@ index 0000000000000000000000000000000000000000..27e33a8dd316a4f2e1ed12f1bf110eaa
 +        with tempfile.TemporaryDirectory(prefix="rstudio service ") as tmp:
 +            prefix = Path(tmp)
 +            (prefix / "bin").mkdir()
++            plist = prefix / "service.plist"
++            plist.write_bytes(plistlib.dumps({"Label": "com.rstudio.launchd.rserver",
++                "BundleProgram": "Contents/Resources/app/bin/rserver"}))
 +            executable = prefix / "bin/rserver"
 +            executable.write_text("#!/bin/bash\n" + config_extra + "\nexit " + str(config_status) + "\n")
 +            executable.chmod(0o755)
 +            functions = functions.replace("${CMAKE_INSTALL_PREFIX}/${RSTUDIO_INSTALL_SUPPORTING}", tmp)
++            functions = functions.replace("$SERVER_PREFIX/../../Library/LaunchDaemons/com.rstudio.launchd.rserver.plist", str(plist))
 +            harness = functions + '''
 +requireRoot() { return 0; }
 +SERVER_CONTROL="$SERVER_PREFIX/control"
@@ -737,18 +392,23 @@ index 0000000000000000000000000000000000000000..27e33a8dd316a4f2e1ed12f1bf110eaa
 +
 +    def test_service_lifecycle(self):
 +        target = "system/com.rstudio.launchd.rserver"
++        result, calls = self.run_admin("startServer")
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(calls, ["print " + target, "kickstart " + target])
 +        result, calls = self.run_admin("startServer", loaded=False)
 +        self.assertEqual(result.returncode, 0, result.stderr)
-+        self.assertEqual(calls, ["control --enable-service"])
++        self.assertEqual(calls[0], "print " + target)
++        self.assertTrue(calls[1].startswith("bootstrap system /private/tmp/rstudio-server-launch."))
++        self.assertFalse(Path(calls[1].split(" ", 2)[2]).exists())
 +        result, calls = self.run_admin("stopServer")
 +        self.assertEqual(result.returncode, 0, result.stderr)
-+        self.assertEqual(calls, ["control --disable-service"])
++        self.assertEqual(calls, ["print " + target, "bootout " + target])
++        result, calls = self.run_admin("stopServer", loaded=False)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(calls, ["print " + target])
 +        result, calls = self.run_admin("restartServer")
 +        self.assertEqual(result.returncode, 0, result.stderr)
 +        self.assertEqual(calls, ["print " + target, "kickstart -k " + target])
-+        result, calls = self.run_admin("restartServer", loaded=False)
-+        self.assertEqual(result.returncode, 0, result.stderr)
-+        self.assertEqual(calls, ["print " + target, "control --enable-service"])
 +
 +    def test_config_failure_prevents_start(self):
 +        result, calls = self.run_admin("startServer", loaded=False, config_status=42)
@@ -838,7 +498,7 @@ index 0000000000000000000000000000000000000000..cd4734337be9e7dca5c6f1c61725cffb
 +fi
 diff --git a/package/osx-server/scripts/postinstall b/package/osx-server/scripts/postinstall
 new file mode 100755
-index 0000000000000000000000000000000000000000..f6d4a0ec9b5a1d1c8ccea152ba4d54a60eb09f76
+index 0000000000000000000000000000000000000000..1e707d54f0d5eaa089753e76499f9b8cd8ba98a9
 --- /dev/null
 +++ b/package/osx-server/scripts/postinstall
 @@ -0,0 +1,15 @@
@@ -856,13 +516,13 @@ index 0000000000000000000000000000000000000000..f6d4a0ec9b5a1d1c8ccea152ba4d54a6
 + if [ "$result" -ne 0 ] && [ "$result" -ne 3 ]; then exit "$result"; fi
 + /bin/rm "$STATE/upgrade-startup"
 +fi
-+echo 'Open /Applications/RStudioServer.app to manage startup, network settings and user accounts.'
++echo 'Open /Applications/RStudioServer.app to manage the service, automatic startup and Admin Info.'
 diff --git a/package/osx-server/scripts/preinstall b/package/osx-server/scripts/preinstall
 new file mode 100755
-index 0000000000000000000000000000000000000000..63787f01056c742c1a142302216ef294f2b74ac3
+index 0000000000000000000000000000000000000000..b0773c652f1528846419977453f6b3dc9cfd8b50
 --- /dev/null
 +++ b/package/osx-server/scripts/preinstall
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,45 @@
 +#!/bin/bash
 +set -e
 +PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -884,14 +544,21 @@ index 0000000000000000000000000000000000000000..63787f01056c742c1a142302216ef294
 + if /usr/bin/pgrep -f "$APP/Contents/Resources/app/bin/rsession" >/dev/null; then
 +    echo 'Quit all RStudio Server sessions before upgrading. User homes will be preserved.' >&2; exit 1
 + fi
-+ if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
++ startupStatus=$("$APP/Contents/MacOS/RStudioServer" --service-status)
++ if [ "$startupStatus" = enabled ] || [ "$startupStatus" = approval-required ] ||
++    /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
 +    [ ! -L "$STATE" ] || exit 1
 +    if [ ! -d "$STATE" ]; then /bin/mkdir -m 700 "$STATE"; fi
 +    [ "$(/usr/bin/stat -f '%u' "$STATE")" = 0 ] || exit 1
 +    mode=$(/usr/bin/stat -f '%Lp' "$STATE")
 +    (( (8#$mode & 0022) == 0 )) || exit 1
-+    /usr/bin/touch "$STATE/upgrade-startup"
++    if [ "$startupStatus" = enabled ] || [ "$startupStatus" = approval-required ]; then
++       /usr/bin/touch "$STATE/upgrade-startup"
++    fi
 +    "$APP/Contents/MacOS/RStudioServer" --disable-service
++    if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
++       /bin/launchctl bootout system/com.rstudio.launchd.rserver
++    fi
 +    for ((attempt=0; attempt<30; attempt++)); do
 +       /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1 || break
 +       /bin/sleep 0.2
@@ -902,7 +569,7 @@ index 0000000000000000000000000000000000000000..63787f01056c742c1a142302216ef294
 + fi
 +fi
 diff --git a/src/cpp/server/CMakeLists.txt b/src/cpp/server/CMakeLists.txt
-index dc1b41ff7f4e91a02acbf80dfc91e2d2b53d57f3..cfbf0b831cf91e224fd3d0cd065d62572abbfbcc 100644
+index 3f6ac2f96f7ff9cfa2a690904298f1bd8151d498..40100dc5d69fb539471f64d247eea42093646084 100644
 --- a/src/cpp/server/CMakeLists.txt
 +++ b/src/cpp/server/CMakeLists.txt
 @@ -164,27 +164,27 @@ set (RSERVER_THEME_README "themes/README.md")
@@ -937,15 +604,13 @@ index dc1b41ff7f4e91a02acbf80dfc91e2d2b53d57f3..cfbf0b831cf91e224fd3d0cd065d6257
  
  if (UNIX AND NOT APPLE)
     # install configured admin script
-@@ -252,26 +252,40 @@ if (UNIX AND NOT APPLE)
+@@ -252,26 +252,38 @@ if (UNIX AND NOT APPLE)
  
  elseif(APPLE)
  
 +  # A separate application controls a bundled system LaunchDaemon through
 +  # ServiceManagement, including the administrator's Login Items approval.
 +  add_subdirectory(extras/macos)
-+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../../dependencies/osx/SERVER.md"
-+          DESTINATION "${RSTUDIO_INSTALL_SUPPORTING}")
 +  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/extras/conf/rserver-mac.conf"
 +          DESTINATION "${RSTUDIO_INSTALL_SUPPORTING}/extras/conf"
 +          RENAME rserver.conf)
@@ -983,10 +648,10 @@ index dc1b41ff7f4e91a02acbf80dfc91e2d2b53d57f3..cfbf0b831cf91e224fd3d0cd065d6257
  
 diff --git a/src/cpp/server/extras/admin/rstudio-server-install.mac b/src/cpp/server/extras/admin/rstudio-server-install.mac
 new file mode 100755
-index 0000000000000000000000000000000000000000..0c11480b7942a85ba3075fd5bcdb8f50d563c024
+index 0000000000000000000000000000000000000000..25b701c6a8db2719f0d13cc7e63a81482fc74d3f
 --- /dev/null
 +++ b/src/cpp/server/extras/admin/rstudio-server-install.mac
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,208 @@
 +#!/bin/bash
 +# Copyright (C) 2026 by Posit Software, PBC
 +# Licensed under the GNU Affero General Public License, version 3.
@@ -1147,6 +812,10 @@ index 0000000000000000000000000000000000000000..0c11480b7942a85ba3075fd5bcdb8f50
 +    fail 'Quit all RStudio Server sessions before uninstalling; their homes will be preserved.'; return 1
 + fi
 + "$CONTROL" --disable-service
++ # A manually started job can run with automatic startup disabled.
++ if /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1; then
++    /bin/launchctl bootout system/com.rstudio.launchd.rserver
++ fi
 + # unregister is asynchronous; wait briefly for the system job to disappear.
 + for ((attempt=0; attempt<30; attempt++)); do
 +    /bin/launchctl print system/com.rstudio.launchd.rserver >/dev/null 2>&1 || break
@@ -1477,10 +1146,10 @@ index 0000000000000000000000000000000000000000..16782037f910a3dea5c4a7a6d76910e5
 + main "$@"
 +fi
 diff --git a/src/cpp/server/extras/admin/rstudio-server.mac.in b/src/cpp/server/extras/admin/rstudio-server.mac.in
-index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea70d287ddc 100644
+index 6438d255dedf590d15b1551d4ca8adb2d083bab1..854533c3a33d475ee2c600ce65a470e346a3591d 100644
 --- a/src/cpp/server/extras/admin/rstudio-server.mac.in
 +++ b/src/cpp/server/extras/admin/rstudio-server.mac.in
-@@ -1,19 +1,116 @@
+@@ -1,19 +1,135 @@
  #!/bin/bash
  
 +SERVICE_LABEL=com.rstudio.launchd.rserver
@@ -1498,13 +1167,32 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea7
 +}
 +
 +startServer() {
++ requireRoot || return $?
 + testConfig || return $?
-+ # ServiceManagement preserves the macOS administrator's startup approval.
-+ "$SERVER_CONTROL" --enable-service
++ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
++    launchctl kickstart "$SERVICE_TARGET"
++    return $?
++ fi
++ # BundleProgram is resolved only by SMAppService. For a manual start, load
++ # an equivalent job with an absolute Program; it is not installed in an
++ # auto-loaded LaunchDaemons directory and does not change startup approval.
++ local servicePlist="$SERVER_PREFIX/../../Library/LaunchDaemons/com.rstudio.launchd.rserver.plist"
++ local manualPlist result
++ manualPlist=$(/usr/bin/mktemp /private/tmp/rstudio-server-launch.XXXXXX) || return $?
++ /bin/cp "$servicePlist" "$manualPlist" &&
++ /usr/bin/plutil -remove BundleProgram "$manualPlist" &&
++ /usr/bin/plutil -insert Program -string "$SERVER_PREFIX/bin/rserver" "$manualPlist" &&
++ launchctl bootstrap system "$manualPlist"
++ result=$?
++ /bin/rm -f "$manualPlist"
++ return "$result"
 +}
 +
 +stopServer() {
-+ "$SERVER_CONTROL" --disable-service
++ requireRoot || return $?
++ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
++    launchctl bootout "$SERVICE_TARGET"
++ fi
 +}
 +
 +restartServer() {
@@ -1601,7 +1289,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea7
  }
  
  isServerRunning() {
-@@ -23,23 +120,41 @@ isServerRunning() {
+@@ -23,23 +139,41 @@ isServerRunning() {
  
  case "$1" in
  
@@ -1650,7 +1338,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea7
          ;;
  
      test-config)
-@@ -56,16 +171,17 @@ case "$1" in
+@@ -56,16 +190,17 @@ case "$1" in
          ;;
  
      verify-installation)
@@ -1671,7 +1359,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea7
          ;;
  
      suspend-session)
-@@ -111,17 +227,17 @@ case "$1" in
+@@ -111,17 +246,17 @@ case "$1" in
          ;;
  
      offline)
@@ -1697,7 +1385,7 @@ index 6438d255dedf590d15b1551d4ca8adb2d083bab1..57048558d25b34b3688182778e755ea7
          ;;
  
      active-sessions)
-@@ -133,6 +249,6 @@ case "$1" in
+@@ -133,6 +268,6 @@ case "$1" in
          ;;
  
      *)
@@ -1818,31 +1506,27 @@ index 0000000000000000000000000000000000000000..e8af0815eb16643617fe913f23cfd328
 +</plist>
 diff --git a/src/cpp/server/extras/macos/ServerAdmin.h b/src/cpp/server/extras/macos/ServerAdmin.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4acd6b0f337da9f605f2f6771811a133af89c0f9
+index 0000000000000000000000000000000000000000..446a582b15a195c26229a3d2021d033a300430d4
 --- /dev/null
 +++ b/src/cpp/server/extras/macos/ServerAdmin.h
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,8 @@
 +/* Copyright (C) 2026 by Posit Software, PBC
 + * Licensed under the GNU Affero General Public License, version 3. */
 +#import <Cocoa/Cocoa.h>
 +
 +NSString *RStudioValidateNetwork(NSString *address, NSString *port);
 +
-+@interface ServerSettingsController : NSWindowController
-+@end
-+
 +@interface ServerAccountsController : NSWindowController <NSTextFieldDelegate>
 +@end
 diff --git a/src/cpp/server/extras/macos/ServerAdmin.m b/src/cpp/server/extras/macos/ServerAdmin.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..37dbac7f2fd9c30470888bdb31b59753d2f4542b
+index 0000000000000000000000000000000000000000..3302a0029bf1f37b17a5e9de5fd1e4c7fafad2e9
 --- /dev/null
 +++ b/src/cpp/server/extras/macos/ServerAdmin.m
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,184 @@
 +/* Copyright (C) 2026 by Posit Software, PBC
 + * Licensed under the GNU Affero General Public License, version 3. */
 +#import "ServerAdmin.h"
-+#import <ServiceManagement/ServiceManagement.h>
 +#include <arpa/inet.h>
 +
 +NSString *RStudioValidateNetwork(NSString *address, NSString *port)
@@ -1858,6 +1542,7 @@ index 0000000000000000000000000000000000000000..37dbac7f2fd9c30470888bdb31b59753
 +      return @"Enter a port between 1 and 65535.";
 +   return nil;
 +}
++
 +
 +static NSString *adminPath(void)
 +{
@@ -1903,131 +1588,22 @@ index 0000000000000000000000000000000000000000..37dbac7f2fd9c30470888bdb31b59753
 +   [alert runModal];
 +}
 +
-+static NSString *runAdministratorCommand(NSArray<NSString *> *arguments)
-+{
-+   NSMutableArray *quoted = [NSMutableArray arrayWithObject:shellQuote(adminPath())];
-+   for (NSString *argument in arguments)
-+      [quoted addObject:shellQuote(argument)];
-+   NSString *command = [quoted componentsJoinedByString:@" "];
-+   // Quote shell arguments and the AppleScript string independently. The
-+   // system authorization dialog handles credentials; the app never reads them.
-+   command = [command stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
-+   command = [command stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
-+   NSAppleScript *script = [[NSAppleScript alloc] initWithSource:
-+      [NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", command]];
-+   NSDictionary *error = nil;
-+   NSAppleEventDescriptor *result = [script executeAndReturnError:&error];
-+   if (!result)
-+   {
-+      if ([error[NSAppleScriptErrorNumber] integerValue] != -128)
-+         showAdminError(error[NSAppleScriptErrorMessage] ?: @"Administrator authorization failed.");
-+      return nil;
-+   }
-+   return result.stringValue ?: @"Done.";
-+}
-+
-+@interface ServerSettingsController ()
-+@property(strong) NSTextField *address;
-+@property(strong) NSTextField *port;
-+@property(strong) NSTextField *result;
-+@end
-+
-+@implementation ServerSettingsController
-+
-+- (instancetype)init
-+{
-+   self = [super initWithWindow:adminWindow(@"RStudio Server Settings", 440)];
-+   if (!self) return nil;
-+   NSView *view = self.window.contentView;
-+   label(view, @"Listen address and service", NSMakeRect(24, 395, 692, 25));
-+   label(view, @"127.0.0.1 allows this Mac only. 0.0.0.0 listens on all IPv4 interfaces. Select an address assigned to this Mac. Authentication remains required.", NSMakeRect(24, 330, 692, 52));
-+   label(view, @"Listen address", NSMakeRect(24, 287, 125, 23));
-+   self.address = [[NSTextField alloc] initWithFrame:NSMakeRect(155, 285, 360, 26)];
-+   [view addSubview:self.address];
-+   label(view, @"Port", NSMakeRect(535, 287, 45, 23));
-+   self.port = [[NSTextField alloc] initWithFrame:NSMakeRect(585, 285, 125, 26)];
-+   [view addSubview:self.port];
-+   button(view, @"Reload Saved Settings", NSMakeRect(24, 235, 215, 32), self, @selector(reload:));
-+   button(view, @"Save and Apply", NSMakeRect(490, 235, 225, 32), self, @selector(save:));
-+   label(view, @"Settings are saved in /etc/rstudio/rserver.conf. Applying restarts an enabled service; a stopped service uses them on its next start. Administrator authorization is required.", NSMakeRect(24, 168, 692, 55));
-+   button(view, @"Start / Enable Startup", NSMakeRect(20, 112, 225, 34), self, @selector(start:));
-+   button(view, @"Stop and Disable Startup", NSMakeRect(255, 112, 225, 34), self, @selector(stop:));
-+   button(view, @"Restart", NSMakeRect(490, 112, 225, 34), self, @selector(restart:));
-+   self.result = label(view, @"", NSMakeRect(24, 15, 692, 82));
-+   [self reload:nil];
-+   return self;
-+}
-+
-+- (void)reload:(id)sender
-+{
-+   NSError *error = nil;
-+   NSString *text = [NSString stringWithContentsOfFile:@"/etc/rstudio/rserver.conf"
-+      encoding:NSUTF8StringEncoding error:&error];
-+   if (!text)
-+   {
-+      self.result.stringValue = error.localizedDescription ?: @"Complete administrator installation first.";
-+      self.address.stringValue = @"";
-+      self.port.stringValue = @"";
-+      return;
-+   }
-+   NSMutableDictionary *options = [NSMutableDictionary new];
-+   NSCharacterSet *space = NSCharacterSet.whitespaceAndNewlineCharacterSet;
-+   for (NSString *line in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet])
-+   {
-+      NSString *entry = [[line componentsSeparatedByString:@"#"][0] stringByTrimmingCharactersInSet:space];
-+      NSRange equals = [entry rangeOfString:@"="];
-+      if (equals.location == NSNotFound) continue;
-+      NSString *key = [[entry substringToIndex:equals.location] stringByTrimmingCharactersInSet:space];
-+      NSString *value = [[entry substringFromIndex:equals.location + 1] stringByTrimmingCharactersInSet:space];
-+      if (value.length >= 2 && [value hasPrefix:@"\""] && [value hasSuffix:@"\""])
-+         value = [value substringWithRange:NSMakeRange(1, value.length - 2)];
-+      options[key] = value;
-+   }
-+   self.address.stringValue = options[@"www-address"] ?: @"0.0.0.0";
-+   NSString *defaultPort = [@[@"1", @"true"] containsObject:[options[@"ssl-enabled"] lowercaseString]] ? @"443" : @"8787";
-+   self.port.stringValue = [options[@"www-port"] length] ? options[@"www-port"] : defaultPort;
-+   self.result.stringValue = @"Loaded the saved Server configuration. Startup registration and HTTP service health are separate; use the Server URL to check connectivity.";
-+}
-+
-+- (void)save:(id)sender
-+{
-+   NSString *error = RStudioValidateNetwork(self.address.stringValue, self.port.stringValue);
-+   if (error) { showAdminError(error); return; }
-+   NSString *output = runAdministratorCommand(@[@"configure-network", self.address.stringValue, self.port.stringValue]);
-+   if (output) { [self reload:nil]; self.result.stringValue = output; }
-+}
-+
-+- (void)start:(id)sender
-+{
-+   [NSApp sendAction:@selector(enableStartup:) to:NSApp.delegate from:sender];
-+}
-+
-+- (void)stop:(id)sender
-+{
-+   [NSApp sendAction:@selector(disableStartup:) to:NSApp.delegate from:sender];
-+}
-+
-+- (void)restart:(id)sender
-+{
-+   NSString *output = runAdministratorCommand(@[@"restart"]);
-+   if (output) self.result.stringValue = @"Restart requested. The service reads the latest saved configuration.";
-+}
-+@end
-+
 +@interface ServerAccountsController ()
 +@property(strong) NSTextField *username;
 +@property(strong) NSTextField *home;
 +@property(strong) NSButton *hidden;
 +@property(strong) NSPopUpButton *operation;
 +@property(strong) NSTextView *commands;
++- (void)openConfiguration:(id)sender;
 +@end
 +
 +@implementation ServerAccountsController
 +- (instancetype)init
 +{
-+   self = [super initWithWindow:adminWindow(@"RStudio Server User Accounts", 620)];
++   self = [super initWithWindow:adminWindow(@"RStudio Server Admin Info", 660)];
 +   if (!self) return nil;
 +   NSView *view = self.window.contentView;
++   button(view, @"Open /etc/rstudio in Finder", NSMakeRect(24, 608, 692, 30), self, @selector(openConfiguration:));
 +   label(view, @"Create a standard macOS account for RStudio with a private home. Hiding it from the login screen is optional. Run the generated commands in your own Terminal; macOS prompts for passwords there.", NSMakeRect(24, 545, 692, 55));
 +   label(view, @"Account name", NSMakeRect(24, 508, 125, 22));
 +   self.username = [[NSTextField alloc] initWithFrame:NSMakeRect(155, 505, 285, 26)];
@@ -2064,6 +1640,12 @@ index 0000000000000000000000000000000000000000..37dbac7f2fd9c30470888bdb31b59753
 +   label(view, @"Deletion preserves the home and refuses users with running processes.", NSMakeRect(24, 20, 450, 36));
 +   [self updateCommands:nil];
 +   return self;
++}
++
++- (void)openConfiguration:(id)sender
++{
++   if (![NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:@"/etc/rstudio" isDirectory:YES]])
++      showAdminError(@"The /etc/rstudio folder is not available. Complete the Server installation first.");
 +}
 +
 +- (void)controlTextDidChange:(NSNotification *)notification { [self updateCommands:nil]; }
@@ -2128,10 +1710,10 @@ index 0000000000000000000000000000000000000000..37dbac7f2fd9c30470888bdb31b59753
 +@end
 diff --git a/src/cpp/server/extras/macos/ServerApp.m b/src/cpp/server/extras/macos/ServerApp.m
 new file mode 100644
-index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30bbb45409
+index 0000000000000000000000000000000000000000..67543edca5dac31ce58196ee39920f35df1bb3d9
 --- /dev/null
 +++ b/src/cpp/server/extras/macos/ServerApp.m
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,290 @@
 +/*
 + * Copyright (C) 2026 by Posit Software, PBC
 + * Licensed under the GNU Affero General Public License, version 3.
@@ -2140,6 +1722,8 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +#import <Cocoa/Cocoa.h>
 +#import <ServiceManagement/ServiceManagement.h>
 +#import "ServerAdmin.h"
++#include <libproc.h>
++#include <stdlib.h>
 +#include <stdio.h>
 +#include <string.h>
 +
@@ -2185,8 +1769,10 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +
 +@interface ServerAppDelegate : NSObject <NSApplicationDelegate>
 +@property(strong) NSWindow *window;
-+@property(strong) NSTextField *statusLabel;
-+@property(strong) ServerSettingsController *settingsController;
++@property(strong) NSTextField *serverStatusLabel;
++@property(strong) NSTextField *startupStatusLabel;
++@property(strong) NSButton *serverButton;
++@property(strong) NSButton *startupButton;
 +@property(strong) ServerAccountsController *accountsController;
 +@end
 +
@@ -2194,27 +1780,65 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +
 +- (void)refreshStatus
 +{
-+   switch (serverService().status)
++   NSString *server = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Resources/app/bin/rserver"];
++   int size = proc_listallpids(NULL, 0);
++   BOOL running = NO;
++   if (size > 0)
 +   {
-+   case SMAppServiceStatusEnabled:
-+      self.statusLabel.stringValue = @"Startup enabled. macOS manages the Server in the background.";
-+      break;
-+   case SMAppServiceStatusRequiresApproval:
-+      self.statusLabel.stringValue = @"Administrator approval is required in System Settings > Login Items.";
-+      break;
-+   case SMAppServiceStatusNotFound:
-+      self.statusLabel.stringValue = @"The Server service could not be found in this application.";
-+      break;
-+   default:
-+      self.statusLabel.stringValue = @"Automatic startup is disabled.";
-+      break;
++      size_t capacity = (size_t)size + 64;
++      pid_t *pids = calloc(capacity, sizeof(pid_t));
++      if (pids)
++      {
++         int count = proc_listallpids(pids, (int)(capacity * sizeof(pid_t)));
++         for (int i = 0; i < count && (size_t)i < capacity; ++i)
++         {
++            char path[PROC_PIDPATHINFO_MAXSIZE];
++            if (proc_pidpath(pids[i], path, sizeof(path)) > 0 &&
++                [server isEqualToString:[NSString stringWithUTF8String:path]])
++            { running = YES; break; }
++         }
++         free(pids);
++      }
 +   }
++   self.serverStatusLabel.stringValue = running ? @"RStudio Server Status: Running" : @"RStudio Server Status: Dead";
++   self.serverStatusLabel.textColor = running ? NSColor.systemGreenColor : NSColor.systemRedColor;
++   self.serverButton.title = running ? @"Stop Server" : @"Start Server";
++   BOOL enabled = serverService().status == SMAppServiceStatusEnabled;
++   self.startupStatusLabel.stringValue = enabled ? @"RStudio Server Auto Startup: Enabled" : @"RStudio Server Auto Startup: Disabled";
++   self.startupStatusLabel.textColor = enabled ? NSColor.systemGreenColor : NSColor.systemRedColor;
++   self.startupButton.title = enabled ? @"Disable Auto Startup" : @"Enable Auto Startup";
++}
++
++- (void)toggleServer:(id)sender
++{
++   [self refreshStatus];
++   BOOL running = [self.serverStatusLabel.stringValue hasSuffix:@"Running"];
++   NSString *tool = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Resources/app/bin/rstudio-server"];
++   NSString *quoted = [NSString stringWithFormat:@"'%@'", [tool stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
++   NSString *command = [NSString stringWithFormat:@"%@ %@", quoted, running ? @"stop" : @"start"];
++   command = [command stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
++   command = [command stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
++   NSAppleScript *script = [[NSAppleScript alloc] initWithSource:[NSString stringWithFormat:
++      @"do shell script \"%@\" with administrator privileges", command]];
++   NSDictionary *error = nil;
++   if (![script executeAndReturnError:&error] && [error[NSAppleScriptErrorNumber] integerValue] != -128)
++      [self showError:[NSError errorWithDomain:@"org.rstudio.RStudioServer" code:3
++         userInfo:@{NSLocalizedDescriptionKey:error[NSAppleScriptErrorMessage] ?: @"Administrator authorization failed."}]];
++   [self refreshStatus];
++}
++
++- (void)toggleStartup:(id)sender
++{
++   if (serverService().status == SMAppServiceStatusEnabled)
++      [self disableStartup:sender];
++   else
++      [self enableStartup:sender];
 +}
 +
 +- (void)showError:(NSError *)error
 +{
 +   NSAlert *alert = [NSAlert new];
-+   alert.messageText = @"RStudio Server could not update automatic startup";
++   alert.messageText = @"RStudio Server could not complete the request";
 +   alert.informativeText = error.localizedDescription ?: @"Check the application installation and try again.";
 +   [alert runModal];
 +}
@@ -2246,30 +1870,10 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +   [self refreshStatus];
 +}
 +
-+- (void)openSettings:(id)sender
-+{
-+   [SMAppService openSystemSettingsLoginItems];
-+}
-+
-+- (void)showServerSettings:(id)sender
-+{
-+   // Recreate the settings editor to reload the authoritative on-disk config.
-+   [self.settingsController close];
-+   self.settingsController = [ServerSettingsController new];
-+   [self.settingsController showWindow:nil];
-+}
-+
 +- (void)showAccounts:(id)sender
 +{
 +   if (!self.accountsController) self.accountsController = [ServerAccountsController new];
 +   [self.accountsController showWindow:nil];
-+}
-+
-+- (void)showInstallationHelp:(id)sender
-+{
-+   NSURL *guide = [NSURL fileURLWithPath:[NSBundle.mainBundle.bundlePath
-+      stringByAppendingPathComponent:@"Contents/Resources/app/SERVER.md"]];
-+   [NSWorkspace.sharedWorkspace openURL:guide];
 +}
 +
 +- (void)applicationDidBecomeActive:(NSNotification *)notification
@@ -2279,43 +1883,33 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +
 +- (void)applicationDidFinishLaunching:(NSNotification *)notification
 +{
-+   self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 300)
++   self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 560, 220)
 +      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
 +      backing:NSBackingStoreBuffered defer:NO];
 +   self.window.title = @"RStudio Server";
-+   NSTextField *description = [NSTextField wrappingLabelWithString:
-+      @"Run RStudio Server as a background service, including before a Mac user signs in. Enable startup, then approve RStudio Server in macOS Login Items settings."];
-+   description.frame = NSMakeRect(24, 210, 612, 65);
-+   [self.window.contentView addSubview:description];
-+   self.statusLabel = [NSTextField wrappingLabelWithString:@""];
-+   self.statusLabel.frame = NSMakeRect(24, 145, 612, 55);
-+   [self.window.contentView addSubview:self.statusLabel];
-+   NSArray *titles = @[@"Enable Startup", @"Stop and Disable Startup", @"Open Login Items",
-+                       @"Server Settings…", @"User Accounts…", @"Installation Help…"];
-+   SEL actions[] = {@selector(enableStartup:), @selector(disableStartup:), @selector(openSettings:)};
-+   SEL helpActions[] = {@selector(showServerSettings:), @selector(showAccounts:), @selector(showInstallationHelp:)};
-+   for (NSUInteger i = 0; i < titles.count; ++i)
-+   {
-+      NSButton *button = [NSButton buttonWithTitle:titles[i] target:self action:(i < 3 ? actions[i] : helpActions[i - 3])];
-+      button.frame = NSMakeRect(16 + (i % 3) * 212, i < 3 ? 88 : 32, 208, 34);
-+      [self.window.contentView addSubview:button];
-+   }
++   self.serverStatusLabel = [NSTextField labelWithString:@""];
++   self.serverStatusLabel.frame = NSMakeRect(24, 160, 350, 28);
++   self.serverStatusLabel.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
++   [self.window.contentView addSubview:self.serverStatusLabel];
++   self.serverButton = [NSButton buttonWithTitle:@"" target:self action:@selector(toggleServer:)];
++   self.serverButton.frame = NSMakeRect(385, 156, 150, 34);
++   [self.window.contentView addSubview:self.serverButton];
++   self.startupStatusLabel = [NSTextField labelWithString:@""];
++   self.startupStatusLabel.frame = NSMakeRect(24, 105, 350, 28);
++   self.startupStatusLabel.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
++   [self.window.contentView addSubview:self.startupStatusLabel];
++   self.startupButton = [NSButton buttonWithTitle:@"" target:self action:@selector(toggleStartup:)];
++   self.startupButton.frame = NSMakeRect(385, 101, 150, 34);
++   [self.window.contentView addSubview:self.startupButton];
++   NSButton *admin = [NSButton buttonWithTitle:@"Admin Info…" target:self action:@selector(showAccounts:)];
++   admin.frame = NSMakeRect(24, 35, 510, 36);
++   [self.window.contentView addSubview:admin];
 +   [self refreshStatus];
++   [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refreshStatus) userInfo:nil repeats:YES];
 +   [self.window center];
 +   [self.window makeKeyAndOrderFront:nil];
 +   [NSApp activateIgnoringOtherApps:YES];
-+   if (serverService().status == SMAppServiceStatusNotRegistered)
-+   {
-+      NSAlert *alert = [NSAlert new];
-+      alert.messageText = @"Start RStudio Server automatically?";
-+      alert.informativeText = @"macOS will ask an administrator to approve background startup in System Settings. You can change this later.";
-+      [alert addButtonWithTitle:@"Enable Startup"];
-+      [alert addButtonWithTitle:@"Not Now"];
-+      if ([alert runModal] == NSAlertFirstButtonReturn)
-+         [self enableStartup:nil];
-+   }
-+   else if (serverService().status == SMAppServiceStatusRequiresApproval)
-+      [self enableStartup:nil];
++
 +}
 +
 +- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
@@ -2331,8 +1925,6 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +   [menuBar addItem:applicationItem];
 +   NSMenu *applicationMenu = [[NSMenu alloc] initWithTitle:@"RStudio Server"];
 +   [applicationMenu addItemWithTitle:@"About RStudio Server" action:@selector(orderFrontStandardAboutPanel:) keyEquivalent:@""];
-+   NSMenuItem *settings = [applicationMenu addItemWithTitle:@"Server Settings…" action:@selector(showServerSettings:) keyEquivalent:@","];
-+   settings.target = delegate;
 +   [applicationMenu addItem:NSMenuItem.separatorItem];
 +   [applicationMenu addItemWithTitle:@"Quit RStudio Server" action:@selector(terminate:) keyEquivalent:@"q"];
 +   applicationItem.submenu = applicationMenu;
@@ -2350,10 +1942,8 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +
 +   NSMenuItem *helpItem = [NSMenuItem new];
 +   NSMenu *helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
-+   NSMenuItem *accounts = [helpMenu addItemWithTitle:@"User Accounts…" action:@selector(showAccounts:) keyEquivalent:@""];
++   NSMenuItem *accounts = [helpMenu addItemWithTitle:@"Admin Info…" action:@selector(showAccounts:) keyEquivalent:@""];
 +   accounts.target = delegate;
-+   NSMenuItem *installation = [helpMenu addItemWithTitle:@"Installation and Removal" action:@selector(showInstallationHelp:) keyEquivalent:@""];
-+   installation.target = delegate;
 +   helpItem.submenu = helpMenu;
 +   [menuBar addItem:helpItem];
 +   NSApp.mainMenu = menuBar;
@@ -2415,10 +2005,10 @@ index 0000000000000000000000000000000000000000..7565e0306b370f4f2fa06851ed16cb30
 +   return 0;
 +}
 diff --git a/src/cpp/session/CMakeLists.txt b/src/cpp/session/CMakeLists.txt
-index 885a64d406afe3aefe0fa19e4f1bccd0c16c4c91..38b5c8a7de837c5e786d921cc0368186c0770aae 100644
+index 1281ff5904de8c925858bf41a286dd28ba2e25aa..627b1ced4c01800040675acac8756fd53dc77664 100644
 --- a/src/cpp/session/CMakeLists.txt
 +++ b/src/cpp/session/CMakeLists.txt
-@@ -849,7 +849,7 @@ if(NOT RSTUDIO_SESSION_WIN32 AND NOT RSESSION_ALTERNATE_BUILD)
+@@ -850,7 +850,7 @@ if(NOT RSTUDIO_SESSION_WIN32 AND NOT RSESSION_ALTERNATE_BUILD)
     # install quarto (or pandoc if quarto disabled)
     if(QUARTO_ENABLED)
        # install some quarto folders into Resources, as needed
@@ -2427,7 +2017,7 @@ index 885a64d406afe3aefe0fa19e4f1bccd0c16c4c91..38b5c8a7de837c5e786d921cc0368186
           install(DIRECTORY "${RSTUDIO_DEPENDENCIES_QUARTO_DIR}" 
                 DESTINATION "${RSTUDIO_INSTALL_RESOURCES}/app"
                 USE_SOURCE_PERMISSIONS
-@@ -943,7 +943,7 @@ if(NOT RSTUDIO_SESSION_WIN32 AND NOT RSESSION_ALTERNATE_BUILD)
+@@ -944,7 +944,7 @@ if(NOT RSTUDIO_SESSION_WIN32 AND NOT RSESSION_ALTERNATE_BUILD)
           list(APPEND COPILOT_EXCLUDES REGEX "${COPILOT_REGEX}" EXCLUDE)
        endforeach()
  

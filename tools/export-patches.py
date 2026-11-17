@@ -10,8 +10,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source", type=Path, required=True)
-parser.add_argument("--base", default="macos-server/base-main-2da6d1b")
-parser.add_argument("--branch", default="feature/macos-server")
+parser.add_argument("--base", default="v2026.11.0+203")
+parser.add_argument("--branch", default="macos-server/2026.11.0-203-v2")
 parser.add_argument("--revision", type=int, required=True)
 args = parser.parse_args()
 if args.revision < 1:
@@ -20,7 +20,8 @@ base = subprocess.check_output(["git", "-C", str(args.source), "rev-parse", args
 subprocess.run(["git", "-C", str(args.source), "merge-base", "--is-ancestor", args.base, args.branch], check=True)
 with tempfile.TemporaryDirectory(prefix="rstudio-export-") as directory:
     subprocess.run(["git", "-C", str(args.source), "format-patch", "--no-signature", "--full-index",
-                    "--output-directory", directory, args.base + ".." + args.branch], check=True)
+                    "--output-directory", directory, args.base + ".." + args.branch, "--", ".",
+                    ":(exclude,glob)**/*.md", ":(exclude)*.md", ":(exclude)INSTALL"], check=True)
     exported = sorted(Path(directory).glob("*.patch"))
     if not exported:
         parser.error("no patch commits found")

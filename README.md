@@ -10,7 +10,12 @@ The initial supported baseline is **v2026.11.0+203**. macOS Server is a communit
 port; these packages are not official Posit macOS Server releases. Electron
 Desktop keeps its original `RStudio.app` name; Server installs as
 `RStudioServer.app` with PAM authentication, per-account UIDs, startup approval,
-listen-address settings, service controls and account-management help.
+independent service/startup controls and an Admin Info window for configuration
+and account-management commands.
+
+Installation and usage: [Server guide](docs/SERVER.md).
+Source branch maintenance: [Maintaining the patches](docs/MAINTAINING-SERVER.md).
+These guides are maintained directly in this repository, outside the patches.
 
 ## Automatic packages
 
@@ -29,7 +34,7 @@ pinned by the selected source release, builds the full Server/UI, and publishes:
 - `PROVENANCE.json` with upstream/patch commits and package/source hashes
 - `SHA256SUMS` and installation notes
 
-Releases are named `v2026.11.0+203-macos.1`, for example. Existing published assets
+Releases are named `v2026.11.0+203-macos.2`, for example. Existing published assets
 are not overwritten. Increment `revision` in `patches/series.json` when updating
 the patch series. Patch conflicts or build/package failures prevent publication.
 Only the separate publishing job has permission to write releases.
@@ -88,11 +93,13 @@ Keep development source branches in your separate RStudio checkout. Export only
 the commits after their explicit upstream base marker:
 
 ```sh
-python3 tools/export-patches.py --source ../rstudio \
-  --base macos-server/base-main-2da6d1b --branch feature/macos-server --revision 2
+python3 tools/export-patches.py --source ../rstudio-2026.11.0-203 \
+  --base v2026.11.0+203 --branch macos-server/2026.11.0-203-v2 --revision 2
 ```
 
-Commit the regenerated patch files and manifest here. A rebase of the source
+The exporter omits Markdown files and the upstream INSTALL guide, so patches
+contain source/build revisions only. Edit docs/ directly for guide changes.
+Commit the regenerated patch files, guides and manifest here. A rebase of the source
 branch requires updating the `--base` boundary. Do not commit generated source,
 downloaded dependencies, PKGs, signing certificates or account data.
 

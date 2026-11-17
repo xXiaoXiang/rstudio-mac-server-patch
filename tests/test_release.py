@@ -51,6 +51,16 @@ class ReleasePlanningTests(unittest.TestCase):
         self.assertEqual([item["tag"] for item in planned],
                          ["v2026.11.0+1", "v2026.11.0+2", "v2026.11.0+3", "v2026.11.0+10"])
 
+    def test_patches_do_not_embed_markdown_guides(self):
+        data = release.manifest()
+        for item in data["patches"]:
+            patch_path = release.ROOT / "patches" / item["file"]
+            for line in patch_path.read_text().splitlines():
+                if line.startswith("diff --git "):
+                    self.assertFalse(line.rsplit(" b/", 1)[-1].lower().endswith(".md"), line)
+        self.assertTrue((release.ROOT / "docs/SERVER.md").is_file())
+        self.assertTrue((release.ROOT / "docs/MAINTAINING-SERVER.md").is_file())
+
     def test_patch_manifest_is_complete_and_checked(self):
         self.assertTrue(release.manifest()["patches"])
         with tempfile.TemporaryDirectory() as directory:
