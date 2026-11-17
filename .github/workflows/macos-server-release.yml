@@ -1,0 +1,129 @@
+name: Build and publish macOS Server
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Official tag, e.g. v2026.11.0+203; blank builds pending tags from 2026.11 onward'
+        type: string
+        required: false
+      publish:
+        description: 'Publish completed packages as GitHub Releases'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-server-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find unpublished numeric release tags
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: python3 tools/release.py plan --repository "$TARGET_REPOSITORY" --tag "$UPSTREAM_TAG"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # macos-15 is the standard native arm64 image; macos-15-intel is x86_64.
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: patch-repo
+          persist-credentials: false
+      - name: Check out official RStudio release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rstudio/rstudio
+          ref: ${{ matrix.tag }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Apply checksummed patch series
+        env:
+          UPSTREAM_TAG: ${{ matrix.tag }}
+        run: python3 patch-repo/tools/release.py apply --source upstream --tag "$UPSTREAM_TAG"
+      - name: Cache release-specific native dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/rstudio-tools
+            upstream/dependencies/common/node
+            upstream/dependencies/common/gwtproject
+          key: macos-15-arm64-${{ matrix.artifact }}-${{ hashFiles('upstream/dependencies/tools/rstudio-tools.sh', 'upstream/dependencies/common/install-*', 'upstream/dependencies/osx/install-*') }}
+      - name: Install arm64 dependencies and build complete Server PKG
+        env:
+          UPSTREAM_TAG: ${{ matrix.tag }}
+          BUILD_JOBS: '3'
+          # These builds are development signed. No account/PAM test scripts run.
+        run: bash patch-repo/tools/build-macos.sh "$GITHUB_WORKSPACE/upstream" "$UPSTREAM_TAG" "$GITHUB_WORKSPACE/dist"
+      - name: Upload package, matching source, provenance and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-${{ matrix.artifact }}
+          path: upstream/build-macos-server/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.count != '0' && (github.event_name == 'schedule' || inputs.publish)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Verify assets and publish the completed draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          PATCH_COMMIT: ${{ github.sha }}
+          UPSTREAM_TAG: ${{ matrix.tag }}
+          MAKE_LATEST: ${{ matrix.make_latest }}
+        shell: bash
+        run: |
+          args=()
+          if [ "$MAKE_LATEST" = true ]; then args+=(--latest); fi
+          python3 tools/release.py publish --repository "$TARGET_REPOSITORY" \
+            --commit "$PATCH_COMMIT" --tag "$UPSTREAM_TAG" --output dist "${args[@]}"

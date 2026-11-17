@@ -1,0 +1,555 @@
+From c2c29f90ce39f0c42e21d93c21c15c6fdb92e4d0 Mon Sep 17 00:00:00 2001
+From: Xiao Xiang <baron@macos.shared>
+Date: Tue, 17 Nov 2026 12:34:15 +0800
+Subject: [PATCH 2/5] Authenticate macOS Server users through Open Directory
+ PAM
+
+Allow non-login shells while keeping account policy checks, use UID 501 as the automatic macOS user threshold, and document the dedicated PAM policy. Add a disposable-account probe covering PAM, encrypted HTTP login and real rsession UID isolation.
+---
+ dependencies/osx/probe-server-accounts.py     | 429 ++++++++++++++++++
+ src/cpp/server/ServerMain.cpp                 |  19 +-
+ src/cpp/server/ServerOptions.cpp              |   9 +-
+ src/cpp/server/extras/pam/mac/rstudio         |   5 +-
+ .../include/server_core/system/Pam.hpp        |  10 +-
+ 5 files changed, 452 insertions(+), 20 deletions(-)
+ create mode 100644 dependencies/osx/probe-server-accounts.py
+
+diff --git a/dependencies/osx/probe-server-accounts.py b/dependencies/osx/probe-server-accounts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2a1caaf253ca5e47746f592cb5556d9d60961b0
+--- /dev/null
++++ b/dependencies/osx/probe-server-accounts.py
+@@ -0,0 +1,429 @@
++#!/usr/bin/env python3
++"""Test macOS PAM and UID separation with disposable local accounts."""
++import argparse
++import base64
++from http.cookiejar import CookieJar
++import json
++import os
++from pathlib import Path
++import secrets
++import shutil
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++from urllib.error import HTTPError
++from urllib.parse import parse_qs, urlencode, urlsplit
++from urllib.request import build_opener, HTTPCookieProcessor, HTTPRedirectHandler, ProxyHandler, Request
++
++ROOT = Path(__file__).resolve().parents[2]
++PAM_HELPER = r'''
++#include <security/pam_appl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static int conversation(int count, const struct pam_message **messages,
++                        struct pam_response **result, void *password)
++{
++   struct pam_response *responses = calloc(count, sizeof(*responses));
++   if (!responses) return PAM_BUF_ERR;
++   for (int i = 0; i < count; ++i)
++   {
++      if (messages[i]->msg_style == PAM_PROMPT_ECHO_OFF)
++      {
++         responses[i].resp = strdup(password);
++         if (responses[i].resp) continue;
++      }
++      else if (messages[i]->msg_style == PAM_TEXT_INFO ||
++               messages[i]->msg_style == PAM_ERROR_MSG) continue;
++      for (int j = 0; j < count; ++j) free(responses[j].resp);
++      free(responses);
++      return PAM_CONV_ERR;
++   }
++   *result = responses;
++   return PAM_SUCCESS;
++}
++
++int main(int argc, char **argv)
++{
++   if (argc != 3) return 2;
++   char password[256];
++   if (!fgets(password, sizeof(password), stdin)) return 2;
++   password[strcspn(password, "\n")] = 0;
++   struct pam_conv conv = {conversation, password};
++   pam_handle_t *handle = NULL;
++   int status = pam_start(argv[1], argv[2], &conv, &handle);
++   if (status == PAM_SUCCESS) status = pam_authenticate(handle, 0);
++   if (status == PAM_SUCCESS) status = pam_acct_mgmt(handle, 0);
++   if (status != PAM_SUCCESS) fprintf(stderr, "PAM: %s\n", pam_strerror(handle, status));
++   if (handle) pam_end(handle, status);
++   volatile char *clear = password;
++   for (size_t i = 0; i < sizeof(password); ++i) clear[i] = 0;
++   return status == PAM_SUCCESS ? 0 : 1;
++}
++'''
++
++
++def run(*args, check=True, **kwargs):
++    # Target accounts must not inherit an inaccessible administrator cwd.
++    kwargs.setdefault("cwd", "/")
++    result = subprocess.run(args, check=False, text=True, capture_output=True, **kwargs)
++    if check and result.returncode:
++        # Never echo stdin; password setup supplies its secret there.
++        detail = (result.stdout + result.stderr).strip()
++        if "input" in kwargs:
++            detail = result.stderr.strip()
++        raise RuntimeError("Command failed (" + str(result.returncode) + "): " +
++                           repr(args) + "\n" + detail)
++    return result
++
++
++def remove_probe_directory(directory):
++    # Return private homes to root before removing them. macOS can protect a
++    # directory registered as another account's home even from a root rmdir.
++    for path in directory.iterdir():
++        if path.is_dir() and not path.is_symlink():
++            os.chown(path, 0, 0)
++    shutil.rmtree(directory)
++
++
++def require(condition, message):
++    if not condition:
++        raise RuntimeError(message)
++    print("PASS: " + message, flush=True)
++
++
++class NoRedirects(HTTPRedirectHandler):
++    def redirect_request(self, request, response, code, message, headers, newurl):
++        return None
++
++
++class ServerBrowser:
++    """Exercise the real browser protocol without using an existing user's password."""
++
++    def __init__(self, url):
++        parts = urlsplit(url)
++        if (parts.scheme not in ("http", "https") or
++                parts.hostname not in ("127.0.0.1", "localhost", "::1") or
++                parts.username or parts.password or parts.query or parts.fragment or
++                parts.path not in ("", "/")):
++            raise ValueError("--server-url must be a loopback HTTP(S) URL without a path or credentials")
++        self.url = url.rstrip("/")
++        self.cookies = CookieJar()
++        self.opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(self.cookies), NoRedirects())
++        self.client_id = None
++        self.client_version = ""
++
++    def request(self, path, data=None, content_type=None):
++        # A normal supported browser UA avoids RStudio's unsupported-browser page.
++        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
++                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
++                   "X-RS-CSRF-Token": self.cookie("rs-csrf-token"), "Referer": self.url + "/"}
++        if content_type:
++            headers["Content-Type"] = content_type
++        request = Request(self.url + path, data=data, headers=headers)
++        try:
++            response = self.opener.open(request, timeout=60)
++        except HTTPError as error:
++            response = error
++        with response:
++            return response.status, response.headers, response.read()
++
++    def cookie(self, name):
++        return next((cookie.value for cookie in self.cookies if cookie.name == name), "")
++
++    def prepare(self):
++        status, headers, _ = self.request("/")
++        require(status == 302 and urlsplit(headers.get("Location", "")).path == "/auth-sign-in",
++                "anonymous browser is redirected to sign-in")
++        status, _, body = self.request("/auth-sign-in")
++        require(status == 200 and b"Sign in to RStudio" in body and bool(self.cookie("rs-csrf-token")),
++                "sign-in form and CSRF cookie are served")
++
++    def login(self, name, password, directory, accepted):
++        status, _, body = self.request("/auth-public-key")
++        if status != 200:
++            raise RuntimeError("Could not retrieve the Server's public login key")
++        exponent, modulus = (int(item, 16) for item in body.decode().strip().split(":"))
++
++        def der(tag, data):
++            length = len(data)
++            size = length.to_bytes((length.bit_length() + 7) // 8, "big")
++            return bytes([tag]) + (bytes([length]) if length < 128 else bytes([128 + len(size)]) + size) + data
++
++        def integer(value):
++            # DER INTEGER is signed; retain a leading zero when needed.
++            return der(2, value.to_bytes((value.bit_length() + 8) // 8, "big"))
++
++        public_key = directory / "server-public-key.der"
++        rsa_key = der(0x30, integer(modulus) + integer(exponent))
++        # SubjectPublicKeyInfo: rsaEncryption AlgorithmIdentifier and key BIT STRING.
++        algorithm = bytes.fromhex("300d06092a864886f70d0101010500")
++        public_key.write_bytes(der(0x30, algorithm + der(3, b"\0" + rsa_key)))
++        # Use OpenSSL's RSA-OAEP implementation. Secrets travel only via stdin;
++        # the temporary file contains the public key, never a password.
++        result = subprocess.run(["/usr/bin/openssl", "pkeyutl", "-encrypt", "-pubin", "-keyform", "DER",
++                                 "-inkey", str(public_key), "-pkeyopt", "rsa_padding_mode:oaep",
++                                 "-pkeyopt", "rsa_oaep_md:sha256"],
++                                input=(name + "\n" + password).encode(), capture_output=True, cwd="/", timeout=10)
++        if result.returncode:
++            raise RuntimeError("OpenSSL could not encrypt the probe login: " + result.stderr.decode())
++        form = {"v": "$RSA-OAEP$" + base64.b64encode(result.stdout).decode(),
++                "rs-csrf-token": self.cookie("rs-csrf-token"), "persist": "0", "appUri": "/"}
++        status, headers, _ = self.request("/auth-do-sign-in", urlencode(form).encode(),
++                                          "application/x-www-form-urlencoded")
++        location = urlsplit(headers.get("Location", ""))
++        if accepted:
++            require(status == 302 and location.path == "/" and bool(self.cookie("user-id")),
++                    "HTTP sign-in accepts the valid password: " + name + " (redirect: " + location.path +
++                    ", error: " + str(parse_qs(location.query).get("error", [])) + ")")
++        else:
++            require(status == 302 and location.path == "/auth-sign-in" and
++                    parse_qs(location.query).get("error") == ["1"] and not self.cookie("user-id"),
++                    "HTTP sign-in rejects an incorrect password: " + name)
++
++    def rpc(self, method, params, **extra):
++        request = dict(method=method, params=params, clientVersion=self.client_version, **extra)
++        if self.client_id:
++            request["clientId"] = self.client_id
++        status, _, body = self.request("/rpc/" + method, json.dumps(request).encode(), "application/json")
++        if status != 200:
++            raise RuntimeError(method + " returned HTTP " + str(status))
++        response = json.loads(body)
++        if response.get("error"):
++            raise RuntimeError(method + " failed: " + str(response["error"]))
++        return response.get("result")
++
++    def initialize(self, name, home):
++        info = self.rpc("client_init", [self.url + "/", secrets.token_hex(16)],
++                        kwparams={"restore_workspace": 0, "run_rprofile": 0})
++        self.client_id = info["clientId"]
++        self.client_version = info["client_version"]
++        require(info["systemUsername"] == name and Path(info["user_home_path"]).resolve() == home.resolve(),
++                "real rsession starts as the authenticated account with its private HOME: " + name)
++
++    def check_r(self, name, uid, home, peer):
++        result_path = home / "server-probe-result"
++        # JSON string quoting is also valid R string quoting for these paths.
++        quote = json.dumps
++        code = ('local({ p <- ' + quote(str(peer / "private")) + '; '
++                'denied <- function(expr) suppressWarnings(tryCatch({force(expr); FALSE}, error=function(e) TRUE)); '
++                'read_denied <- denied(readLines(p)); '
++                'write_denied <- denied(write("changed", p, append=TRUE)); '
++                'writeLines(c(system2("/usr/bin/id", "-u", stdout=TRUE), Sys.getenv("HOME"), '
++                'as.character(Sys.getpid()), R.version$arch, as.character(read_denied), '
++                'as.character(write_denied)), ' + quote(str(result_path)) + ') })')
++        self.rpc("console_input", [code, "", 0])
++        deadline = time.monotonic() + 30
++        while not result_path.exists() and time.monotonic() < deadline:
++            time.sleep(0.2)
++        require(result_path.exists(), "R console executes code: " + name)
++        lines = result_path.read_text().splitlines()
++        require(len(lines) == 6 and lines[0] == str(uid) and Path(lines[1]).resolve() == home.resolve() and
++                result_path.stat().st_uid == uid,
++                "R code and its output file have the correct UID and HOME: " + name)
++        process_uid = run("/bin/ps", "-o", "uid=", "-p", lines[2]).stdout.strip()
++        require(process_uid == str(uid), "rsession process has the authenticated UID: " + name)
++        require(lines[3] in ("aarch64", "arm64"), "R runs natively on Apple Silicon: " + name)
++        require(lines[4:] == ["TRUE", "TRUE"], "R cannot read or write the other account's private file: " + name)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--hidden", action="store_true",
++                        help="set IsHidden=1 on the temporary accounts (optional)")
++    parser.add_argument("--pam-helper", type=Path,
++                        help="also test the newly built rserver-pam executable")
++    parser.add_argument("--server-url", help="also test HTTP login and real R sessions on a running loopback Server")
++    parser.add_argument("--check-http", action="store_true",
++                        help="only check the anonymous HTTP sign-in flow; does not need sudo or create accounts")
++    parser.add_argument("--cleanup", type=Path,
++                        help="remove a leftover /private/tmp/rstudio-probe-* directory, then exit")
++    args = parser.parse_args()
++    if args.check_http:
++        ServerBrowser(args.server_url or "http://127.0.0.1:8787").prepare()
++        return
++    if sys.platform != "darwin" or os.geteuid() != 0:
++        parser.error("run with sudo on macOS; two temporary accounts will be created and removed")
++    if args.pam_helper:
++        args.pam_helper = args.pam_helper.resolve()
++        if not args.pam_helper.is_file() or not os.access(args.pam_helper, os.X_OK):
++            parser.error("--pam-helper must name an executable rserver-pam binary")
++    if args.cleanup:
++        directory = args.cleanup
++        if (directory.parent != Path("/private/tmp") or directory.is_symlink() or
++                not directory.name.startswith("rstudio-probe-") or
++                not (directory / "pam-probe.c").is_file()):
++            parser.error("cleanup accepts only an existing probe directory under /private/tmp")
++        remove_probe_directory(directory)
++        print("Removed " + str(directory))
++        return
++    if args.server_url:
++        ServerBrowser(args.server_url).prepare()
++
++    token = secrets.token_hex(4)
++    names = ["rsprobe" + token + suffix for suffix in ("a", "b")]
++    service = "rstudio-probe-" + token
++    profile = Path("/etc/pam.d") / service
++    directory = Path(tempfile.mkdtemp(prefix=service + "-", dir="/private/tmp"))
++    directory.chmod(0o755)
++    created = []
++    browsers = []
++    children = []
++    profile_created = False
++    print("Temporary accounts: " + ", ".join(names), flush=True)
++    print("Temporary files: " + str(directory), flush=True)
++    try:
++        source = directory / "pam-probe.c"
++        source.write_text(PAM_HELPER)
++        helper = directory / "pam-probe"
++        run("/usr/bin/clang", "-Wall", "-Wextra", str(source), "-lpam", "-o", str(helper))
++        with profile.open("x") as output:
++            profile_created = True
++            output.write((ROOT / "src/cpp/server/extras/pam/mac/rstudio").read_text())
++        profile.chmod(0o644)
++        records = run("/usr/bin/dscl", "/Local/Default", "-list", "/Users", "UniqueID").stdout
++        used = {int(line.rsplit(None, 1)[1]) for line in records.splitlines()}
++        candidate = max(501, max(used) + 1)
++        for name in names:
++            record = "/Users/" + name
++            existing = run("/usr/bin/dscl", "/Local/Default", "-read", record, check=False)
++            require(existing.returncode != 0, "temporary account name is unused: " + name)
++            home = directory / name
++            home.mkdir(mode=0o700)
++            os.chown(home, candidate, 20)
++            run("/usr/bin/dscl", "/Local/Default", "-create", record)
++            created.append(name)
++            for key, value in {"UniqueID": str(candidate), "PrimaryGroupID": "20",
++                               "NFSHomeDirectory": str(home), "UserShell": "/usr/bin/false",
++                               "RealName": "Disposable RStudio test account"}.items():
++                run("/usr/bin/dscl", "/Local/Default", "-create", record, key, value)
++            # Open Directory assigns GeneratedUID when the record is created.
++            # Replacing that identity is restricted on current macOS releases.
++            run("/usr/bin/dscl", "/Local/Default", "-read", record, "GeneratedUID")
++            if args.hidden:
++                run("/usr/bin/dscl", "/Local/Default", "-create", record, "IsHidden", "1")
++            password = "Rstudio-Probe-" + secrets.token_urlsafe(32) + "9a!"
++            # Interactive dscl reads commands from stdin. Supply the generated
++            # password there so it never appears in process arguments. Omitting
++            # the password from -passwd would instead prompt on /dev/tty.
++            run("/usr/bin/dscl", "/Local/Default",
++                input="passwd " + record + " " + password + "\nquit\n", timeout=20)
++            result = run(str(helper), service, name, input=password + "\n", check=False, timeout=20)
++            require(result.returncode == 0,
++                    "PAM accepts a valid password with a non-login shell: " + name + " " + result.stderr.strip())
++            result = run(str(helper), service, name, input=secrets.token_urlsafe(32) + "\n", check=False, timeout=20)
++            require(result.returncode == 1, "PAM rejects an incorrect password: " + name)
++            if args.pam_helper:
++                result = run(str(args.pam_helper), name, service, "1",
++                             input=password + "\n", check=False, timeout=20)
++                require(result.returncode == 0,
++                        "rserver-pam accepts the valid password: " + name + " " + result.stderr.strip())
++                result = run(str(args.pam_helper), name, service, "1",
++                             input=secrets.token_urlsafe(32) + "\n", check=False, timeout=20)
++                require(result.returncode == 1, "rserver-pam rejects an incorrect password: " + name)
++            result = run("/usr/bin/sudo", "-n", "-H", "-u", name, "/bin/sh", "-c",
++                         'umask 077; printf private > "$HOME/private"; /usr/bin/id -u; printf "%s\n" "$HOME"')
++            require(result.stdout.splitlines() == [str(candidate), str(home)],
++                    "process has the target UID and HOME: " + name)
++            require(run("/bin/launchctl", "print", "gui/" + str(candidate), check=False).returncode != 0,
++                    "no graphical login session is required: " + name)
++            if args.server_url:
++                browser = ServerBrowser(args.server_url)
++                browsers.append((browser, name, candidate, home))
++                browser.prepare()
++                browser.login(name, secrets.token_urlsafe(32), directory, accepted=False)
++                browser.login(name, password, directory, accepted=True)
++                browser.initialize(name, home)
++            candidate += 1
++
++        for browser, name, uid, home in browsers:
++            peer = directory / next(item for item in names if item != name)
++            browser.check_r(name, uid, home, peer)
++
++        for own, peer in (names, names[::-1]):
++            peer_file = directory / peer / "private"
++            denied = run("/usr/bin/sudo", "-n", "-H", "-u", own, "/bin/cat", str(peer_file), check=False)
++            require(denied.returncode != 0 and "Permission denied" in denied.stderr,
++                    own + " cannot read " + peer + "'s private file")
++            denied = run("/usr/bin/sudo", "-n", "-H", "-u", own, "/bin/sh", "-c",
++                         'printf changed >> "$1"', "probe", str(peer_file), check=False)
++            require(denied.returncode != 0 and "Permission denied" in denied.stderr,
++                    own + " cannot write " + peer + "'s private file")
++
++        child = subprocess.Popen(["/usr/bin/sudo", "-n", "-H", "-u", names[1],
++                                  "/bin/sh", "-c", 'echo $$; exec /bin/sleep 60'],
++                                 stdout=subprocess.PIPE, text=True, cwd="/")
++        pid = child.stdout.readline().strip()
++        children.append((child, int(pid) if pid.isdigit() else None))
++        require(pid.isdigit(), "target process starts without graphical login")
++        denied = run("/usr/bin/sudo", "-n", "-H", "-u", names[0], "/bin/kill", "-0", pid, check=False)
++        require(denied.returncode != 0 and "Operation not permitted" in denied.stderr,
++                "one account cannot signal the other account's process")
++        os.kill(int(pid), signal.SIGTERM)
++        child.wait(timeout=10)
++        if args.server_url:
++            print("HTTP authentication, native R execution and rsession UID separation passed.", flush=True)
++        else:
++            print("Account authentication and UID separation passed. RStudio itself is not exercised.", flush=True)
++    finally:
++        failed = sys.exc_info()[0] is not None
++        errors = []
++        for browser, name, _, _ in browsers:
++            if browser.client_id:
++                try:
++                    browser.rpc("quit_session", [False, "", None, ""])
++                except (OSError, ValueError, RuntimeError) as error:
++                    print("Session quit did not complete for " + name + ": " + str(error), file=sys.stderr)
++            # Stop only sessions owned by the disposable accounts from this run.
++            run("/usr/bin/pkill", "-TERM", "-u", name, "-x", "rsession", check=False)
++            deadline = time.monotonic() + 5
++            while run("/usr/bin/pgrep", "-u", name, "-x", "rsession", check=False).returncode == 0:
++                if time.monotonic() >= deadline:
++                    run("/usr/bin/pkill", "-KILL", "-u", name, "-x", "rsession", check=False)
++                    break
++                time.sleep(0.2)
++        for child, pid in children:
++            if child.poll() is None:
++                if pid:
++                    try:
++                        os.kill(pid, signal.SIGTERM)
++                    except ProcessLookupError:
++                        pass
++                else:
++                    child.terminate()
++                child.wait(timeout=10)
++        for name in reversed(created):
++            # Release home-directory registration before deleting the account.
++            home = directory / name
++            try:
++                os.chown(home, 0, 0)
++            except OSError as error:
++                errors.append("could not restore home ownership: " + str(error))
++            run("/usr/bin/dscl", "/Local/Default", "-create", "/Users/" + name,
++                "NFSHomeDirectory", "/var/empty", check=False)
++            result = run("/usr/bin/dscl", "/Local/Default", "-delete", "/Users/" + name, check=False)
++            if result.returncode:
++                errors.append("could not remove account " + name + ": " + result.stderr)
++        if profile_created:
++            try:
++                profile.unlink()
++            except OSError as error:
++                errors.append("could not remove PAM profile: " + str(error))
++        try:
++            remove_probe_directory(directory)
++        except OSError as error:
++            errors.append("could not remove temporary directory " + str(directory) + ": " + str(error))
++        if errors:
++            if failed:
++                print("Cleanup incomplete: " + "; ".join(errors), file=sys.stderr)
++            else:
++                raise RuntimeError("Cleanup incomplete: " + "; ".join(errors))
++        else:
++            print("Removed temporary accounts, PAM profile and files.", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/cpp/server/ServerMain.cpp b/src/cpp/server/ServerMain.cpp
+index c838d82f84c47046256c9270f3a80ba6dda279ea..0c5bff909c475595e1b6f2f598ba968b5385a62c 100644
+--- a/src/cpp/server/ServerMain.cpp
++++ b/src/cpp/server/ServerMain.cpp
+@@ -733,17 +733,6 @@ int main(int argc, char * const argv[])
+       // syslog prior to daemonizing)
+       core::system::ignoreSignal(core::system::SigPipe);
+ 
+-#ifdef __APPLE__
+-      // warn if the rstudio pam profile does not exist
+-      // (note that this only effects macOS development configurations)
+-      FilePath pamProfilePath("/etc/pam.d/rstudio");
+-      if (!pamProfilePath.exists())
+-      {
+-         std::cerr << "WARNING: /etc/pam.d/rstudio does not exist; authentication may fail!" << std::endl;
+-         std::cerr << "Run 'sudo cp /etc/pam.d/cups /etc/pam.d/rstudio' to set a default PAM profile for RStudio." << std::endl;
+-      }
+-#endif
+-
+       // read program options
+       std::ostringstream osWarnings;
+       Options& options = server::options();
+@@ -757,6 +746,14 @@ int main(int argc, char * const argv[])
+          return status.exitCode();
+       }
+ 
++#ifdef __APPLE__
++      if (!options.authNone() && !FilePath("/etc/pam.d/rstudio").exists())
++      {
++         std::cerr << "WARNING: /etc/pam.d/rstudio does not exist; authentication may fail!" << std::endl;
++         std::cerr << "Install extras/pam/rstudio from this Server installation into /etc/pam.d/rstudio." << std::endl;
++      }
++#endif
++
+       // Extended --check-config checks.  At this point options is fully
+       // populated and no subsystems have been started.  A clean config-file
+       // parse (handled inside program_options::read) has already printed its
+diff --git a/src/cpp/server/ServerOptions.cpp b/src/cpp/server/ServerOptions.cpp
+index 6fb045cd92b8df41c6d529120ab34df5809c0166..d570b2fd3155ce6cb7978364403a04a2ccde0938 100644
+--- a/src/cpp/server/ServerOptions.cpp
++++ b/src/cpp/server/ServerOptions.cpp
+@@ -146,11 +146,17 @@ unsigned int resolveMinimumUserId(std::string minimumUserId,
+                                   std::ostream& osWarnings)
+ {
+    // default for invalid input
++#ifdef __APPLE__
++   // Local macOS user accounts begin at 501; system accounts are below 500.
++   const unsigned int kDefaultMinimumId = 501;
++#else
+    const unsigned int kDefaultMinimumId = 1000;
++#endif
+ 
+    // auto-detect if requested
+    if (minimumUserId == "auto")
+    {
++#ifndef __APPLE__
+       // if /etc/login.defs exists, scan it and look for a UID_MIN setting
+       FilePath loginDefs("/etc/login.defs");
+       if (loginDefs.exists())
+@@ -169,7 +175,8 @@ unsigned int resolveMinimumUserId(std::string minimumUserId,
+          }
+       }
+ 
+-      // none found, return default
++#endif
++      // No platform setting found, return the platform default.
+       return kDefaultMinimumId;
+    }
+    else
+diff --git a/src/cpp/server/extras/pam/mac/rstudio b/src/cpp/server/extras/pam/mac/rstudio
+index 752a2a4fb1108626e76f2d219e9b5c6bfdf3c25c..682b1f68c830f4ae533e7fc01fc4cbbccb5fccc5 100644
+--- a/src/cpp/server/extras/pam/mac/rstudio
++++ b/src/cpp/server/extras/pam/mac/rstudio
+@@ -1,5 +1,8 @@
+ # login: auth account password session
+ auth       required       pam_opendirectory.so
+-account    required       pam_permit.so
++# Account visibility in loginwindow is an independent administrator setting.
++# A web session does not require an interactive login shell. Keep account
++# policy and home-directory validation, including for RStudio-only accounts.
++account    required       pam_opendirectory.so no_check_shell
+ password   required       pam_deny.so
+ session    required       pam_permit.so
+diff --git a/src/cpp/server_core/include/server_core/system/Pam.hpp b/src/cpp/server_core/include/server_core/system/Pam.hpp
+index b2be4c42ea93267000fbfc24c052c024a24d7f61..f1f1e22a522bdf7ee7e83a9b53ccdd5feed6c542 100644
+--- a/src/cpp/server_core/include/server_core/system/Pam.hpp
++++ b/src/cpp/server_core/include/server_core/system/Pam.hpp
+@@ -31,13 +31,9 @@ int conv(int num_msg,
+          struct pam_response** resp,
+          void * appdata_ptr);
+ 
+-// NOTE: Mac OS X supports PAM but ships with it in a locked-down config
+-// which will cause all passwords to be rejected. To make it work run:
+-//
+-//   sudo cp /etc/pam.d/ftpd /etc/pam.d/rstudio
+-//
+-// That configures PAM to send rstudio through the same authentication
+-// stack as ftpd uses, which is similar to us.
++// macOS requires an explicit /etc/pam.d/rstudio profile. Install the
++// Open Directory profile shipped in the Server installation's extras/pam
++// directory; do not copy another service's authentication policy.
+ 
+ // Low-level C++ wrapper around PAM API.
+ class PAM : boost::noncopyable

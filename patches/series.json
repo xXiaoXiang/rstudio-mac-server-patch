@@ -1,0 +1,32 @@
+{
+  "upstream": "rstudio/rstudio",
+  "minimum_release": [
+    2026,
+    11
+  ],
+  "tested_release": "v2026.11.0+203",
+  "revision": 1,
+  "base_commit": "2da6d1b0e60d243299ac8f5545714623875434bd",
+  "patches": [
+    {
+      "file": "0001-Default-macOS-dependencies-to-the-native-architectur.patch",
+      "sha256": "a76a34f4c09bd4aad696cc8cf1af0c03a1de3a3701739b0e51870817f9a9c13a"
+    },
+    {
+      "file": "0002-Authenticate-macOS-Server-users-through-Open-Directo.patch",
+      "sha256": "2bf3b3b731f50fd6e56e7bb5f732f179aa4a656556942877acf4da62b4e714e9"
+    },
+    {
+      "file": "0003-Add-a-native-macOS-Server-app-and-package-lifecycle.patch",
+      "sha256": "9388c8443e47fab5bef2a9ae6404c3f5564bc615f389049f3f86117ff93023dc"
+    },
+    {
+      "file": "0004-Document-release-builds-and-maintenance-of-the-macOS.patch",
+      "sha256": "c2025df2abd44dbfe3bac235f05299adc35719228853cd6135f2efac98820ad6"
+    },
+    {
+      "file": "0005-Document-optional-macOS-Server-diagnostics-and-remov.patch",
+      "sha256": "564671b0a8c507dec075f7316bcbdf7312049d861c10140a3a9c08390970d1bb"
+    }
+  ]
+}

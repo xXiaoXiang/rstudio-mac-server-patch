@@ -1,0 +1,120 @@
+From c79fafd3f43433650352080799125d5642900cb0 Mon Sep 17 00:00:00 2001
+From: Xiao Xiang <baron@macos.shared>
+Date: Tue, 17 Nov 2026 12:33:43 +0800
+Subject: [PATCH 1/5] Default macOS dependencies to the native architecture
+
+Keep Intel and universal tooling as explicit opt-ins, including CI and rig. Install the RStudio PAM profile instead of copying another macOS service policy.
+---
+ dependencies/common/install-rig               |  6 +++--
+ dependencies/osx/install-dependencies-osx     | 26 +++++++++----------
+ .../osx/install-dependencies-osx-arch         |  3 ++-
+ .../osx/install-dependencies-osx-jenkins      |  4 +--
+ 4 files changed, 21 insertions(+), 18 deletions(-)
+
+diff --git a/dependencies/common/install-rig b/dependencies/common/install-rig
+index a961a66527aacf19bd46c3b2c56b479dd8cc2c0b..31a1c7a3442dab4331520365ac8ebba063164f22 100755
+--- a/dependencies/common/install-rig
++++ b/dependencies/common/install-rig
+@@ -25,8 +25,10 @@ section "Installing rig"
+ case "$(uname -s)-$(uname -m)" in
+    Darwin-*)
+       RIG_PLATFORM=macos
+-      # The same dependency can be used by thin and universal RStudio builds.
+-      RIG_ARCH=universal
++      # Match this invocation's architecture; native Server builds must not
++      # download Intel tools or require Rosetta. Universal Desktop packaging
++      # can opt in with RSTUDIO_RIG_ARCH=universal.
++      RIG_ARCH="${RSTUDIO_RIG_ARCH:-$(uname -m)}"
+       ;;
+    Linux-x86_64) RIG_PLATFORM=linux; RIG_ARCH=x86_64 ;;
+    Linux-aarch64|Linux-arm64) RIG_PLATFORM=linux; RIG_ARCH=aarch64 ;;
+diff --git a/dependencies/osx/install-dependencies-osx b/dependencies/osx/install-dependencies-osx
+index 868d6417667e16e49927f76f8214e487404de677..1a954180d9db5cfc1098173bbbcd89eb2e906f86 100755
+--- a/dependencies/osx/install-dependencies-osx
++++ b/dependencies/osx/install-dependencies-osx
+@@ -26,23 +26,20 @@ Install the dependencies needed to build RStudio on macOS.
+ Options
+   --arch=<architectures>
+         Comma-separated list of architectures to install dependencies for
+-        (x86_64, arm64). Jenkins defaults to "x86_64,arm64" on Apple Silicon
+-        so it can produce a universal package; everywhere else the default is
+-        the machine's own architecture. Installing x86_64 dependencies on
++        (x86_64, arm64). Defaults to the machine's own architecture.
++        Universal Desktop dependencies require an explicit --arch option.
++        Installing x86_64 dependencies on
+         Apple Silicon requires Rosetta 2 and an x86_64 Homebrew at /usr/local.
+ USAGE
+ }
+ 
+ NATIVE_ARCH="$(uname -m)"
+ 
+-# a universal package needs both sets of dependencies, but only Jenkins
+-# builds one routinely; everywhere else the other architecture's tools are
+-# dead weight (and, on Apple Silicon, pull in Rosetta 2 and a second Homebrew)
+-if is-jenkins && [ "${NATIVE_ARCH}" = "arm64" ]; then
+-   ARCHS="x86_64,arm64"
+-else
+-   ARCHS="${NATIVE_ARCH}"
+-fi
++# Server builds on Apple Silicon need only arm64 dependencies. Do not
++# implicitly install osx-64 tools, even on CI. For a universal Desktop
++# build, opt in explicitly with --arch=x86_64,arm64.
++# ARCHS="x86_64,arm64"
++ARCHS="${NATIVE_ARCH}"
+ 
+ for ARG in "$@"; do
+    case "${ARG}" in
+@@ -102,7 +99,9 @@ done
+ 
+ # install Jenkins pre-requisites
+ if is-jenkins; then
+-   ./install-dependencies-osx-jenkins
++   for ARCH in "${ARCH_LIST[@]}"; do
++      ./install-dependencies-osx-jenkins "${ARCH}"
++   done
+ fi
+ 
+ for ARCH in "${ARCH_LIST[@]}"; do
+@@ -121,7 +120,8 @@ fi
+ if ! is-jenkins; then
+    if ! [ -f "/etc/pam.d/rstudio" ]; then
+       section "Installing RStudio PAM Profile"
+-      sudo cp /etc/pam.d/cups /etc/pam.d/rstudio
++      sudo install -o root -g wheel -m 644 \
++         ../../src/cpp/server/extras/pam/mac/rstudio /etc/pam.d/rstudio
+    fi
+ fi
+ 
+diff --git a/dependencies/osx/install-dependencies-osx-arch b/dependencies/osx/install-dependencies-osx-arch
+index 3fbb11686a8faadd2a27afc711cb9652b0ca973f..9055e50fd01dcdbd549ece54b1273a752e542896 100755
+--- a/dependencies/osx/install-dependencies-osx-arch
++++ b/dependencies/osx/install-dependencies-osx-arch
+@@ -22,10 +22,11 @@ require-program brew
+ 
+ # NOTE: the intention is for this script to be invoked as e.g.
+ #
+-#   arch -x86_64 ./install-dependencies-osx-arch
+ #   arch -arm64  ./install-dependencies-osx-arch
+ #
+ # to install the dependencies as appropriate for each architecture.
++# Intel dependencies are optional for universal Desktop builds only:
++#   arch -x86_64 ./install-dependencies-osx-arch
+ 
+ if [ -e install-overlay ]; then
+    ./install-overlay
+diff --git a/dependencies/osx/install-dependencies-osx-jenkins b/dependencies/osx/install-dependencies-osx-jenkins
+index 118e1f346285b41a06149fab1b7798ad18cfae51..f14be06946d39db513cf8fc8fe94f6e8ff5a2325 100755
+--- a/dependencies/osx/install-dependencies-osx-jenkins
++++ b/dependencies/osx/install-dependencies-osx-jenkins
+@@ -23,9 +23,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/../tools/rstudio-tools.sh"
+ if [ "$#" = "0" ]; then
+ 
+    if [ "$(arch)" = "arm64" ]; then
+-      # recursively invoke self with different architecture on arm64
++      # Native Apple Silicon Server builds do not need Intel dependencies.
+       arch -arm64  "${BASH_SOURCE[0]}" "arm64"
+-      arch -x86_64 "${BASH_SOURCE[0]}" "x86_64"
++      # arch -x86_64 "${BASH_SOURCE[0]}" "x86_64"
+    else
+       # assume x86_64 otherwise and run as normal
+       "${BASH_SOURCE[0]}" "x86_64"
