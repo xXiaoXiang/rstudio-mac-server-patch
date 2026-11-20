@@ -1,7 +1,7 @@
-From bc34481493c1fb937a86e73cb2bd6aa54a854694 Mon Sep 17 00:00:00 2001
+From 0c560ed803505122aec01981a5b3f4fb3ebb2c21 Mon Sep 17 00:00:00 2001
 From: Xiao Xiang <baron@macos.shared>
 Date: Tue, 17 Nov 2026 16:18:58 +0800
-Subject: [PATCH 2/3] Authenticate macOS Server users through Open Directory
+Subject: [PATCH 2/4] Authenticate macOS Server users through Open Directory
  PAM
 
 ---

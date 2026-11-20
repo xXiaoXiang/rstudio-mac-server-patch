@@ -1,0 +1,736 @@
+From 483600148b4b40adf69021997e57f6aa8b4ea229 Mon Sep 17 00:00:00 2001
+From: macOS Server patch builder <noreply@github.com>
+Date: Fri, 20 Nov 2026 15:27:12 +0800
+Subject: [PATCH 4/4] Manage a shared Conda R environment from the macOS Server
+ app
+
+---
+ dependencies/osx/test-server-conda.py         | 146 ++++++++++++
+ src/cpp/server/CMakeLists.txt                 |   2 +-
+ .../server/extras/admin/rsession-conda.mac    |  31 +++
+ .../extras/admin/rstudio-server-conda.mac     | 224 ++++++++++++++++++
+ .../server/extras/admin/rstudio-server.mac.in |   7 +-
+ src/cpp/server/extras/macos/CMakeLists.txt    |   2 +-
+ src/cpp/server/extras/macos/ServerApp.m       |  13 +-
+ .../server/extras/macos/ServerEnvironment.h   |   5 +
+ .../server/extras/macos/ServerEnvironment.m   | 181 ++++++++++++++
+ 9 files changed, 607 insertions(+), 4 deletions(-)
+ create mode 100644 dependencies/osx/test-server-conda.py
+ create mode 100755 src/cpp/server/extras/admin/rsession-conda.mac
+ create mode 100755 src/cpp/server/extras/admin/rstudio-server-conda.mac
+ create mode 100644 src/cpp/server/extras/macos/ServerEnvironment.h
+ create mode 100644 src/cpp/server/extras/macos/ServerEnvironment.m
+
+diff --git a/dependencies/osx/test-server-conda.py b/dependencies/osx/test-server-conda.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7367f5465de9f74792b257c07f41c70faca45422
+--- /dev/null
++++ b/dependencies/osx/test-server-conda.py
+@@ -0,0 +1,146 @@
++#!/usr/bin/env python3
++"""Shared Conda regressions using temporary files; no service or account changes."""
++from pathlib import Path
++import shlex
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++ADMIN = ROOT / "src/cpp/server/extras/admin"
++HELPER = ADMIN / "rstudio-server-conda.mac"
++
++
++class CondaTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory(prefix="rstudio-conda-")
++        self.addCleanup(self.temp.cleanup)
++        self.directory = Path(self.temp.name)
++        self.config = self.directory / "config"
++        self.config.mkdir()
++        self.prefix = self.directory / "shared"
++        self.prefix.mkdir()
++
++    def shell(self, body):
++        return subprocess.run(["/bin/bash"], input="source " + shlex.quote(str(HELPER)) + "\n" + body,
++                              capture_output=True, text=True)
++
++    def test_arguments_cannot_become_options_or_shell_code(self):
++        for function, values in (
++            ("validName", ("../base", "-n", "a/b", "a\nb", "")),
++            ("validPath", ("relative", "/a/../b", "/a b", "/a;touch", "/a\nb", "/a/.", "/a%U")),
++            ("validSpec", ("--prefix", "-y", "x;touch", "https://example", "a b", "$(id)")),
++        ):
++            for value in values:
++                with self.subTest(function=function, value=value):
++                    self.assertNotEqual(self.shell(function + " " + shlex.quote(value)).returncode, 0)
++        for value in ("r-base=4.6", "python>=3.14", "r-essentials", "numpy=2.*"):
++            self.assertEqual(self.shell("validSpec " + shlex.quote(value)).returncode, 0)
++
++    def test_switch_and_restore_preserve_other_settings(self):
++        config = self.config / "rserver.conf"
++        original = "# R selection\nauth-none=0\nwww-port=8787\nrsession-which-r=/original/bin/R\n"
++        config.write_text(original)
++        body = f'''
++CONFIG_DIR={shlex.quote(str(self.config))}
++SELECTION="$CONFIG_DIR/shared-conda-prefix"
++SNAPSHOT="$CONFIG_DIR/.shared-conda-original"
++SCRIPT_DIR={shlex.quote(str(self.directory))}
++PREFIX={shlex.quote(str(self.prefix))}
++checkStopped() {{ :; }}
++secureFile() {{ :; }}
++secureDir() {{ :; }}
++validateEnvironment() {{ PREFIX="$1"; }}
++prepareLibrary() {{ :; }}
++touch "$SCRIPT_DIR/rsession-conda"
++chmod +x "$SCRIPT_DIR/rsession-conda"
++selectEnvironment "$PREFIX"
++'''
++        result = self.shell(body)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertIn("rsession-which-r=" + str(self.prefix) + "/bin/R", config.read_text())
++        self.assertEqual((self.config / ".shared-conda-original/rserver.conf").read_text(), original)
++        config.write_text(config.read_text().replace("www-port=8787", "www-port=9999"))
++        # Selecting a second environment must preserve the first original snapshot.
++        result = self.shell(body + '\nuseSystemR\n')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        restored = config.read_text()
++        self.assertIn("rsession-which-r=/original/bin/R", restored)
++        self.assertIn("www-port=9999", restored)
++        self.assertIn("auth-none=0", restored)
++        self.assertNotIn("rsession-path=", restored)
++        self.assertFalse((self.config / "shared-conda-prefix").exists())
++
++    def test_active_environment_cannot_be_modified(self):
++        selected = self.config / "shared-conda-prefix"
++        selected.write_text(str(self.prefix) + "\n")
++        result = self.shell("SELECTION=" + shlex.quote(str(selected)) + "\nPREFIX=" +
++                            shlex.quote(str(self.prefix)) + "\ncheckNotSelected\n")
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("different environment", result.stderr)
++
++    def test_user_owned_r_cannot_be_selected_for_privileged_discovery(self):
++        result = self.shell("secureDir " + shlex.quote(str(self.prefix)))
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("root-owned", result.stderr)
++
++    def test_remove_preserves_packages_outside_deleted_prefix(self):
++        managed = self.directory / "managed"
++        prefix = managed / "shared-r"
++        library = prefix / "lib/R/rstudio-library"
++        library.mkdir(parents=True)
++        (library / "user-package").write_text("keep installed R package")
++        config = self.config / "shared-conda-prefix"
++        result = self.shell("MANAGED_ROOT=" + shlex.quote(str(managed)) + "\n" +
++            "SELECTION=" + shlex.quote(str(config)) + "\n" + '''
++lockSettings() { :; }
++condaTool() { :; }
++managedPrefix() { PREFIX="$MANAGED_ROOT/$1"; }
++checkStopped() { :; }
++runConda() { /bin/rm -rf "$PREFIX"; }
++main remove /opt/conda/bin/conda shared-r --confirm-delete
++''')
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertFalse(prefix.exists())
++        archives = list(managed.glob("shared-r-retained-library.*/rstudio-library/user-package"))
++        self.assertEqual(len(archives), 1)
++        self.assertEqual(archives[0].read_text(), "keep installed R package")
++
++    def test_wrapper_passes_shared_defaults_and_preserves_arguments(self):
++        prefix = self.prefix
++        for name in ("bin", "conda-meta", "lib/R/rstudio-library"):
++            (prefix / name).mkdir(parents=True, exist_ok=True)
++        (prefix / "conda-meta/history").touch()
++        for name in ("R", "python"):
++            path = prefix / "bin" / name
++            path.write_text("#!/bin/sh\nexit 0\n")
++            path.chmod(0o755)
++        selection = self.config / "shared-conda-prefix"
++        selection.write_text(str(prefix) + "\n")
++        wrapper = self.directory / "rsession-conda"
++        wrapper.write_text((ADMIN / "rsession-conda.mac").read_text().replace(
++            "PREFIX_FILE=/etc/rstudio/shared-conda-prefix", "PREFIX_FILE=" + shlex.quote(str(selection))))
++        real = self.directory / "rsession"
++        real.write_text('''#!/bin/bash
++printf '%s\n' "$CONDA_PREFIX" "$R_LIBS_USER" "$R_LIBS" "$RETICULATE_PYTHON" "$PATH"
++printf 'ARG:%s\n' "$@"
++''')
++        real.chmod(0o755)
++        result = subprocess.run(["/bin/bash", str(wrapper), "--user-identity", "test user", "--project=has space"],
++                                text=True, capture_output=True)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        lines = result.stdout.splitlines()
++        self.assertEqual(lines[:4], [str(prefix), str(prefix / "lib/R/rstudio-library"),
++                         str(prefix / "lib/R/rstudio-library"), str(prefix / "bin/python")])
++        self.assertTrue(lines[4].startswith(str(prefix / "bin") + ":"))
++        self.assertIn("ARG:test user", lines)
++        self.assertIn("ARG:--project=has space", lines)
++        self.assertIn("ARG:--r-libs-user=" + str(prefix / "lib/R/rstudio-library"), lines)
++        selection.unlink()
++        result = subprocess.run(["/bin/bash", str(wrapper)], capture_output=True, text=True)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("selection is missing", result.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/src/cpp/server/CMakeLists.txt b/src/cpp/server/CMakeLists.txt
+index 40100dc5d69fb539471f64d247eea42093646084..acc5e864b26f2b9786da098e3f00b3e6cdc4b657 100644
+--- a/src/cpp/server/CMakeLists.txt
++++ b/src/cpp/server/CMakeLists.txt
+@@ -265,7 +265,7 @@ elseif(APPLE)
+                  ${CMAKE_CURRENT_BINARY_DIR}/${RSERVER_ADMIN_SCRIPT})
+   install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/${RSERVER_ADMIN_SCRIPT}
+                    DESTINATION ${RSTUDIO_INSTALL_BIN})
+-  foreach(RSERVER_MAC_HELPER rstudio-server-users rstudio-server-install uninstall-rstudio-server)
++  foreach(RSERVER_MAC_HELPER rstudio-server-users rstudio-server-install uninstall-rstudio-server rstudio-server-conda rsession-conda)
+      install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/extras/admin/${RSERVER_MAC_HELPER}.mac"
+              DESTINATION ${RSTUDIO_INSTALL_BIN}
+              RENAME "${RSERVER_MAC_HELPER}")
+diff --git a/src/cpp/server/extras/admin/rsession-conda.mac b/src/cpp/server/extras/admin/rsession-conda.mac
+new file mode 100755
+index 0000000000000000000000000000000000000000..b98bdfa6c4e480b4d876b7dcb75247a35130ab93
+--- /dev/null
++++ b/src/cpp/server/extras/admin/rsession-conda.mac
+@@ -0,0 +1,31 @@
++#!/bin/bash
++# Copyright (C) 2026 by Posit Software, PBC
++# Licensed under the GNU Affero General Public License, version 3.
++# rserver has already switched to the authenticated user's UID before exec.
++set -e
++SCRIPT_DIR=$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)
++PREFIX_FILE=/etc/rstudio/shared-conda-prefix
++[ -f "$PREFIX_FILE" ] && [ ! -L "$PREFIX_FILE" ] || {
++ echo 'The shared Conda selection is missing. Ask the administrator to reapply R Environment settings.' >&2; exit 1
++}
++IFS= read -r CONDA_PREFIX < "$PREFIX_FILE"
++[ -x "$CONDA_PREFIX/bin/R" ] && [ -f "$CONDA_PREFIX/conda-meta/history" ] &&
++ [ -d "$CONDA_PREFIX/lib/R/rstudio-library" ] || {
++ echo 'The selected shared Conda environment is unavailable. Mount its volume or choose another R environment.' >&2; exit 1
++}
++export CONDA_PREFIX
++export CONDA_DEFAULT_ENV="${CONDA_PREFIX##*/}"
++export CONDA_SHLVL=1
++export PATH="$CONDA_PREFIX/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
++export R_LIBS_USER="$CONDA_PREFIX/lib/R/rstudio-library"
++export R_LIBS="$R_LIBS_USER"
++# SIP may remove DYLD variables when launching a system shell. Restore them
++# here, after the UID switch and immediately before exec of the real rsession.
++export DYLD_FALLBACK_LIBRARY_PATH="$CONDA_PREFIX/lib/R/lib:$CONDA_PREFIX/lib:/usr/local/lib:/usr/lib"
++export DYLD_INSERT_LIBRARIES="$CONDA_PREFIX/lib/R/lib/libR.dylib"
++if [ -x "$CONDA_PREFIX/bin/python" ]; then
++ export RETICULATE_PYTHON="$CONDA_PREFIX/bin/python"
++fi
++# Never source activation hooks or user shell profiles as the server/root.
++# exec preserves the PID tracked by rserver. R startup files remain user-owned.
++exec "$SCRIPT_DIR/rsession" "$@" --r-libs-user="$R_LIBS_USER"
+diff --git a/src/cpp/server/extras/admin/rstudio-server-conda.mac b/src/cpp/server/extras/admin/rstudio-server-conda.mac
+new file mode 100755
+index 0000000000000000000000000000000000000000..b3ad9c599f993afe3b77384655ac324c91c280bb
+--- /dev/null
++++ b/src/cpp/server/extras/admin/rstudio-server-conda.mac
+@@ -0,0 +1,224 @@
++#!/bin/bash
++# Copyright (C) 2026 by Posit Software, PBC
++# Licensed under the GNU Affero General Public License, version 3.
++set -euo pipefail
++export PATH=/usr/bin:/bin:/usr/sbin:/sbin
++umask 022
++SCRIPT_DIR=$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)
++CONFIG_DIR=/etc/rstudio
++MANAGED_ROOT=/Library/RStudioServer/conda-envs
++SELECTION="$CONFIG_DIR/shared-conda-prefix"
++SNAPSHOT="$CONFIG_DIR/.shared-conda-original"
++SERVICE=system/com.rstudio.launchd.rserver
++
++fail() { printf '%s\n' "$*" >&2; return 1; }
++requireRoot() { [ "$EUID" -eq 0 ] || fail 'Run this command with administrator privileges.'; }
++validPath() {
++ [[ "$1" =~ ^/[A-Za-z0-9_./+-]+$ ]] && [[ "$1" != *'/../'* ]] &&
++ [[ "$1" != */.. ]] && [[ "$1" != *'/./'* ]] && [[ "$1" != */. ]] ||
++ fail 'Use an absolute path without whitespace, shell characters, . or ...'
++}
++validName() { [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_-]{0,47}$ ]] || fail 'Use an environment name of 1–48 letters, digits, underscores or hyphens, beginning with a letter.'; }
++validSpec() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.=,+*'<>!'-]*$ ]] || fail "Invalid Conda package specification: $1"; }
++checkStopped() {
++ if /bin/launchctl print "$SERVICE" >/dev/null 2>&1 || /usr/bin/pgrep -x rsession >/dev/null; then
++  fail 'Quit all RStudio Server R sessions and stop the Server before changing R environments.'
++ fi
++}
++secureFile() {
++ [ -f "$1" ] && [ ! -L "$1" ] && [ "$(/usr/bin/stat -f '%u' "$1")" = 0 ] ||
++  { fail "Expected a root-owned regular file: $1"; return 1; }
++ local mode=$(/usr/bin/stat -f '%Lp' "$1")
++ (( (8#$mode & 0022) == 0 )) || fail "File must not be group/world-writable: $1"
++}
++secureDir() {
++ [ -d "$1" ] && [ ! -L "$1" ] && [ "$(/usr/bin/stat -f '%u' "$1")" = 0 ] ||
++  { fail "Expected a root-owned directory: $1"; return 1; }
++ local mode=$(/usr/bin/stat -f '%Lp' "$1")
++ (( (8#$mode & 0022) == 0 )) || fail "Directory must not be group/world-writable: $1"
++}
++lockSettings() {
++ requireRoot
++ secureDir "$CONFIG_DIR"
++ /bin/mkdir -m 700 "$CONFIG_DIR/.conda-lock" 2>/dev/null ||
++  { fail 'Another Conda operation is running. Inspect /etc/rstudio/.conda-lock after an interrupted operation.'; return 1; }
++ trap '/bin/rmdir "$CONFIG_DIR/.conda-lock"' EXIT
++}
++secureAncestry() {
++ local dir
++ dir=$(cd "$1" && /bin/pwd -P)
++ while :; do
++  secureDir "$dir"
++  [ "$dir" = / ] && break
++  dir=$(/usr/bin/dirname "$dir")
++ done
++}
++condaTool() {
++ validPath "$1"
++ [ -x "$1" ] && [ "${1##*/}" = conda ] || { fail 'Select the conda executable inside a Miniforge, Miniconda or Anaconda base installation.'; return 1; }
++ CONDA_TOOL="$1"
++ CONDA_BASE=$(cd "$(/usr/bin/dirname "$1")/.." && /bin/pwd -P)
++ # Administrator-managed base is required before executing it with authority.
++ secureDir "$CONDA_BASE"
++ secureDir "$CONDA_BASE/bin"
++ secureDir "$CONDA_BASE/lib"
++ secureDir "$CONDA_BASE/pkgs"
++ secureFile "$CONDA_BASE/bin/conda"
++}
++runConda() {
++ # Do not load the invoking user's ~/.condarc, plugins or shell initialization.
++ /usr/bin/env -i PATH="$CONDA_BASE/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
++  HOME=/var/root LANG=en_US.UTF-8 CONDARC=/dev/null CONDA_NO_PLUGINS=true \
++  CONDA_PKGS_DIRS="$CONDA_BASE/pkgs" CONDA_ENVS_PATH="$MANAGED_ROOT" \
++  "$CONDA_TOOL" --no-plugins "$@"
++}
++managedPrefix() {
++ validName "$1"
++ PREFIX="$MANAGED_ROOT/$1"
++ secureDir "$MANAGED_ROOT"
++ [ -f "$PREFIX/.rstudio-managed-conda" ] && [ ! -L "$PREFIX" ] ||
++  { fail 'Only environments created by this manager can be modified or deleted.'; return 1; }
++ secureDir "$PREFIX"
++ secureFile "$PREFIX/.rstudio-managed-conda"
++}
++checkNotSelected() {
++ if [ -f "$SELECTION" ] && [ "$(cat "$SELECTION")" = "$PREFIX" ]; then
++  fail 'Select system R or a different environment before modifying or deleting the selected environment.'
++ fi
++}
++validateEnvironment() {
++ validPath "$1"
++ PREFIX=$(cd "$1" && /bin/pwd -P)
++ validPath "$PREFIX"
++ [ "$PREFIX" != / ] && [ -f "$PREFIX/conda-meta/history" ] &&
++ [ -x "$PREFIX/bin/R" ] && [ -f "$PREFIX/lib/R/lib/libR.dylib" ] ||
++  { fail 'Choose a Conda environment containing r-base for macOS arm64.'; return 1; }
++ secureAncestry "$PREFIX"
++ secureDir "$PREFIX/bin"
++ secureDir "$PREFIX/lib"
++ secureDir "$PREFIX/lib/R"
++ secureDir "$PREFIX/lib/R/library"
++ secureDir "$PREFIX/lib/R/etc"
++ secureDir "$PREFIX/lib/R/lib"
++ secureFile "$PREFIX/bin/R"
++ secureFile "$PREFIX/lib/R/lib/libR.dylib"
++ /usr/bin/lipo -verify_arch arm64 "$PREFIX/lib/R/lib/libR.dylib" || return 1
++ # R discovery runs this script before rserver drops privileges. It and the
++ # Conda-managed package library must remain administrator-controlled.
++ local home
++ home=$(/usr/bin/env -i PATH="$PREFIX/bin:/usr/bin:/bin" HOME=/var/empty \
++  R_ENVIRON_USER=/dev/null R_PROFILE_USER=/dev/null "$PREFIX/bin/R" RHOME)
++ [ "$home" = "$PREFIX/lib/R" ] || { fail 'RHOME must resolve to the selected environment/lib/R.'; return 1; }
++}
++prepareLibrary() {
++ local lib="$PREFIX/lib/R/rstudio-library"
++ [ ! -L "$lib" ] || { fail 'Refusing a symlink for the shared R package library.'; return 1; }
++ if [ ! -d "$lib" ]; then /usr/bin/install -d -o root -g wheel -m 755 "$lib"; fi
++ secureDir "$lib"
++ # Inheritable ACLs keep packages installed by one UID writable by the other
++ # users, even when R or a package build applies a restrictive umask.
++ local acl='group:everyone allow list,search,read,write,append,execute,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit'
++ /bin/chmod -a "$acl" "$lib" 2>/dev/null || true
++ /bin/chmod +a "$acl" "$lib"
++}
++renderConfig() {
++ /usr/bin/awk '!/^[[:space:]]*(rsession-which-r|rsession-ld-library-path|rsession-path)[[:space:]]*=/' "$1"
++ printf '\nrsession-which-r=%s/bin/R\nrsession-ld-library-path=%s/lib\nrsession-path=%s/rsession-conda\n' "$PREFIX" "$PREFIX" "$SCRIPT_DIR"
++}
++selectEnvironment() {
++ checkStopped
++ validateEnvironment "$1"
++ secureFile "$CONFIG_DIR/rserver.conf"
++ [ ! -L "$SELECTION" ] && [ ! -L "$SNAPSHOT" ] || { fail 'Refusing symlinked Conda configuration.'; return 1; }
++ [ -x "$SCRIPT_DIR/rsession-conda" ] || { fail 'Install the complete app with the Conda session launcher first.'; return 1; }
++ prepareLibrary
++ if [ ! -e "$SNAPSHOT" ]; then
++  /bin/mkdir -m 700 "$SNAPSHOT"
++  /bin/cp -p "$CONFIG_DIR/rserver.conf" "$SNAPSHOT/rserver.conf"
++ else
++  secureDir "$SNAPSHOT"
++  secureFile "$SNAPSHOT/rserver.conf"
++ fi
++ local candidate
++ candidate=$(/usr/bin/mktemp "$CONFIG_DIR/.conda-config.XXXXXX")
++ renderConfig "$CONFIG_DIR/rserver.conf" > "$candidate"
++ /bin/chmod 644 "$candidate"
++ local selectionCandidate
++ selectionCandidate=$(/usr/bin/mktemp "$CONFIG_DIR/.conda-prefix.XXXXXX")
++ printf '%s\n' "$PREFIX" > "$selectionCandidate"
++ /bin/chmod 644 "$selectionCandidate"
++ /bin/mv -f "$selectionCandidate" "$SELECTION"
++ /bin/mv -f "$candidate" "$CONFIG_DIR/rserver.conf"
++ echo "Selected $PREFIX. Start the Server, then start new R sessions."
++}
++useSystemR() {
++ checkStopped
++ if [ ! -e "$SELECTION" ]; then echo 'Shared Conda is already disabled.'; return; fi
++ secureFile "$SELECTION"
++ secureDir "$SNAPSHOT"
++ secureFile "$SNAPSHOT/rserver.conf"
++ secureFile "$CONFIG_DIR/rserver.conf"
++ local candidate
++ candidate=$(/usr/bin/mktemp "$CONFIG_DIR/.conda-config.XXXXXX")
++ # Restore only the three R settings we took over; preserve newer network
++ # settings and all unrelated administrator configuration.
++ /usr/bin/awk '!/^[[:space:]]*(rsession-which-r|rsession-ld-library-path|rsession-path)[[:space:]]*=/' "$CONFIG_DIR/rserver.conf" > "$candidate"
++ /usr/bin/awk '/^[[:space:]]*(rsession-which-r|rsession-ld-library-path|rsession-path)[[:space:]]*=/' "$SNAPSHOT/rserver.conf" >> "$candidate"
++ /bin/chmod 644 "$candidate"
++ /bin/mv -f "$candidate" "$CONFIG_DIR/rserver.conf"
++ /bin/rm "$SELECTION" "$SNAPSHOT/rserver.conf"
++ /bin/rmdir "$SNAPSHOT"
++ echo 'Restored the original R settings and per-user package libraries. Start the Server to apply.'
++}
++main() {
++ case "${1:-}" in
++  status)
++   if [ -f "$SELECTION" ]; then printf 'Shared Conda: '; cat "$SELECTION";
++   else echo 'System R / per-user libraries'; fi; return ;;
++  *) ;;
++ esac
++ lockSettings
++ case "${1:-}" in
++  select) [ "$#" -eq 2 ] || { fail 'Usage: conda select PREFIX'; return 2; }; selectEnvironment "$2" ;;
++  system) [ "$#" -eq 1 ] || { fail 'Usage: conda system'; return 2; }; useSystemR ;;
++  create)
++   [ "$#" -eq 5 ] || { fail 'Usage: conda create CONDA NAME R_VERSION PYTHON_VERSION'; return 2; }
++   condaTool "$2"; validName "$3"
++   [[ "$4" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] && [[ "$5" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || { fail 'Use numeric R and Python versions, such as 4.6 and 3.14.'; return 1; }
++   checkStopped
++   if [ ! -d /Library/RStudioServer ]; then /usr/bin/install -d -o root -g wheel -m 755 /Library/RStudioServer; fi
++   secureDir /Library/RStudioServer
++   if [ ! -d "$MANAGED_ROOT" ]; then /usr/bin/install -d -o root -g wheel -m 755 "$MANAGED_ROOT"; fi
++   secureDir "$MANAGED_ROOT"
++   PREFIX="$MANAGED_ROOT/$3"
++   [ ! -e "$PREFIX" ] && [ ! -L "$PREFIX" ] || { fail 'That environment already exists.'; return 1; }
++   runConda create --yes --solver classic --override-channels --channel conda-forge \
++    --strict-channel-priority --prefix "$PREFIX" "r-base=$4" "python=$5"
++   printf 'RStudio Server managed environment\n' > "$PREFIX/.rstudio-managed-conda"
++   validateEnvironment "$PREFIX"; prepareLibrary
++   echo "Created $PREFIX. Select it to use it for Server sessions." ;;
++  install)
++   [ "$#" -ge 4 ] || { fail 'Usage: conda install CONDA NAME PACKAGE...'; return 2; }
++   condaTool "$2"; managedPrefix "$3"; checkStopped; checkNotSelected
++   shift 3
++   for spec in "$@"; do validSpec "$spec"; done
++   runConda install --yes --solver classic --override-channels --channel conda-forge \
++    --strict-channel-priority --prefix "$PREFIX" "$@"
++   validateEnvironment "$PREFIX" ;;
++  remove)
++   [ "$#" -eq 4 ] && [ "$4" = --confirm-delete ] || { fail 'Explicit --confirm-delete is required.'; return 2; }
++   condaTool "$2"; managedPrefix "$3"; checkStopped; checkNotSelected
++   # Conda may delete the entire prefix, including files it did not install.
++   # Move the library outside the prefix first and retain it even on failure.
++   local_archive=$(/usr/bin/mktemp -d "$MANAGED_ROOT/$3-retained-library.XXXXXX")
++   if [ -d "$PREFIX/lib/R/rstudio-library" ]; then
++    /bin/mv "$PREFIX/lib/R/rstudio-library" "$local_archive/rstudio-library"
++   fi
++   if ! runConda env remove --yes --prefix "$PREFIX"; then
++    fail "Conda removal failed. Shared R packages were retained in $local_archive."; return 1
++   fi
++   echo "Removed Conda environment. Shared R packages were retained in $local_archive." ;;
++  *) fail 'Usage: rstudio-server conda {status|select PREFIX|system|create CONDA NAME R_VERSION PYTHON_VERSION|install CONDA NAME PACKAGE...|remove CONDA NAME --confirm-delete}'; return 2 ;;
++ esac
++}
++if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
+diff --git a/src/cpp/server/extras/admin/rstudio-server.mac.in b/src/cpp/server/extras/admin/rstudio-server.mac.in
+index d1539d1d5f22e71b3cad5f2f65e8fac5bbd1bd0d..3889b65760cde904ff70093a53c081b591c9e4c4 100644
+--- a/src/cpp/server/extras/admin/rstudio-server.mac.in
++++ b/src/cpp/server/extras/admin/rstudio-server.mac.in
+@@ -151,6 +151,11 @@ case "$1" in
+         requireRoot && "$SERVER_PREFIX/bin/rstudio-server-install" uninstall
+         ;;
+ 
++    conda)
++        shift
++        "$SERVER_PREFIX/bin/rstudio-server-conda" "$@"
++        ;;
++
+     configure-network)
+         shift
+         configureNetwork "$@"
+@@ -272,6 +277,6 @@ case "$1" in
+         ;;
+ 
+     *)
+-        echo $"Usage: rstudio-server {install-service|uninstall-service|configure-network ADDRESS PORT|user-help|create-user|delete-user|set-user-visibility|status|start|stop|restart|test-config|check-config|setup-db|verify-installation|suspend-session|suspend-all|force-suspend-session|force-suspend-all|kill-session|kill-all|offline|online|active-sessions|version}"
++        echo $"Usage: rstudio-server {install-service|uninstall-service|conda ...|configure-network ADDRESS PORT|user-help|create-user|delete-user|set-user-visibility|status|start|stop|restart|test-config|check-config|setup-db|verify-installation|suspend-session|suspend-all|force-suspend-session|force-suspend-all|kill-session|kill-all|offline|online|active-sessions|version}"
+         exit 2
+ esac
+diff --git a/src/cpp/server/extras/macos/CMakeLists.txt b/src/cpp/server/extras/macos/CMakeLists.txt
+index 327f19c964f4765cfa6d479c2f0a446606239bea..c61e77f76d58d015ef0266570504945e6dbbe747 100644
+--- a/src/cpp/server/extras/macos/CMakeLists.txt
++++ b/src/cpp/server/extras/macos/CMakeLists.txt
+@@ -4,7 +4,7 @@ project(RStudioServerControl LANGUAGES OBJC)
+ find_library(RSERVER_COCOA_FRAMEWORK Cocoa REQUIRED)
+ find_library(RSERVER_SERVICE_MANAGEMENT_FRAMEWORK ServiceManagement REQUIRED)
+ 
+-add_executable(rstudio-server-app MACOSX_BUNDLE ServerApp.m ServerAdmin.m)
++add_executable(rstudio-server-app MACOSX_BUNDLE ServerApp.m ServerAdmin.m ServerEnvironment.m)
+ set_target_properties(rstudio-server-app PROPERTIES
+    OUTPUT_NAME RStudioServer
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in")
+diff --git a/src/cpp/server/extras/macos/ServerApp.m b/src/cpp/server/extras/macos/ServerApp.m
+index ef9a393d1757e58aeb559c36ae9ab9c81914f004..0a4510b39e501c907e206684f7b16f203858b87d 100644
+--- a/src/cpp/server/extras/macos/ServerApp.m
++++ b/src/cpp/server/extras/macos/ServerApp.m
+@@ -6,6 +6,7 @@
+ #import <Cocoa/Cocoa.h>
+ #import <ServiceManagement/ServiceManagement.h>
+ #import "ServerAdmin.h"
++#import "ServerEnvironment.h"
+ #include <libproc.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -70,6 +71,7 @@ @interface ServerAppDelegate : NSObject <NSApplicationDelegate>
+ @property(strong) NSButton *serverButton;
+ @property(strong) NSButton *startupButton;
+ @property(strong) ServerAccountsController *accountsController;
++@property(strong) ServerEnvironmentController *environmentController;
+ @end
+ 
+ @implementation ServerAppDelegate
+@@ -170,6 +172,12 @@ - (void)showAccounts:(id)sender
+    [self.accountsController showWindow:nil];
+ }
+ 
++- (void)showEnvironment:(id)sender
++{
++   if (!self.environmentController) self.environmentController = [ServerEnvironmentController new];
++   [self.environmentController showWindow:nil];
++}
++
+ - (void)applicationDidBecomeActive:(NSNotification *)notification
+ {
+    [self refreshStatus];
+@@ -196,8 +204,11 @@ - (void)applicationDidFinishLaunching:(NSNotification *)notification
+    self.startupButton.frame = NSMakeRect(385, 101, 150, 34);
+    [self.window.contentView addSubview:self.startupButton];
+    NSButton *admin = [NSButton buttonWithTitle:@"Admin Info…" target:self action:@selector(showAccounts:)];
+-   admin.frame = NSMakeRect(24, 35, 510, 36);
++   admin.frame = NSMakeRect(24, 35, 245, 36);
+    [self.window.contentView addSubview:admin];
++   NSButton *environment = [NSButton buttonWithTitle:@"R Environment…" target:self action:@selector(showEnvironment:)];
++   environment.frame = NSMakeRect(285, 35, 250, 36);
++   [self.window.contentView addSubview:environment];
+    [self refreshStatus];
+    [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+    [self.window center];
+diff --git a/src/cpp/server/extras/macos/ServerEnvironment.h b/src/cpp/server/extras/macos/ServerEnvironment.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8677843497b97c2ce647d2f1b8e49d45d130b7f
+--- /dev/null
++++ b/src/cpp/server/extras/macos/ServerEnvironment.h
+@@ -0,0 +1,5 @@
++/* Copyright (C) 2026 by Posit Software, PBC
++ * Licensed under the GNU Affero General Public License, version 3. */
++#import <Cocoa/Cocoa.h>
++@interface ServerEnvironmentController : NSWindowController
++@end
+diff --git a/src/cpp/server/extras/macos/ServerEnvironment.m b/src/cpp/server/extras/macos/ServerEnvironment.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..c64820ce282e59b98d8b75cedbb8efab682b7268
+--- /dev/null
++++ b/src/cpp/server/extras/macos/ServerEnvironment.m
+@@ -0,0 +1,181 @@
++/* Copyright (C) 2026 by Posit Software, PBC
++ * Licensed under the GNU Affero General Public License, version 3. */
++#import "ServerEnvironment.h"
++
++static NSString *quote(NSString *value)
++{
++   return [NSString stringWithFormat:@"'%@'", [value stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
++}
++
++@interface ServerEnvironmentController ()
++@property(strong) NSTextField *conda;
++@property(strong) NSTextField *prefix;
++@property(strong) NSTextField *name;
++@property(strong) NSTextField *rVersion;
++@property(strong) NSTextField *pythonVersion;
++@property(strong) NSTextField *packages;
++@property(strong) NSTextField *status;
++@property(strong) NSTextView *output;
++@property(strong) NSMutableArray<NSControl *> *actions;
++@property(strong) NSProgressIndicator *progress;
++@property BOOL busy;
++@end
++
++@implementation ServerEnvironmentController
++
++- (NSTextField *)field:(NSString *)value y:(CGFloat)y label:(NSString *)text
++{
++   NSTextField *label = [NSTextField labelWithString:text];
++   label.frame = NSMakeRect(24, y + 3, 160, 22);
++   [self.window.contentView addSubview:label];
++   NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(190, y, 500, 27)];
++   field.stringValue = value;
++   [self.window.contentView addSubview:field];
++   [self.actions addObject:field];
++   return field;
++}
++
++- (void)addButton:(NSString *)title frame:(NSRect)frame action:(SEL)action
++{
++   NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
++   button.frame = frame;
++   [self.window.contentView addSubview:button];
++   [self.actions addObject:button];
++}
++
++- (instancetype)init
++{
++   NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 740, 770)
++      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
++      backing:NSBackingStoreBuffered defer:NO];
++   self = [super initWithWindow:window];
++   if (!self) return nil;
++   window.title = @"RStudio Server R Environment";
++   [window center];
++   self.actions = [NSMutableArray new];
++   self.status = [NSTextField wrappingLabelWithString:@""];
++   self.status.frame = NSMakeRect(24, 700, 690, 50);
++   self.status.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
++   [window.contentView addSubview:self.status];
++   NSTextField *info = [NSTextField wrappingLabelWithString:
++      @"Choose one shared R environment for all Server users. Quit every R session and stop the Server before applying changes. Users share installed R packages; Conda and R remain administrator-managed."];
++   info.frame = NSMakeRect(24, 628, 690, 65);
++   [window.contentView addSubview:info];
++   self.conda = [self field:@"/opt/conda/bin/conda" y:590 label:@"Conda executable"];
++   self.prefix = [self field:@"" y:550 label:@"Environment folder"];
++   self.prefix.placeholderString = @"Choose an existing Conda environment containing R";
++   [self addButton:@"Browse…" frame:NSMakeRect(20, 505, 145, 32) action:@selector(browse:)];
++   [self addButton:@"Use Shared Environment" frame:NSMakeRect(170, 505, 255, 32) action:@selector(selectEnvironment:)];
++   [self addButton:@"Use System R" frame:NSMakeRect(435, 505, 255, 32) action:@selector(useSystem:)];
++   self.name = [self field:@"shared-r" y:456 label:@"Managed env name"];
++   self.rVersion = [self field:@"4.6" y:416 label:@"R version"];
++   self.pythonVersion = [self field:@"3.14" y:376 label:@"Python version"];
++   self.packages = [self field:@"r-essentials" y:336 label:@"Conda packages"];
++   self.packages.placeholderString = @"Space-separated package names, optionally with versions";
++   [self addButton:@"Create Environment" frame:NSMakeRect(20, 291, 220, 32) action:@selector(createEnvironment:)];
++   [self addButton:@"Install / Update Packages" frame:NSMakeRect(250, 291, 240, 32) action:@selector(installPackages:)];
++   [self addButton:@"Remove Environment…" frame:NSMakeRect(500, 291, 215, 32) action:@selector(removeEnvironment:)];
++   NSTextField *location = [NSTextField wrappingLabelWithString:
++      @"New environments: /Library/RStudioServer/conda-envs/<name>. Shared R library: <environment>/lib/R/rstudio-library. System R restores your previous settings. Start the Server after applying a selection."];
++   location.frame = NSMakeRect(24, 218, 690, 60);
++   [window.contentView addSubview:location];
++   NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(24, 55, 690, 155)];
++   scroll.hasVerticalScroller = YES;
++   scroll.borderType = NSBezelBorder;
++   self.output = [[NSTextView alloc] initWithFrame:scroll.bounds];
++   self.output.editable = NO;
++   self.output.richText = NO;
++   self.output.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
++   self.output.autoresizingMask = NSViewWidthSizable;
++   scroll.documentView = self.output;
++   [window.contentView addSubview:scroll];
++   self.progress = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(24, 18, 22, 22)];
++   self.progress.style = NSProgressIndicatorStyleSpinning;
++   self.progress.displayedWhenStopped = NO;
++   [window.contentView addSubview:self.progress];
++   [self addButton:@"Refresh" frame:NSMakeRect(570, 14, 145, 30) action:@selector(refresh:)];
++   [self refresh:nil];
++   return self;
++}
++
++- (void)refresh:(id)sender
++{
++   if (self.busy) return;
++   NSString *prefix = [NSString stringWithContentsOfFile:@"/etc/rstudio/shared-conda-prefix"
++      encoding:NSUTF8StringEncoding error:nil];
++   prefix = [prefix stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
++   self.status.stringValue = prefix.length
++      ? [@"Selected shared Conda environment: " stringByAppendingString:prefix]
++      : @"Shared Conda disabled — original R settings and library defaults apply";
++   if (prefix.length) self.prefix.stringValue = prefix;
++}
++
++- (void)browse:(id)sender
++{
++   NSOpenPanel *panel = [NSOpenPanel openPanel];
++   panel.canChooseDirectories = YES;
++   panel.canChooseFiles = NO;
++   panel.canCreateDirectories = NO;
++   panel.message = @"Select the Conda environment folder containing bin/R and conda-meta.";
++   if ([panel runModal] == NSModalResponseOK) self.prefix.stringValue = panel.URL.path;
++}
++
++- (void)run:(NSArray<NSString *> *)arguments
++{
++   if (self.busy) return;
++   NSString *tool = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Resources/app/bin/rstudio-server-conda"];
++   if (![NSFileManager.defaultManager isExecutableFileAtPath:tool])
++   {
++      self.output.string = @"Install the complete RStudioServer.app before applying system settings. The standalone controller supports UI development only.";
++      return;
++   }
++   NSMutableArray *parts = [NSMutableArray arrayWithObject:quote(tool)];
++   for (NSString *arg in arguments) [parts addObject:quote(arg)];
++   NSString *command = [[parts componentsJoinedByString:@" "] stringByAppendingString:@" 2>&1"];
++   command = [command stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
++   command = [command stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
++   NSString *source = [NSString stringWithFormat:@"do shell script \"%@\" with administrator privileges", command];
++   self.busy = YES;
++   for (NSControl *action in self.actions) action.enabled = NO;
++   self.output.string = @"Waiting for administrator authorization and Conda to finish. Environment creation or package installation may take several minutes.\n";
++   [self.progress startAnimation:nil];
++   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++      NSDictionary *error = nil;
++      NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
++      NSAppleEventDescriptor *result = [script executeAndReturnError:&error];
++      NSString *message = result.stringValue ?: error[NSAppleScriptErrorMessage] ?: @"The operation did not complete.";
++      dispatch_async(dispatch_get_main_queue(), ^{
++         self.output.string = message;
++         self.busy = NO;
++         for (NSControl *action in self.actions) action.enabled = YES;
++         [self.progress stopAnimation:nil];
++         [self refresh:nil];
++      });
++   });
++}
++
++- (void)selectEnvironment:(id)sender { [self run:@[@"select", self.prefix.stringValue]]; }
++- (void)useSystem:(id)sender { [self run:@[@"system"]]; }
++- (void)createEnvironment:(id)sender
++{
++   self.prefix.stringValue = [@"/Library/RStudioServer/conda-envs" stringByAppendingPathComponent:self.name.stringValue];
++   [self run:@[@"create", self.conda.stringValue, self.name.stringValue, self.rVersion.stringValue, self.pythonVersion.stringValue]];
++}
++- (void)installPackages:(id)sender
++{
++   NSMutableArray *args = [NSMutableArray arrayWithArray:@[@"install", self.conda.stringValue, self.name.stringValue]];
++   for (NSString *spec in [self.packages.stringValue componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet])
++      if (spec.length) [args addObject:spec];
++   [self run:args];
++}
++- (void)removeEnvironment:(id)sender
++{
++   NSAlert *alert = [NSAlert new];
++   alert.messageText = [NSString stringWithFormat:@"Remove managed environment “%@”?", self.name.stringValue];
++   alert.informativeText = @"This removes its Conda-installed R, Python and other Conda packages. Shared R library files are preserved. Select system R first and stop the Server.";
++   [alert addButtonWithTitle:@"Cancel"];
++   [alert addButtonWithTitle:@"Remove Environment"];
++   if ([alert runModal] == NSAlertSecondButtonReturn)
++      [self run:@[@"remove", self.conda.stringValue, self.name.stringValue, @"--confirm-delete"]];
++}
++@end

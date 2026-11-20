@@ -2,9 +2,11 @@
 
 ## Branches and upstream versions
 
-The current source-only branch is macos-server/2026.11.0-203-v2, based on the
-official v2026.11.0+203 tag. It contains three commits: native dependencies,
-Open Directory PAM, and the native Server app/package lifecycle. The older
+The current source-only branch is macos-server/shared-conda, based on the
+official v2026.11.0+203 tag. It contains four commits: native dependencies,
+Open Directory PAM, the native Server app/package lifecycle, and shared Conda
+environment management. Patch revision 4 adds the R Environment controller,
+privileged Conda helper and user-context session launcher. The older
 feature/macos-server and macos-server/2026.11.0-203 branches are retained locally
 for reference; do not export their intermediate documentation changes.
 
@@ -14,8 +16,8 @@ follow the repository README to fetch an official tag and apply the manifest.
 
 To review the current source branch from its RStudio checkout:
 
-    git log --reverse --oneline v2026.11.0+203..macos-server/2026.11.0-203-v2
-    git diff --stat v2026.11.0+203 macos-server/2026.11.0-203-v2
+    git log --reverse --oneline v2026.11.0+203..macos-server/shared-conda
+    git diff --stat v2026.11.0+203 macos-server/shared-conda
 
 The version shown in the app must come from the selected official tag's version
 metadata. Changing a development build's display version does not make it a
@@ -93,7 +95,7 @@ of the patch branch. Replace NEW_TAG, NEW_BRANCH and NEW_WORKTREE with the desir
 tag and unused local names:
 
     git fetch --no-tags --depth=1 origin tag NEW_TAG
-    git branch NEW_BRANCH macos-server/2026.11.0-203-v2
+    git branch NEW_BRANCH macos-server/shared-conda
     git worktree add NEW_WORKTREE NEW_BRANCH
     cd NEW_WORKTREE
     git rebase --onto NEW_TAG v2026.11.0+203
@@ -146,3 +148,13 @@ Server installation. Building the full Server/UI and installing the package are
 separate from these diagnostics. If live authentication/session validation is
 desired, SERVER.md documents the optional PAM/HTTP probe. Reboot and uninstall
 behavior need their own runtime checks; these scripts do not establish them.
+
+Shared Conda regression checks (no system mutations):
+
+    python3 dependencies/osx/test-server-conda.py
+
+The standalone controller compiles with the Conda window. These checks cover
+argument validation, settings restoration, session environment forwarding,
+active-environment protection and package preservation during removal. Live
+Conda creation, multi-user package writes and full Server sessions still require
+runtime testing after building and installing the complete app.

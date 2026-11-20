@@ -172,6 +172,96 @@ preserves other settings, and saves the previous rserver.conf before replacing i
 
     sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server configure-network 127.0.0.1 8787
 
+## Shared Conda R environment
+
+Open **R Environment…** in the manager to select one Conda environment for every
+Server user. The Server continues to run as one authenticated service; each R
+session still runs under its user's UID and private home.
+
+**Use Shared Environment** accepts an existing administrator-owned arm64 Conda
+environment containing R. Miniforge, Miniconda and Anaconda environments use the
+same prefix layout. Choose the environment folder, not its R executable. Paths
+must not contain whitespace or shell metacharacters. **Use System R** restores
+the R-related server settings saved before the first selection. With the default
+configuration, this restores system R and users' home package libraries. Existing
+custom R or library settings still apply; individual project/user startup files
+can also override R's library defaults.
+
+The selected environment uses these settings:
+
+- `rsession-which-r=<prefix>/bin/R` and
+  `rsession-ld-library-path=<prefix>/lib` select R and its native libraries.
+- A bundled session launcher sets `CONDA_PREFIX`, adds `<prefix>/bin` to `PATH`,
+  and restores macOS `DYLD` library paths immediately before executing
+  `rsession` as the authenticated user.
+- `R_LIBS_USER`, `R_LIBS` and `--r-libs-user` point to
+  `<prefix>/lib/R/rstudio-library`. This separate directory has inheritable
+  ACLs so users can install/update shared R packages while Conda's
+  `<prefix>/lib/R/library`, R executable and other files stay protected.
+- When the environment contains Python, `RETICULATE_PYTHON` selects it.
+
+The launcher does not run `conda init`, shell profiles or arbitrary activation
+hooks. Packages requiring custom activation hooks may need additional setup.
+User/project R startup files and renv remain available; this is a default shared
+library, not a restriction on users choosing project libraries.
+
+Shared R packages are executable code writable by all local users. Enable this
+mode for users who trust one another's package changes. Do not run privileged R
+processes using the shared package library. R's `00LOCK` directories coordinate
+package installation; simultaneous installs of the same package may need retrying.
+Packages in this library are separate from Conda's package records.
+
+Quit all active R sessions using **Session → Quit Session**, then stop the Server
+before switching R, creating an environment, changing Conda packages or removing
+an environment. The helper refuses changes while sessions or the service remain.
+It does not kill sessions or automatically restart the Server. Start the Server
+and open new sessions after applying the setting. Mount external volumes before
+starting the Server when they contain the selected environment.
+
+### Create and manage environments
+
+Set **Conda executable** to the base installation's `bin/conda`, for example
+`/opt/conda/bin/conda`. The base directory and its executable must be root-owned
+and not group/world-writable. Do not use a personal writable base for operations
+that request administrator privileges.
+
+Enter a managed environment name and numeric R/Python versions, then choose
+**Create Environment**. New environments are created under
+`/Library/RStudioServer/conda-envs/<name>` from conda-forge. Creating an environment
+does not select it automatically. Choose its folder with **Use Shared Environment**.
+Only the shared R package library is made writable to users.
+
+**Install / Update Packages** installs space-separated Conda package specifications
+into that managed environment. Version constraints such as `r-base=4.6` are
+accepted; channel URLs and command-line options are rejected. To update a package,
+specify the desired version. Switch away from the environment and stop the Server
+before modifying it. **Remove Environment…** requires confirmation and moves the
+shared R package library into a sibling `<name>-retained-library.*` directory
+before Conda removes the environment. Only environments created by the manager
+can be modified or removed through these controls. Existing external environments
+can be selected; their Conda packages remain managed by their administrator.
+
+The manager requests administrator authorization and keeps its window responsive
+while Conda solves/downloads packages. Conda operations use a clean environment,
+conda-forge and the classic solver, without loading the invoking user's Conda
+plugins or shell initialization. Conda is installed separately; the Server PKG
+does not bundle a Conda distribution.
+
+CLI equivalents after installing the complete app:
+
+```sh
+sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server conda create /opt/conda/bin/conda shared-r 4.6 3.14
+sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server conda select /Library/RStudioServer/conda-envs/shared-r
+# Quit sessions and stop Server before restoring:
+sudo /Applications/RStudioServer.app/Contents/Resources/app/bin/rstudio-server conda system
+```
+
+`/etc/rstudio/shared-conda-prefix` stores the selection. Original R settings remain
+in `/etc/rstudio/.shared-conda-original` until shared mode is disabled. Uninstall
+preserves environments, shared R packages and administrator-modified configuration.
+Before uninstalling permanently, use **Use System R** to restore configuration
+that refers to the bundled launcher.
+
 ## Access to macOS protected folders
 
 macOS privacy controls can deny a session access to Documents, Desktop and

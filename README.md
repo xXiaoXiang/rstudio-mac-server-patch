@@ -1,5 +1,16 @@
 # RStudio Server for macOS: patch series and packages
 
+**Under development:** `dev/shared-conda-r` adds shared Conda R environment
+management to the native control app. The standalone controller compiles and
+targeted checks pass; full Server/session validation is still pending. This
+branch is separate from the released packages built from `main`.
+
+Pushing this branch does not trigger either existing workflow. Validation runs
+on pushes to `main` and on pull requests. Scheduled package builds use the default
+branch (`main`). A manual package-workflow dispatch can explicitly select this
+branch; leave **Publish completed packages as GitHub Releases** unchecked for
+development builds. The workflow files are unchanged.
+
 This repository stores the native macOS Server patches and release automation.
 It does not duplicate RStudio's source tree or require a GitHub fork. Every build
 checks out a versioned tag from [rstudio/rstudio](https://github.com/rstudio/rstudio),
@@ -11,7 +22,9 @@ port; these packages are not official Posit macOS Server releases. Electron
 Desktop keeps its original `RStudio.app` name; Server installs as
 `RStudioServer.app` with PAM authentication, per-account UIDs, startup approval,
 independent service/startup controls and an Admin Info window for configuration
-and account-management commands.
+and account-management commands. The R Environment window selects a shared Conda R
+installation and manages shared environments with a writable R package library,
+while keeping Conda and R administrator-controlled.
 
 Installation and usage: [Server guide](docs/SERVER.md).
 Source branch maintenance: [Maintaining the patches](docs/MAINTAINING-SERVER.md).

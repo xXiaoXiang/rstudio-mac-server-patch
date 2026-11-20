@@ -1,7 +1,7 @@
-From bdc5f6ce04f2824474491aae80ed3239191df70c Mon Sep 17 00:00:00 2001
+From bfde33d3d38e01935f1fcf58d72071b04a51bd43 Mon Sep 17 00:00:00 2001
 From: Xiao Xiang <baron@macos.shared>
 Date: Tue, 17 Nov 2026 16:18:59 +0800
-Subject: [PATCH 3/3] Add native macOS Server app with service and account
+Subject: [PATCH 3/4] Add native macOS Server app with service and account
  controls
 
 ---

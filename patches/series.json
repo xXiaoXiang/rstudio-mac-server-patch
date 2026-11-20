@@ -5,20 +5,24 @@
     11
   ],
   "tested_release": "v2026.11.0+203",
-  "revision": 3,
+  "revision": 4,
   "base_commit": "187ef1689bea1e8a4724e478a23ad8d390678d0f",
   "patches": [
     {
       "file": "0001-Default-macOS-dependencies-to-the-native-architectur.patch",
-      "sha256": "e35760572555d2335f15100b6fcd21dea7862e6e7817b4ac64e4338ad391eccc"
+      "sha256": "8d5e8dc21e5a2f566df09d3ae27cd5055f5d4f2c420d64e95cdd5e7f260b7b3f"
     },
     {
       "file": "0002-Authenticate-macOS-Server-users-through-Open-Directo.patch",
-      "sha256": "545b54fa5952b1a2bf186c8f4fad4711674527d00e517f351976e6e22f34e43b"
+      "sha256": "22a170e7a78af4cb5c1cf05dab7454340f625c42e843bd8e54ca1f778b0c7cc6"
     },
     {
       "file": "0003-Add-native-macOS-Server-app-with-service-and-account.patch",
-      "sha256": "3f2c113f44af0d39aef68760be64644e2e35d480b2d428dbe7ac333598beb020"
+      "sha256": "56980a9c9e805b4c40eeab8b8ab6c6ce45dc65726227a90e35b94799e630fa65"
+    },
+    {
+      "file": "0004-Manage-a-shared-Conda-R-environment-from-the-macOS-S.patch",
+      "sha256": "315d5216df1d3e7971c042910555c4ee449930994365a67a1b8f257e349c6b61"
     }
   ]
 }
